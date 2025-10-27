@@ -78,7 +78,7 @@ class OAMS:
         self.reactor = self.printer.get_reactor()
         self.action_status = None
         self.action_status_code = None
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
         self.fps_value = 0
         self.f1s_hes_value = [0, 0, 0, 0]
         self.hub_hes_value = [0, 0, 0, 0]
@@ -137,7 +137,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             "i_value": self.i_value,
         }
 
-    def handle_ready(self):
+    def handle_connect(self):
         try:
             self.oams_load_spool_cmd = self.mcu.lookup_command(
                 "oams_cmd_load_spool spool=%c"
