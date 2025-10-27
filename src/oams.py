@@ -124,7 +124,10 @@ class OAMS:
         # Register commands and event handlers
         self.name = config.get_name()
         self.register_commands(self.name.split()[-1])
-        self.printer.register_event_handler("klippy:ready", self.handle_ready)
+        self.printer.register_event_handler("klippy:connect", self.handle_connect)
+        
+        self.cmd_queue = self.mcu.alloc_command_queue()
+        
 
     def get_status(self, eventtime: float) -> dict:
         """Return current hardware status for monitoring."""
@@ -168,49 +171,9 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             ),
         )
 
-    def handle_ready(self):
-        try:
-            self.oams_load_spool_cmd = self.mcu.lookup_command(
-                "oams_cmd_load_spool spool=%c"
-            )
-
-            self.oams_unload_spool_cmd = self.mcu.lookup_command(
-                "oams_cmd_unload_spool"
-            )
-
-            self.oams_follower_cmd = self.mcu.lookup_command(
-                "oams_cmd_follower enable=%c direction=%c"
-            )
-
-            self.oams_calibrate_ptfe_length_cmd = self.mcu.lookup_command(
-                "oams_cmd_calibrate_ptfe_length spool=%c"
-            )
-
-            self.oams_calibrate_hub_hes_cmd = self.mcu.lookup_command(
-                "oams_cmd_calibrate_hub_hes spool=%c"
-            )
-
-            self.oams_pid_cmd = self.mcu.lookup_command(
-                "oams_cmd_pid kp=%u ki=%u kd=%u target=%u"
-            )
-            # TODO: change this to reset the state of the AMS and determine it again instead
-            #       of directly doing it via klipper, let the firmware handle it
-            self.oams_set_led_error_cmd = self.mcu.lookup_command(
-                "oams_set_led_error idx=%c value=%c"
-            )
-
-            cmd_queue = self.mcu.alloc_command_queue()
-
-            self.oams_spool_query_spool_cmd = self.mcu.lookup_query_command(
-                "oams_cmd_query_spool",
-                "oams_query_response_spool spool=%u",
-                cq=cmd_queue,
-            )
-            
-            self.clear_errors()
-            
-        except Exception as e:
-            logging.error("Failed to initialize OAMS commands: %s", e)
+    def handle_connect(self):
+        self.clear_errors()
+        self.current_spool = self.determine_current_spool()
 
     def get_spool_status(self, bay_index):
         return self.f1s_hes_value[bay_index]
@@ -218,8 +181,6 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
     def clear_errors(self):
         for i in range(4):
             self.set_led_error(i, 0)
-        self.current_spool = self.determine_current_spool()
-        self.determine_current_spool()
             
     def set_led_error(self, idx, value):
         logging.info("Setting LED %d to %d", idx, value)
@@ -606,6 +567,42 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         )
 
         self.mcu.add_config_cmd("config_oams_logger idx=%u" % (self.oams_idx))
+        
+        
+        self.oams_load_spool_cmd = self.mcu.lookup_command(
+            "oams_cmd_load_spool spool=%c"
+        )
+        
+        self.oams_unload_spool_cmd = self.mcu.lookup_command(
+            "oams_cmd_unload_spool"
+        )
+
+        self.oams_follower_cmd = self.mcu.lookup_command(
+            "oams_cmd_follower enable=%c direction=%c"
+        )
+
+        self.oams_calibrate_ptfe_length_cmd = self.mcu.lookup_command(
+            "oams_cmd_calibrate_ptfe_length spool=%c"
+        )
+
+        self.oams_calibrate_hub_hes_cmd = self.mcu.lookup_command(
+            "oams_cmd_calibrate_hub_hes spool=%c"
+        )
+
+        self.oams_pid_cmd = self.mcu.lookup_command(
+            "oams_cmd_pid kp=%u ki=%u kd=%u target=%u"
+        )
+        # TODO: change this to reset the state of the AMS and determine it again instead
+        #       of directly doing it via klipper, let the firmware handle it
+        self.oams_set_led_error_cmd = self.mcu.lookup_command(
+            "oams_set_led_error idx=%c value=%c"
+        )
+
+        self.oams_spool_query_spool_cmd = self.mcu.lookup_query_command(
+            "oams_cmd_query_spool",
+            "oams_query_response_spool spool=%u",
+            cq=self.cmd_queue
+        )
 
 
 def load_config_prefix(config):
