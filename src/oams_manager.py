@@ -115,28 +115,34 @@ class OAMSManager:
     
     def _load_next_spool(self, eventtime, pause_distance):
         extruder = self.printer.lookup_object("extruder")
-        if self.runout_position is None:
-            self.runout_position = extruder.last_position
-            logging.info(f"OAMS: Runout position set to {self.runout_position}")
-        else:
-            self.runout_after_position = extruder.last_position - self.runout_position
-            logging.info(f"OAMS: Traveled after runout: {self.runout_after_position}")
-            if self.runout_after_position + pause_distance + self.reload_before_toolhead_distance > self.current_spool[0].filament_path_length / FILAMENT_PATH_LENGTH_FACTOR:
-                logging.info("OAMS: Loading next spool in the filament group.")
-                for (oam, bay_index) in self.filament_groups[self.current_group].bays:
-                    if oam.is_bay_ready(bay_index):
-                        success, message = oam.load_spool(bay_index)
-                        if success:
-                            logging.info(f"OAMS: Successfully loaded spool in bay {bay_index} of OAM {oam.name}")
-                            self.current_spool = (oam, bay_index)
-                            self.runout_position = None
-                            self.runout_after_position = None
-                            self._register_monitor_spool_timer()
-                            return self.printer.get_reactor().NEVER
-                        else:
-                            logging.error(f"OAMS: Failed to load spool: {message}")
-                            raise Exception(message)
-                self._pause_print()
+        try:
+            if self.runout_position is None:
+                self.runout_position = extruder.last_position
+                logging.info(f"OAMS: Runout position set to {self.runout_position}")
+            else:
+                self.runout_after_position = extruder.last_position - self.runout_position
+                logging.info(f"OAMS: Traveled after runout: {self.runout_after_position}")
+                if self.runout_after_position + pause_distance + self.reload_before_toolhead_distance > self.current_spool[0].filament_path_length / FILAMENT_PATH_LENGTH_FACTOR:
+                    logging.info("OAMS: Loading next spool in the filament group.")
+                    for (oam, bay_index) in self.filament_groups[self.current_group].bays:
+                        if oam.is_bay_ready(bay_index):
+                            success, message = oam.load_spool(bay_index)
+                            if success:
+                                logging.info(f"OAMS: Successfully loaded spool in bay {bay_index} of OAM {oam.name}")
+                                self.current_spool = (oam, bay_index)
+                                self.runout_position = None
+                                self.runout_after_position = None
+                                self._register_monitor_spool_timer()
+                                return self.printer.get_reactor().NEVER
+                            else:
+                                logging.error(f"OAMS: Failed to load spool: {message}")
+                                raise Exception(message)
+                    self._pause_print()
+                    return self.printer.get_reactor().NEVER
+        except Exception as e:
+            logging.error(f"OAMS: Error while loading next spool: {str(e)}")
+            self._pause_print()
+            return self.printer.get_reactor().NEVER
         return eventtime + 1.0
     
     def _register_load_next_spool_timer(self, eventtime, pause_distance):
