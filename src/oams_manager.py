@@ -186,10 +186,19 @@ class OAMSManager:
             self.oams[name] = oam
         
     def _initialize_filament_groups(self):
+        seen_groups = set()
         for (name, group) in self.printer.lookup_objects(module="filament_group"):
-            name = name.split()[-1]
-            logging.info(f"OAMS: Adding group {name}")
-            self.filament_groups[name] = group
+            group_name = name.split()[-1]
+            if group_name in seen_groups:
+                msg = f"Duplicate filament_group '{group_name}' found. Filament group names must be unique."
+                # Prefer Klipper's config error helper when available to halt startup cleanly
+                if hasattr(self.config, "error"):
+                    raise self.config.error(msg)
+                raise Exception(msg)
+
+            seen_groups.add(group_name)
+            logging.info(f"OAMS: Adding group {group_name}")
+            self.filament_groups[group_name] = group
     
     def determine_current_loaded_group(self):
         for group_name, group in self.filament_groups.items():
