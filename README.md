@@ -273,7 +273,8 @@ With the templates staged, edit the hardware-specific values before moving on:
      ```
 
 Only after the AFC installer, template staging, and configuration edits are complete should you proceed to installing OpenAMS.
-<img width="512" height="512" alt="image" src="https://github.com/user-attachments/assets/093877d5-ff56-4837-9f38-0e878ae5180b" />
+<img width="1086" height="803" alt="Screenshot 2025-11-09 095729" src="https://github.com/user-attachments/assets/bd0663ef-6454-4ebb-8489-e7a8bd0faca1" />
+
 
 ### 2. Install OpenAMS
 
