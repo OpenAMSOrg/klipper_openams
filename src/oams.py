@@ -1,15 +1,14 @@
-# OpenAMS Mainboard
+## OpenAMS Mainboard
 #
 # Copyright (C) 2025 JR Lomas <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 
-import logging
 import mcu
 import struct
 from math import pi
-from typing import Tuple, List, Optional, Any, Dict
+from typing import Tuple, List, Optional, Dict
 
 try:  # pragma: no cover - optional dependency during unit tests
     from extras.openams_integration import AMSHardwareService
@@ -879,7 +878,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         if direction is None:
             raise gcmd.error("DIRECTION is required")
 
-        self.oams_follower_cmd.send([enable, direction])
+        self.set_oams_follower(enable, direction)
         if enable == 1 and direction == 0:
             gcmd.respond_info("Follower enable in reverse direction")
 
