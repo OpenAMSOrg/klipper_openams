@@ -4,7 +4,6 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import logging
 from typing import List, Callable, Optional, Any
 
 class FPS:
@@ -54,7 +53,9 @@ class FPS:
         self.extruder = None  # Will be set in on_ready()
         
         # Parse OAMS names and store references
-        self.oams_names: List[str] = config.get('oams').split(',')
+        self.oams_names: List[str] = [
+            name.strip() for name in config.get('oams').split(',') if name.strip()
+        ]
         self.oams: List[Any] = []  # List of OAMS objects this FPS works with
         
         # Initialize OAMS references
