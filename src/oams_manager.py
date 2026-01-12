@@ -24,12 +24,10 @@
 # - clog_sensitivity: Detection sensitivity level - "low", "medium", "high" (default: "medium")
 # - extra_retract: Default extra retract distance (mm) applied before unload (default: 10.0)
 
-import json
 import logging
-import time
 import traceback
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import partial
 from typing import Optional, Tuple, Dict, List, Any, Callable
 
@@ -388,7 +386,7 @@ class OAMSRunoutMonitor:
 
                 if not hasattr(self, '_last_coast_log_position'):
                     self._last_coast_log_position = 0.0
-                    self.logger.info(
+                    self.logger.debug(
                         "OAMS: COASTING - path_length="
                         f"{path_length:.1f}, effective_path_length={effective_path_length:.1f}, "
                         f"reload_margin={self.reload_before_toolhead_distance:.1f}"
@@ -397,7 +395,7 @@ class OAMSRunoutMonitor:
                 if self.hub_cleared and runout_after_position - self._last_coast_log_position >= 100.0:
                     self._last_coast_log_position = runout_after_position
                     remaining = effective_path_length - consumed_with_margin
-                    self.logger.info(
+                    self.logger.debug(
                         "OAMS: COASTING progress (after hub clear) - "
                         f"runout_after={runout_after_position:.1f}, "
                         f"consumed_with_margin={consumed_with_margin:.1f}, remaining={remaining:.1f}"
@@ -580,41 +578,40 @@ class OAMSRunoutMonitor:
             return lane_data.get("runout_lane")
         return None
 
-    def _get_oams_object(self, oams_name: Optional[str]):
+    def _resolve_oams_name(
+        self,
+        oams_name: Optional[str],
+        oams_obj: Optional[Any] = None,
+    ) -> Tuple[Optional[str], Optional[Any]]:
         if not oams_name:
-            return None
-        if oams_name in self.oams:
-            return self.oams.get(oams_name)
-        prefixed = f"oams {oams_name}"
-        if prefixed in self.oams:
-            return self.oams.get(prefixed)
-        if oams_name.startswith("oams "):
-            unprefixed = oams_name[5:]
-            return self.oams.get(unprefixed)
-        return None
-
-    def _normalize_oams_name(self, oams_name: Optional[str], oams_obj: Optional[Any] = None) -> Optional[str]:
-        if not oams_name:
-            return oams_name
+            return None, None
 
         if oams_name in self.oams:
-            return oams_name
+            return oams_name, self.oams.get(oams_name)
 
         if oams_obj is not None:
             obj_name = getattr(oams_obj, "name", None)
             if obj_name in self.oams:
-                return obj_name
+                return obj_name, self.oams.get(obj_name)
 
         prefixed = f"oams {oams_name}"
         if prefixed in self.oams:
-            return prefixed
+            return prefixed, self.oams.get(prefixed)
 
         if oams_name.startswith("oams "):
             unprefixed = oams_name[5:]
             if unprefixed in self.oams:
-                return unprefixed
+                return unprefixed, self.oams.get(unprefixed)
 
-        return oams_name
+        return oams_name, None
+
+    def _get_oams_object(self, oams_name: Optional[str]):
+        _, oams_obj = self._resolve_oams_name(oams_name)
+        return oams_obj
+
+    def _normalize_oams_name(self, oams_name: Optional[str], oams_obj: Optional[Any] = None) -> Optional[str]:
+        resolved_name, _ = self._resolve_oams_name(oams_name, oams_obj)
+        return resolved_name
 
     def _get_lane_extruder_name(self, lane) -> Optional[str]:
         if lane is None:
@@ -1319,18 +1316,39 @@ class OAMSManager:
         for name, oam in self.printer.lookup_objects(module="oams"):
             self.oams[name] = oam
 
+    def _resolve_oams_name(
+        self,
+        oams_name: Optional[str],
+        oams_obj: Optional[Any] = None,
+    ) -> Tuple[Optional[str], Optional[Any]]:
+        if not oams_name:
+            return None, None
+
+        if oams_name in self.oams:
+            return oams_name, self.oams.get(oams_name)
+
+        if oams_obj is not None:
+            obj_name = getattr(oams_obj, "name", None)
+            if obj_name in self.oams:
+                return obj_name, self.oams.get(obj_name)
+
+        prefixed = f"oams {oams_name}"
+        if prefixed in self.oams:
+            return prefixed, self.oams.get(prefixed)
+
+        if oams_name.startswith("oams "):
+            unprefixed = oams_name[5:]
+            if unprefixed in self.oams:
+                return unprefixed, self.oams.get(unprefixed)
+
+        return oams_name, None
+
 
     def _get_follower_state(self, oams_name: str) -> FollowerState:
         """Get or create FollowerState for an OAMS unit."""
-        resolved_name = oams_name
-        if oams_name not in self.oams:
-            prefixed = f"oams {oams_name}"
-            if prefixed in self.oams:
-                resolved_name = prefixed
-            elif oams_name.startswith("oams "):
-                unprefixed = oams_name[5:]
-                if unprefixed in self.oams:
-                    resolved_name = unprefixed
+        resolved_name, _ = self._resolve_oams_name(oams_name)
+        if resolved_name is None:
+            resolved_name = oams_name
 
         if resolved_name != oams_name and oams_name in self.follower_state:
             if resolved_name not in self.follower_state:
