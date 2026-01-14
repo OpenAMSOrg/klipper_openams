@@ -19,6 +19,8 @@ except Exception:  # pragma: no cover - best-effort integration only
 _FLOAT_STRUCT = struct.Struct("f")
 _U32_STRUCT = struct.Struct("I")
 
+OPENAMS_VERSION = "0.0.2"
+
 # OAMS Hardware Status Constants
 class OAMSStatus:
     """Hardware status codes reported by OAMS firmware."""
@@ -152,14 +154,13 @@ class OAMS:
         # Retry configuration
         self.load_retry_max: int = config.getint("load_retry_max", 3, minval=1, maxval=5)
         self.unload_retry_max: int = config.getint("unload_retry_max", 2, minval=1, maxval=3)
-        self.retry_backoff_base: float = config.getfloat("retry_backoff_base", 1.0, above=0.0)
-        self.retry_backoff_max: float = config.getfloat("retry_backoff_max", 5.0, above=0.0)
+        self.retry_delay: float = config.getfloat("retry_delay", 3.0, above=0.0)
         self.auto_unload_on_failed_load: bool = config.getboolean(
             "auto_unload_on_failed_load", True
         )
         self.dock_load: bool = config.getboolean("dock_load", False)
         self.post_load_purge: float = config.getfloat("post_load_purge", 0.0)
-        self.extra_retract: float = config.getfloat("extra_retract", 10.0)
+        self.extra_retract: float = config.getfloat("extra_retract", -10.0)
 
         # Retry state tracking
         self._load_retry_count: Dict[int, int] = {}
@@ -369,7 +370,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             f"OAMS[{self.oams_idx}] Retry Status:",
             f"  Load retry max: {self.load_retry_max}",
             f"  Unload retry max: {self.unload_retry_max}",
-            f"  Backoff: {self.retry_backoff_base:.1f}s (max {self.retry_backoff_max:.1f}s)",
+            f"  Retry delay: {self.retry_delay:.1f}s",
             f"  Auto-unload on failed load: {self.auto_unload_on_failed_load}",
             f"  Current unload retry count: {self._unload_retry_count}",
         ]
@@ -400,8 +401,8 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         gcmd.respond_info(f"OAMS[{self.oams_idx}]: Reset all retry counters")
 
     def _calculate_retry_delay(self, attempt_number: int) -> float:
-        """Calculate constant retry delay with max cap."""
-        return min(self.retry_backoff_base, self.retry_backoff_max)
+        """Calculate constant retry delay."""
+        return self.retry_delay
 
     def _reset_load_retry_count(self, spool_idx: int) -> None:
         """Clear retry tracking for a specific spool."""
