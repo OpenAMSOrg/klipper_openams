@@ -49,6 +49,8 @@ except Exception:
     OAMSStatus = None
     OAMSOpCode = None
 
+OPENAMS_VERSION = "0.0.2"
+
 # Configuration constants
 PAUSE_DISTANCE = 60
 MIN_ENCODER_DIFF = 3  # Increased from 1 to 3 - prevents false positives during print stalls/brief pauses
@@ -2852,10 +2854,16 @@ class OAMSManager:
 
                 # Run the engagement extrusion using gcode command
                 # M83: relative extrusion, G92 E0: reset position, G1: extrude
+                prime_length = 5.0
+                remaining_length = max(0.0, engagement_length - prime_length)
                 gcode.run_script_from_command("M83")  # Relative extrusion mode
                 gcode.run_script_from_command("G92 E0")  # Reset extruder position
-                gcode.run_script_from_command(f"G1 E{engagement_length:.2f} F{engagement_speed:.0f}")  # Extrude to nozzle tip
+                gcode.run_script_from_command(f"G1 E{prime_length:.2f} F{engagement_speed:.0f}")  # Prime to help engagement
                 gcode.run_script_from_command("M400")  # Wait for moves to complete
+                self.reactor.pause(self.reactor.monotonic() + 0.2)
+                if remaining_length > 0.0:
+                    gcode.run_script_from_command(f"G1 E{remaining_length:.2f} F{engagement_speed:.0f}")  # Extrude to nozzle tip
+                    gcode.run_script_from_command("M400")  # Wait for moves to complete
 
                 # Small pause to let encoder reading settle
                 self.reactor.pause(self.reactor.monotonic() + 0.2)
@@ -2871,12 +2879,25 @@ class OAMSManager:
 
                     if encoder_before is not None:
                         encoder_delta = abs(encoder_after - encoder_before)
-                        # Expect significant encoder movement for reload_length (typically 50-100mm)
-                        # Minimum threshold: at least 10 encoder clicks
-                        min_encoder_movement = 10
+                        # Expect encoder movement for at least 50% of the post-prime extrusion,
+                        # then allow a small fixed slack to reduce false failures.
+                        # engagement_length is tool_stn / 2, so this checks for tool_stn / 4,
+                        # minus the prime length. Allow 3 clicks of slack.
+                        expected_movement = max(1.0, remaining_length * 0.5)
+                        min_encoder_movement = max(1.0, expected_movement - 3.0)
 
                         if encoder_delta >= min_encoder_movement:
-                            # Encoder moved - filament engaged successfully!
+                            fps_pressure = oams.fps_value
+                            if fps_pressure >= self.engagement_pressure_threshold:
+                                fps_state.engaged_with_extruder = False
+                                self.logger.warning(
+                                    f"Filament failed to engage for {lane_name} "
+                                    f"(encoder moved {encoder_delta} clicks but FPS pressure stayed high at "
+                                    f"{fps_pressure:.2f})"
+                                )
+                                return False
+
+                            # Encoder moved and pressure dropped - filament engaged successfully.
                             fps_state.engaged_with_extruder = True
                             self.logger.debug(
                                 f"Filament engagement verified for {lane_name} "
@@ -2891,11 +2912,43 @@ class OAMSManager:
                                 gcode.run_script_from_command("M400")
                             return True
                         else:
-                            # Encoder didn't move - filament not engaged
+                            # Encoder didn't move enough - re-check after a short delay
+                            self.reactor.pause(self.reactor.monotonic() + 0.3)
+                            try:
+                                encoder_retry = oams.encoder_clicks
+                            except Exception:
+                                encoder_retry = encoder_after
+                            encoder_delta = abs(encoder_retry - encoder_before)
+                            if encoder_delta >= min_encoder_movement:
+                                fps_pressure = oams.fps_value
+                                if fps_pressure >= self.engagement_pressure_threshold:
+                                    fps_state.engaged_with_extruder = False
+                                    self.logger.warning(
+                                        f"Filament failed to engage for {lane_name} "
+                                        f"(encoder moved {encoder_delta} clicks after retry but FPS pressure stayed high at "
+                                        f"{fps_pressure:.2f})"
+                                    )
+                                    return False
+                                fps_state.engaged_with_extruder = True
+                                self.logger.debug(
+                                    f"Filament engagement verified for {lane_name} "
+                                    f"(encoder moved {encoder_delta} clicks after retry during "
+                                    f"{engagement_length:.1f}mm extrusion)"
+                                )
+                                if post_length is not None and post_speed is not None and post_length > 0:
+                                    self.logger.debug(
+                                        f"Completing load for {lane_name}: extruding {post_length:.1f}mm "
+                                        f"at {post_speed:.0f}mm/min"
+                                    )
+                                    gcode.run_script_from_command(f"G1 E{post_length:.2f} F{post_speed:.0f}")
+                                    gcode.run_script_from_command("M400")
+                                return True
+
+                            # Encoder didn't move enough - filament not engaged
                             fps_state.engaged_with_extruder = False
                             self.logger.info(
                                 f"Filament failed to engage extruder for {lane_name} "
-                                f"(encoder only moved {encoder_delta} clicks, expected >={min_encoder_movement})"
+                                f"(encoder only moved {encoder_delta} clicks, expected >={min_encoder_movement:.1f})"
                             )
                             return False
                     else:
