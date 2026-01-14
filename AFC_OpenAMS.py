@@ -21,8 +21,9 @@ import os
 import re
 import traceback
 from textwrap import dedent
+from datetime import datetime
 from types import MethodType
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from configparser import Error as ConfigError
 try: from extras.AFC_utils import ERROR_STR
@@ -55,8 +56,12 @@ except Exception:
     AMSEventBus = None
     normalize_extruder_name = None
 
+OPENAMS_VERSION = "0.0.2"
+
 _ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", None)
 _ORIGINAL_PERFORM_INFINITE_RUNOUT = getattr(AFCLane, "_perform_infinite_runout", None)
+_ORIGINAL_PREP_CAPTURE_TD1 = getattr(AFCLane, "_prep_capture_td1", None)
+_ORIGINAL_GET_TD1_DATA = getattr(AFCLane, "get_td1_data", None)
 
 class _VirtualRunoutHelper:
     """Minimal runout helper used by AMS-managed virtual sensors."""
@@ -312,6 +317,7 @@ class afcAMS(afcUnit):
             self.hardware_service = AMSHardwareService.for_printer(self.printer, self.oams_name, self.logger)
 
         self._register_sync_dispatcher()
+        self._patch_td1_capture()
 
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_HUB_HES", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_HUB_HES, desc="calibrate the OpenAMS HUB HES value for a specific lane")
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_HUB_HES_ALL", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL, desc="calibrate the OpenAMS HUB HES value for every loaded lane")
@@ -321,6 +327,35 @@ class afcAMS(afcUnit):
     def _is_openams_unit(self):
         """Check if this unit has OpenAMS hardware available."""
         return self.oams is not None
+
+    def _patch_td1_capture(self):
+        if getattr(AFCLane, "_ams_td1_capture_patched", False):
+            return
+
+        def _patched_prep_capture_td1(lane_self):
+            if (
+                getattr(lane_self.unit_obj, "type", None) == "OpenAMS"
+                and hasattr(lane_self.unit_obj, "prep_capture_td1")
+            ):
+                lane_self.unit_obj.prep_capture_td1(lane_self)
+                return
+            if _ORIGINAL_PREP_CAPTURE_TD1 is not None:
+                return _ORIGINAL_PREP_CAPTURE_TD1(lane_self)
+            return None
+
+        def _patched_get_td1_data(lane_self):
+            if (
+                getattr(lane_self.unit_obj, "type", None) == "OpenAMS"
+                and hasattr(lane_self.unit_obj, "capture_td1_data")
+            ):
+                return lane_self.unit_obj.capture_td1_data(lane_self)
+            if _ORIGINAL_GET_TD1_DATA is not None:
+                return _ORIGINAL_GET_TD1_DATA(lane_self)
+            return False, "TD-1 capture not available"
+
+        AFCLane._prep_capture_td1 = _patched_prep_capture_td1
+        AFCLane.get_td1_data = _patched_get_td1_data
+        AFCLane._ams_td1_capture_patched = True
 
     def _format_openams_calibration_command(self, base_command, lane):
         if base_command not in {"OAMS_CALIBRATE_HUB_HES", "OAMS_CALIBRATE_PTFE_LENGTH"}:
@@ -1524,15 +1559,248 @@ class afcAMS(afcUnit):
         return False, msg, 0
 
     def calibrate_td1(self, cur_lane, dis, tol):
-        """OpenAMS units use different calibration commands."""
-        msg = (
-            "OpenAMS units do not support standard AFC TD1 calibration. "
-            "Use OpenAMS-specific calibration commands instead:\n"
-            "  - AFC_OAMS_CALIBRATE_HUB_HES UNIT={} SPOOL=<spool_index>\n"
-            "  - AFC_OAMS_CALIBRATE_PTFE UNIT={} SPOOL=<spool_index>"
-        ).format(self.name, self.name)
-        self.logger.info(msg)
-        return False, msg, 0
+        """
+        Calibration function for automatically determining td1_bowden_length.
+        Uses OAMS load/unload commands and TD-1 data detection to bracket distance.
+        """
+        if cur_lane.td1_device_id is None:
+            msg = f"Cannot calibrate TD-1 for {cur_lane.name}, td1_device_id is a required "
+            msg += "field in AFC_hub or per AFC_lane"
+            return False, msg, 0
+
+        if self.oams is None:
+            msg = "OpenAMS hardware not available; cannot calibrate TD-1."
+            self.logger.error(msg)
+            return False, msg, 0
+
+        spool_index = self._get_openams_spool_index(cur_lane)
+        if spool_index is None:
+            msg = f"Unable to resolve spool index for {cur_lane.name}"
+            return False, msg, 0
+
+        # Verify TD-1 is still connected before trying to get data
+        valid, msg = self.afc.function.check_for_td1_id(cur_lane.td1_device_id)
+        if not valid:
+            msg = f"TD-1 device(SN: {cur_lane.td1_device_id}) not detected anymore, "
+            msg += "please check before continuing to calibrate TD-1 bowden length"
+            return valid, msg, 0
+
+        self.logger.raw(f"Calibrating bowden length to TD-1 device with {cur_lane.name}")
+        gcode = self.gcode
+
+        try:
+            gcode.run_script_from_command(
+                f"OAMS_LOAD_SPOOL OAMS={self.oams_name} SPOOL={spool_index} QUIET=1"
+            )
+        except Exception:
+            msg = f"Failed to start OAMS load for {cur_lane.name}"
+            self.logger.error(msg)
+            return False, msg, 0
+
+        hub_timeout = self.afc.reactor.monotonic() + 90.0
+        hub_detected = False
+        while self.afc.reactor.monotonic() < hub_timeout:
+            hub_loaded = None
+            if cur_lane.hub_obj is not None:
+                hub_loaded = bool(cur_lane.hub_obj.state)
+            else:
+                try:
+                    hub_loaded = bool(self.oams.hub_hes_value[spool_index])
+                except Exception:
+                    hub_loaded = None
+
+            if hub_loaded:
+                hub_detected = True
+                break
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.5)
+
+        if not hub_detected:
+            gcode.run_script_from_command(
+                f"OAMS_ABORT_ACTION OAMS={self.oams_name} CODE=5 WAIT=1"
+            )
+            msg = f"Hub sensor did not trigger during TD-1 calibration for {cur_lane.name}"
+            self.logger.error(msg)
+            return False, msg, 0
+
+        try:
+            encoder_before = int(self.oams.encoder_clicks)
+        except Exception:
+            encoder_before = None
+
+        compare_time = datetime.now()
+        td1_timeout = self.afc.reactor.monotonic() + 180.0
+        td1_detected = False
+        burst_duration = 4.0
+        rest_duration = 1.0
+
+        while self.afc.reactor.monotonic() < td1_timeout:
+            gcode.run_script_from_command(
+                f"OAMS_FOLLOWER OAMS={self.oams_name} ENABLE=1 DIRECTION=1"
+            )
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + burst_duration)
+            gcode.run_script_from_command(
+                f"OAMS_FOLLOWER OAMS={self.oams_name} ENABLE=0 DIRECTION=1"
+            )
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + rest_duration)
+
+            if self.get_td1_data(cur_lane, compare_time):
+                td1_detected = True
+                break
+            compare_time = datetime.now()
+
+        gcode.run_script_from_command(
+            f"OAMS_ABORT_ACTION OAMS={self.oams_name} CODE=5 WAIT=1"
+        )
+        gcode.run_script_from_command(
+            f"OAMS_UNLOAD_SPOOL OAMS={self.oams_name} MAX_RETRIES=1"
+        )
+
+        if not td1_detected:
+            msg = f"TD-1 failed to detect filament for {cur_lane.name}"
+            return False, msg, 0
+
+        try:
+            encoder_after = int(self.oams.encoder_clicks)
+        except Exception:
+            encoder_after = None
+
+        if encoder_before is None or encoder_after is None:
+            msg = "Unable to read encoder clicks for TD-1 calibration"
+            self.logger.error(msg)
+            return False, msg, 0
+
+        encoder_delta = abs(encoder_after - encoder_before)
+        cal_msg = f"\n td1_bowden_length: New: {encoder_delta} Old: {cur_lane.td1_bowden_length}"
+
+        cur_lane.td1_bowden_length = encoder_delta
+        fullname = cur_lane.fullname
+        self.afc.function.ConfigRewrite(fullname, "td1_bowden_length", encoder_delta, cal_msg)
+        cur_lane.do_enable(False)
+        cur_lane.unit_obj.return_to_home()
+        self.afc.save_vars()
+        return True, "td1_bowden_length calibration successful", encoder_delta
+
+    def _capture_td1_with_oams(
+        self,
+        cur_lane,
+        *,
+        require_loaded: bool,
+        require_enabled: bool,
+    ) -> Tuple[bool, str]:
+        if require_enabled and not cur_lane.td1_when_loaded:
+            return False, "TD-1 capture disabled"
+        if cur_lane.td1_device_id is None:
+            return False, "TD-1 device ID not configured"
+        if cur_lane.hub_obj is None or cur_lane.hub_obj.state:
+            self.logger.info(
+                f"Cannot get TD-1 data for {cur_lane.name}, hub shows filament in path"
+            )
+            return False, "Hub shows filament in path"
+        if self.afc.function.get_current_lane_obj() is not None:
+            self.logger.info(
+                f"Cannot get TD-1 data for {cur_lane.name}, toolhead is loaded"
+            )
+            return False, "Toolhead is loaded"
+        if cur_lane.td1_bowden_length is None:
+            self.logger.info(
+                f"td1_bowden_length not set for {cur_lane.name}, skipping TD-1 capture"
+            )
+            return False, "td1_bowden_length not set"
+        if require_loaded and not (cur_lane.load_state or cur_lane.prep_state):
+            return False, "Lane is not loaded"
+        if self.oams is None:
+            self.logger.error("OpenAMS hardware not available; skipping TD-1 capture")
+            return False, "OpenAMS hardware not available"
+
+        spool_index = self._get_openams_spool_index(cur_lane)
+        if spool_index is None:
+            self.logger.error(f"Unable to resolve spool index for {cur_lane.name}")
+            return False, "Unable to resolve spool index"
+
+        gcode = self.gcode
+        try:
+            gcode.run_script_from_command(
+                f"OAMS_LOAD_SPOOL OAMS={self.oams_name} SPOOL={spool_index} QUIET=1"
+            )
+        except Exception:
+            self.logger.error(f"Failed to start OAMS load for {cur_lane.name}")
+            return False, "Failed to start OAMS load"
+
+        hub_timeout = self.afc.reactor.monotonic() + 90.0
+        hub_detected = False
+        while self.afc.reactor.monotonic() < hub_timeout:
+            try:
+                hub_detected = bool(self.oams.hub_hes_value[spool_index])
+            except Exception:
+                hub_detected = False
+            if hub_detected:
+                break
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.5)
+
+        if not hub_detected:
+            gcode.run_script_from_command(
+                f"OAMS_ABORT_ACTION OAMS={self.oams_name} CODE=5 WAIT=1"
+            )
+            self.logger.error(
+                f"Hub sensor did not trigger during TD-1 capture for {cur_lane.name}"
+            )
+            return False, "Hub sensor did not trigger"
+
+        try:
+            encoder_before = int(self.oams.encoder_clicks)
+        except Exception:
+            encoder_before = None
+
+        if encoder_before is None:
+            self.logger.error(
+                f"Unable to read encoder before TD-1 capture for {cur_lane.name}"
+            )
+            return False, "Unable to read encoder before capture"
+
+        target_clicks = max(0, int(cur_lane.td1_bowden_length) + 5)
+        compare_time = datetime.now()
+        td1_timeout = self.afc.reactor.monotonic() + 120.0
+
+        while self.afc.reactor.monotonic() < td1_timeout:
+            try:
+                encoder_now = int(self.oams.encoder_clicks)
+            except Exception:
+                encoder_now = encoder_before
+            if abs(encoder_now - encoder_before) >= target_clicks:
+                break
+
+            gcode.run_script_from_command(
+                f"OAMS_FOLLOWER OAMS={self.oams_name} ENABLE=1 DIRECTION=1"
+            )
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.5)
+
+        gcode.run_script_from_command(
+            f"OAMS_FOLLOWER OAMS={self.oams_name} ENABLE=0 DIRECTION=1"
+        )
+        self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.5)
+        self.get_td1_data(cur_lane, compare_time)
+
+        gcode.run_script_from_command(
+            f"OAMS_ABORT_ACTION OAMS={self.oams_name} CODE=5 WAIT=1"
+        )
+        gcode.run_script_from_command(
+            f"OAMS_UNLOAD_SPOOL OAMS={self.oams_name} MAX_RETRIES=1"
+        )
+        return True, "TD-1 data captured"
+
+    def prep_capture_td1(self, cur_lane):
+        self._capture_td1_with_oams(
+            cur_lane,
+            require_loaded=False,
+            require_enabled=True,
+        )
+
+    def capture_td1_data(self, cur_lane):
+        return self._capture_td1_with_oams(
+            cur_lane,
+            require_loaded=True,
+            require_enabled=False,
+        )
 
     def calibrate_hub(self, cur_lane, tol):
         """OpenAMS units use different calibration commands."""
@@ -1544,6 +1812,7 @@ class afcAMS(afcUnit):
         ).format(self.name, self.name)
         self.logger.info(msg)
         return False, msg, 0
+
 
     def handle_ready(self):
         """Resolve the OpenAMS object once Klippy is ready."""
