@@ -26,6 +26,8 @@ from types import MethodType
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from configparser import Error as ConfigError
+
+from extras.AFC_prep import afcPrep
 try: from extras.AFC_utils import ERROR_STR
 except: raise ConfigError("Error when trying to import AFC_utils.ERROR_STR\n{trace}".format(trace=traceback.format_exc()))
 
@@ -62,6 +64,7 @@ _ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", No
 _ORIGINAL_PERFORM_INFINITE_RUNOUT = getattr(AFCLane, "_perform_infinite_runout", None)
 _ORIGINAL_PREP_CAPTURE_TD1 = getattr(AFCLane, "_prep_capture_td1", None)
 _ORIGINAL_GET_TD1_DATA = getattr(AFCLane, "get_td1_data", None)
+_ORIGINAL_TD1_PREP = getattr(afcPrep, "_td1_prep", None)
 
 class _VirtualRunoutHelper:
     """Minimal runout helper used by AMS-managed virtual sensors."""
@@ -319,6 +322,7 @@ class afcAMS(afcUnit):
         self._register_sync_dispatcher()
         self._patch_td1_capture()
         self._patch_td1_cali_fail_prompt()
+        self._patch_td1_prep()
 
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_HUB_HES", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_HUB_HES, desc="calibrate the OpenAMS HUB HES value for a specific lane")
         self.gcode.register_mux_command("AFC_OAMS_CALIBRATE_HUB_HES_ALL", "UNIT", self.name, self.cmd_AFC_OAMS_CALIBRATE_HUB_HES_ALL, desc="calibrate the OpenAMS HUB HES value for every loaded lane")
@@ -357,6 +361,46 @@ class afcAMS(afcUnit):
         AFCLane._prep_capture_td1 = _patched_prep_capture_td1
         AFCLane.get_td1_data = _patched_get_td1_data
         AFCLane._ams_td1_capture_patched = True
+
+    def _patch_td1_prep(self):
+        if getattr(afcPrep, "_openams_td1_prep_patched", False):
+            return
+
+        def _openams_td1_prep(prep_self, overrall_status):
+            capture_td1_data = prep_self.get_td1_data and prep_self.afc.td1_present
+            any_td1_error = False
+            if prep_self.afc.td1_present:
+                prep_self.logger.info("Found TD-1 device connected to printer")
+                any_td1_error, _ = prep_self.afc.function.check_for_td1_error()
+
+            current_lane = prep_self.afc.function.get_current_lane_obj()
+            if current_lane is not None:
+                current_lane.unit_obj.select_lane(current_lane)
+                if capture_td1_data:
+                    prep_self.logger.info("Cannot capture TD-1 data during PREP since toolhead is loaded")
+            elif capture_td1_data:
+                if not overrall_status:
+                    prep_self.logger.info("Cannot capture TD-1 data, not all of PREP succeeded")
+                else:
+                    if any_td1_error:
+                        prep_self.logger.error("Error with a TD-1 device, not collecting data during prep")
+                    else:
+                        prep_self.logger.info("Capturing TD-1 data for all loaded lanes")
+                        for lane in prep_self.afc.lanes.values():
+                            prep_ready = lane.prep_state
+                            if getattr(lane.unit_obj, "type", None) == "OpenAMS":
+                                prep_ready = lane.load_state
+                            if lane.td1_device_id and lane.load_state and prep_ready:
+                                return_status, _ = lane.get_td1_data()
+                                if not return_status:
+                                    break
+                        prep_self.logger.info("Done capturing TD-1 data")
+
+        if _ORIGINAL_TD1_PREP is None:
+            return
+
+        afcPrep._td1_prep = _openams_td1_prep
+        afcPrep._openams_td1_prep_patched = True
 
     def _patch_td1_cali_fail_prompt(self):
         afc_function = getattr(self.afc, "function", None)
