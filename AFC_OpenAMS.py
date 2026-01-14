@@ -391,6 +391,10 @@ class afcAMS(afcUnit):
         # PTFE calibration button
         buttons.append(("Calibrate PTFE Length", f"UNIT_PTFE_CALIBRATION UNIT={self.name}", "secondary"))
 
+        any_lane_has_td1_ids = any(lane.td1_device_id for lane in self.lanes.values())
+        if self.afc.td1_defined and any_lane_has_td1_ids:
+            buttons.append(("Calibrate TD-1 Length", f"AFC_UNIT_TD_ONE_CALIBRATION UNIT={self.name}", "secondary"))
+
         # Back button
         back = [("Back", "AFC_CALIBRATION", "info")]
 
@@ -1630,7 +1634,7 @@ class afcAMS(afcUnit):
         compare_time = datetime.now()
         td1_timeout = self.afc.reactor.monotonic() + 180.0
         td1_detected = False
-        burst_duration = 3.5
+        burst_duration = 4.0
         rest_duration = 3.5
 
         while self.afc.reactor.monotonic() < td1_timeout:
