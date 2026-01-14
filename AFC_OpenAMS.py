@@ -401,11 +401,6 @@ class afcAMS(afcUnit):
             _openams_cmd_AFC_CALI_FAIL,
             afc_function,
         )
-        afc_function.afc.gcode.register_command(
-            "AFC_CALI_FAIL",
-            afc_function.cmd_AFC_CALI_FAIL,
-            desc=afc_function.cmd_AFC_CALI_FAIL_help,
-        )
         afc_function._openams_cali_fail_patched = True
 
     def _format_openams_calibration_command(self, base_command, lane):
