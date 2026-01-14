@@ -855,6 +855,7 @@ class OAMSManager:
         # Follower coast tracking: when all hub sensors go empty, coast 50mm before disabling
         self.follower_coast_distance = 50.0  # mm to coast after hub empties
         self.follower_state: Dict[str, FollowerState] = {}  # oams_name -> FollowerState (consolidated tracking)
+        self._follower_pulse_timers: Dict[str, Any] = {}
 
         # LED state tracking: avoid sending redundant LED commands to MCU
         # Key format: "oams_name:spool_idx" -> error_state (0 or 1)
@@ -1652,6 +1653,7 @@ class OAMSManager:
             ("OAMSM_UNLOAD_FILAMENT", self.cmd_UNLOAD_FILAMENT, self.cmd_UNLOAD_FILAMENT_help),
             ("OAMSM_LOAD_FILAMENT", self.cmd_LOAD_FILAMENT, self.cmd_LOAD_FILAMENT_help),
             ("OAMSM_FOLLOWER", self.cmd_FOLLOWER, self.cmd_FOLLOWER_help),
+            ("OAMSM_PULSE_FOLLOWER", self.cmd_PULSE_FOLLOWER, self.cmd_PULSE_FOLLOWER_help),
             ("OAMSM_FOLLOWER_RESET", self.cmd_FOLLOWER_RESET, self.cmd_FOLLOWER_RESET_help),
             ("OAMSM_CLEAR_ERRORS", self.cmd_CLEAR_ERRORS, self.cmd_CLEAR_ERRORS_help),
             ("OAMSM_CLEAR_LANE_MAPPINGS", self.cmd_CLEAR_LANE_MAPPINGS, self.cmd_CLEAR_LANE_MAPPINGS_help),
@@ -2325,6 +2327,71 @@ class OAMSManager:
         except Exception:
             self.logger.error(f"Failed to set follower on {fps_state.current_oams}")
             gcmd.respond_info(f"Failed to set follower. Check logs.")
+
+    cmd_PULSE_FOLLOWER_help = "Pulse the follower for a short duration without blocking"
+    def cmd_PULSE_FOLLOWER(self, gcmd):
+        duration = gcmd.get_float("DURATION", 0.5)
+        direction = gcmd.get_int("DIRECTION", 1)
+        fps_name = "fps " + gcmd.get("FPS")
+
+        if fps_name not in self.fpss:
+            gcmd.respond_info(f"FPS {fps_name} does not exist")
+            return
+
+        if duration <= 0:
+            gcmd.respond_info("DURATION must be greater than 0")
+            return
+
+        fps_state = self.current_state.fps_state[fps_name]
+
+        if not fps_state.current_oams:
+            try:
+                detected_lane, detected_oams, detected_spool_idx = self.determine_current_loaded_lane(fps_name)
+            except Exception:
+                detected_lane, detected_oams, detected_spool_idx = None, None, None
+            if detected_oams is not None:
+                fps_state.current_oams = detected_oams.name
+                fps_state.current_spool_idx = detected_spool_idx
+                fps_state.current_lane = detected_lane
+
+        oams_name = fps_state.current_oams
+        if not oams_name:
+            gcmd.respond_info(f"No OAMS associated with {fps_name}")
+            return
+
+        oams_obj = self._get_oams_object(oams_name)
+        if oams_obj is None:
+            gcmd.respond_info(f"OAMS {oams_name} is not available")
+            return
+
+        timer = self._follower_pulse_timers.get(fps_name)
+        if timer is not None:
+            self.reactor.unregister_timer(timer)
+
+        try:
+            state = self._get_follower_state(oams_name)
+            oams_obj.set_oams_follower(1, direction)
+            fps_state.following = True
+            fps_state.direction = direction
+            state.last_state = (1, direction)
+        except Exception:
+            self.logger.error(f"Failed to pulse follower on {oams_name}")
+            gcmd.respond_info("Failed to pulse follower. Check logs.")
+            return
+
+        def _disable_pulse(eventtime):
+            try:
+                target_oams = self._get_oams_object(oams_name)
+                if target_oams is not None:
+                    target_oams.set_oams_follower(0, direction)
+                fps_state.following = False
+                state.last_state = (0, direction)
+            except Exception:
+                self.logger.error(f"Failed to disable follower pulse on {oams_name}")
+            return self.reactor.NEVER
+
+        timer = self.reactor.register_timer(_disable_pulse, self.reactor.monotonic() + duration)
+        self._follower_pulse_timers[fps_name] = timer
 
     cmd_FOLLOWER_RESET_help = "Return follower to automatic control based on hub sensors"
     def cmd_FOLLOWER_RESET(self, gcmd):
