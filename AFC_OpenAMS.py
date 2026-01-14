@@ -1630,8 +1630,8 @@ class afcAMS(afcUnit):
         compare_time = datetime.now()
         td1_timeout = self.afc.reactor.monotonic() + 180.0
         td1_detected = False
-        burst_duration = 4.0
-        rest_duration = 1.0
+        burst_duration = 3.5
+        rest_duration = 3.5
 
         while self.afc.reactor.monotonic() < td1_timeout:
             gcode.run_script_from_command(
