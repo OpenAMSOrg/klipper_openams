@@ -1705,6 +1705,7 @@ class OAMSManager:
             ("OAMSM_LOAD_FILAMENT", self.cmd_LOAD_FILAMENT, self.cmd_LOAD_FILAMENT_help),
             ("OAMSM_FOLLOWER", self.cmd_FOLLOWER, self.cmd_FOLLOWER_help),
             ("OAMSM_PULSE_FOLLOWER", self.cmd_PULSE_FOLLOWER, self.cmd_PULSE_FOLLOWER_help),
+            ("OAMS_PULSE_FOLLOWER", self.cmd_PULSE_FOLLOWER, self.cmd_PULSE_FOLLOWER_help),
             ("OAMSM_FOLLOWER_RESET", self.cmd_FOLLOWER_RESET, self.cmd_FOLLOWER_RESET_help),
             ("OAMSM_CLEAR_ERRORS", self.cmd_CLEAR_ERRORS, self.cmd_CLEAR_ERRORS_help),
             ("OAMSM_CLEAR_LANE_MAPPINGS", self.cmd_CLEAR_LANE_MAPPINGS, self.cmd_CLEAR_LANE_MAPPINGS_help),
