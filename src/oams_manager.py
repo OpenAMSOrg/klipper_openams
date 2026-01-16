@@ -2384,6 +2384,7 @@ class OAMSManager:
     def cmd_PULSE_FOLLOWER(self, gcmd):
         duration = gcmd.get_float("DURATION", 0.5)
         direction = gcmd.get_int("DIRECTION", 1)
+        oams_param = gcmd.get("OAMS", None)
         fps_name = "fps " + gcmd.get("FPS")
 
         if fps_name not in self.fpss:
@@ -2396,7 +2397,9 @@ class OAMSManager:
 
         fps_state = self.current_state.fps_state[fps_name]
 
-        if not fps_state.current_oams:
+        if oams_param:
+            fps_state.current_oams = self._normalize_oams_name(oams_param)
+        elif not fps_state.current_oams:
             try:
                 detected_lane, detected_oams, detected_spool_idx = self.determine_current_loaded_lane(fps_name)
             except Exception:
@@ -2447,6 +2450,7 @@ class OAMSManager:
 
     cmd_FOLLOWER_RESET_help = "Return follower to automatic control based on hub sensors"
     def cmd_FOLLOWER_RESET(self, gcmd):
+        oams_param = gcmd.get("OAMS", None)
         fps_name = "fps " + gcmd.get('FPS')
 
         if fps_name not in self.fpss:
@@ -2456,7 +2460,9 @@ class OAMSManager:
 
         fps_state = self.current_state.fps_state[fps_name]
 
-        if not fps_state.current_oams:
+        if oams_param:
+            fps_state.current_oams = self._normalize_oams_name(oams_param)
+        elif not fps_state.current_oams:
             gcmd.respond_info(f"No OAMS associated with {fps_name}")
 
             return
