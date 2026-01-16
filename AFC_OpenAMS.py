@@ -1691,6 +1691,12 @@ class afcAMS(afcUnit):
             msg = f"Unable to resolve spool index for {cur_lane.name}"
             return False, msg, 0
 
+        try:
+            self.oams.oams_load_spool_cmd.send([spool_index])
+        except Exception:
+            self.logger.error(f"Failed to start spool load for TD-1 calibration on {cur_lane.name}")
+            return False, "Failed to start spool load", 0
+
         # Verify TD-1 is still connected before trying to get data
         valid, msg = self.afc.function.check_for_td1_id(cur_lane.td1_device_id)
         if not valid:
@@ -1722,16 +1728,20 @@ class afcAMS(afcUnit):
                 hub_detected = True
                 break
             gcode.run_script_from_command(
-                f"OAMSM_PULSE_FOLLOWER FPS={fps_id} DURATION=0.5 DIRECTION=1"
+                f"OAMSM_PULSE_FOLLOWER FPS={fps_id} DURATION=0.5 DIRECTION=1 OAMS={self.oams_name}"
             )
             self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.7)
 
         if not hub_detected:
             gcode.run_script_from_command(
-                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1"
+                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
             )
             msg = f"Hub sensor did not trigger during TD-1 calibration for {cur_lane.name}"
             self.logger.error(msg)
+            try:
+                self.oams.oams_unload_spool_cmd.send()
+            except Exception:
+                self.logger.error(f"Failed to stop spool after TD-1 calibration for {cur_lane.name}")
             return False, msg, 0
 
         try:
@@ -1747,7 +1757,7 @@ class afcAMS(afcUnit):
 
         while self.afc.reactor.monotonic() < td1_timeout:
             gcode.run_script_from_command(
-                f"OAMSM_PULSE_FOLLOWER FPS={fps_id} DURATION={burst_duration} DIRECTION=1"
+                f"OAMSM_PULSE_FOLLOWER FPS={fps_id} DURATION={burst_duration} DIRECTION=1 OAMS={self.oams_name}"
             )
             self.afc.reactor.pause(self.afc.reactor.monotonic() + burst_duration + rest_duration)
 
@@ -1757,11 +1767,15 @@ class afcAMS(afcUnit):
             compare_time = datetime.now()
 
         gcode.run_script_from_command(
-            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1"
+            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
         )
 
         if not td1_detected:
             msg = f"TD-1 failed to detect filament for {cur_lane.name}"
+            try:
+                self.oams.oams_unload_spool_cmd.send()
+            except Exception:
+                self.logger.error(f"Failed to stop spool after TD-1 calibration for {cur_lane.name}")
             return False, msg, 0
 
         try:
@@ -1783,6 +1797,10 @@ class afcAMS(afcUnit):
         cur_lane.do_enable(False)
         cur_lane.unit_obj.return_to_home()
         self.afc.save_vars()
+        try:
+            self.oams.oams_unload_spool_cmd.send()
+        except Exception:
+            self.logger.error(f"Failed to stop spool after TD-1 calibration for {cur_lane.name}")
         return True, "td1_bowden_length calibration successful", encoder_delta
 
     def _capture_td1_with_oams(
@@ -1822,6 +1840,12 @@ class afcAMS(afcUnit):
             self.logger.error(f"Unable to resolve spool index for {cur_lane.name}")
             return False, "Unable to resolve spool index"
 
+        try:
+            self.oams.oams_load_spool_cmd.send([spool_index])
+        except Exception:
+            self.logger.error(f"Failed to start spool load for TD-1 capture on {cur_lane.name}")
+            return False, "Failed to start spool load"
+
         gcode = self.gcode
         fps_id = self._get_fps_id_for_lane(cur_lane.name)
         if fps_id is None:
@@ -1831,7 +1855,7 @@ class afcAMS(afcUnit):
         hub_timeout = self.afc.reactor.monotonic() + 90.0
         hub_detected = False
         gcode.run_script_from_command(
-            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=1 DIRECTION=1"
+            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=1 DIRECTION=1 OAMS={self.oams_name}"
         )
         while self.afc.reactor.monotonic() < hub_timeout:
             try:
@@ -1844,11 +1868,15 @@ class afcAMS(afcUnit):
 
         if not hub_detected:
             gcode.run_script_from_command(
-                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1"
+                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
             )
             self.logger.error(
                 f"Hub sensor did not trigger during TD-1 capture for {cur_lane.name}"
             )
+            try:
+                self.oams.oams_unload_spool_cmd.send()
+            except Exception:
+                self.logger.error(f"Failed to stop spool after TD-1 capture for {cur_lane.name}")
             return False, "Hub sensor did not trigger"
 
         try:
@@ -1858,11 +1886,15 @@ class afcAMS(afcUnit):
 
         if encoder_before is None:
             gcode.run_script_from_command(
-                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1"
+                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
             )
             self.logger.error(
                 f"Unable to read encoder before TD-1 capture for {cur_lane.name}"
             )
+            try:
+                self.oams.oams_unload_spool_cmd.send()
+            except Exception:
+                self.logger.error(f"Failed to stop spool after TD-1 capture for {cur_lane.name}")
             return False, "Unable to read encoder before capture"
 
         target_clicks = max(0, int(cur_lane.td1_bowden_length) + 5)
@@ -1879,13 +1911,17 @@ class afcAMS(afcUnit):
             self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.5)
 
         gcode.run_script_from_command(
-            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1"
+            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
         )
+        try:
+            self.oams.oams_unload_spool_cmd.send()
+        except Exception:
+            self.logger.error(f"Failed to stop spool after TD-1 capture for {cur_lane.name}")
         self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.5)
         self.get_td1_data(cur_lane, compare_time)
 
         gcode.run_script_from_command(
-            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1"
+            f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
         )
         return True, "TD-1 data captured"
 
