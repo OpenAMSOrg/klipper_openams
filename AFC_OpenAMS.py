@@ -58,7 +58,7 @@ except Exception:
     AMSEventBus = None
     normalize_extruder_name = None
 
-OPENAMS_VERSION = "0.0.2"
+OPENAMS_VERSION = "0.0.3"
 
 _ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", None)
 _ORIGINAL_PERFORM_INFINITE_RUNOUT = getattr(AFCLane, "_perform_infinite_runout", None)
@@ -301,8 +301,6 @@ class afcAMS(afcUnit):
         self._virtual_tool_sensor = None
         # Keep _last_hub_hes_values for HES calibration (not an AFC responsibility)
         self._last_hub_hes_values: Optional[List[float]] = None
-        self._hub_refresh_timer = None
-        self._hub_refresh_interval = 2.0
 
         # OPTIMIZATION: Cache frequently accessed objects
         self._cached_sensor_helper = None
@@ -1967,7 +1965,6 @@ class afcAMS(afcUnit):
             self.hardware_service.start_polling()
         except Exception:
             self.logger.error(f"Failed to start unified polling for {self.oams_name}")
-        self._start_hub_refresh_timer()
         # Hook into AFC's LANE_UNLOAD for cross-extruder runouts
         self._wrap_afc_lane_unload()
         self._wrap_afc_unset_lane_loaded()
@@ -2379,67 +2376,6 @@ class afcAMS(afcUnit):
                 )
             except Exception:
                 self.logger.error(f"Failed to update lane snapshot for {lane.name}")
-
-    def _start_hub_refresh_timer(self) -> None:
-        if self._hub_refresh_timer is not None:
-            return
-        if self.reactor is None:
-            return
-        self._hub_refresh_timer = self.reactor.register_timer(
-            self._hub_refresh_callback,
-            self.reactor.NOW + self._hub_refresh_interval,
-        )
-
-    def _hub_refresh_callback(self, eventtime: float) -> float:
-        if self.oams is None:
-            return self.reactor.NEVER
-        try:
-            self.sync_openams_sensors(eventtime, sync_hub=True, sync_f1s=False, allow_lane_clear=False)
-        except Exception:
-            self.logger.error("Failed to refresh OpenAMS hub state from hardware")
-        return eventtime + self._hub_refresh_interval
-
-    def sync_openams_sensors(
-        self,
-        eventtime: float,
-        *,
-        sync_hub: bool = True,
-        sync_f1s: bool = True,
-        allow_lane_clear: bool = True,
-    ) -> None:
-        if self.oams is None:
-            return
-
-        if sync_hub:
-            hub_values = getattr(self.oams, "hub_hes_value", None)
-            if hub_values:
-                for bay in range(min(len(hub_values), 4)):
-                    lane = self._lane_for_spool_index(bay)
-                    if lane is None:
-                        continue
-                    hub = getattr(lane, "hub_obj", None)
-                    if hub is None:
-                        continue
-                    hub_val = bool(hub_values[bay])
-                    hub.switch_pin_callback(eventtime, hub_val)
-                    lane.loaded_to_hub = hub_val
-
-        if sync_f1s:
-            f1s_values = getattr(self.oams, "f1s_hes_value", None)
-            if f1s_values:
-                for bay in range(min(len(f1s_values), 4)):
-                    lane = self._lane_for_spool_index(bay)
-                    if lane is None:
-                        continue
-                    lane_val = bool(f1s_values[bay])
-                    if getattr(lane, "ams_share_prep_load", False):
-                        self._update_shared_lane(lane, lane_val, eventtime, allow_clear=allow_lane_clear)
-                        continue
-                    prev_val = getattr(lane, "load_state", False)
-                    if lane_val != prev_val:
-                        lane.load_callback(eventtime, lane_val)
-                        lane.prep_callback(eventtime, lane_val)
-                        self._mirror_lane_to_virtual_sensor(lane, eventtime)
 
     def _should_block_sensor_update_for_runout(self, lane, lane_val):
         """Check if sensor update should be blocked due to active runout.
