@@ -13,8 +13,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
-OPENAMS_VERSION = "0.0.2"
-
+OPENAMS_VERSION = "0.0.3"
 
 # ============================================================================
 # Shared Utility Functions
@@ -318,6 +317,9 @@ class LaneRegistry:
         extruder_lanes = self._by_extruder.get(info.extruder, [])
         if info in extruder_lanes:
             extruder_lanes.remove(info)
+            # Remove empty list to prevent memory leak
+            if not extruder_lanes:
+                self._by_extruder.pop(info.extruder, None)
     
     def get_by_lane(self, lane_name: str) -> Optional[LaneInfo]:
         """Get lane info by AFC lane name (e.g., "lane4")."""
@@ -803,8 +805,6 @@ class AMSHardwareService:
         """
         if spool_index is None:
             return None
-        if isinstance(unit_name, str) and unit_name.startswith("oams "):
-            unit_name = unit_name[5:]
         try:
             normalized = int(spool_index)
         except (TypeError, ValueError):
