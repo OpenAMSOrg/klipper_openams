@@ -940,15 +940,11 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             OAMSStatus.STOPPED,
         ):
             self.logger.debug(
-                "OAMS status update (non-action) code=%d action=%d",
-                code,
-                action,
+                f"OAMS status update (non-action) code={code} action={action}"
             )
         else:
             self.logger.debug(
-                "OAMS status update (unhandled) code=%d action=%d",
-                code,
-                action,
+                f"OAMS status update (unhandled) code={code} action={action}"
             )
 
     def float_to_u32(self, f: float) -> int:
