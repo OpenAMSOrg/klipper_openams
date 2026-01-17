@@ -1814,11 +1814,9 @@ class afcAMS(afcUnit):
             return False, "TD-1 capture disabled"
         if cur_lane.td1_device_id is None:
             return False, "TD-1 device ID not configured"
-        if cur_lane.hub_obj is None or cur_lane.hub_obj.state:
-            self.logger.info(
-                f"Cannot get TD-1 data for {cur_lane.name}, hub shows filament in path"
-            )
-            return False, "Hub shows filament in path"
+        hub_state = False
+        if cur_lane.hub_obj is not None:
+            hub_state = bool(cur_lane.hub_obj.state)
         if self.afc.function.get_current_lane_obj() is not None:
             self.logger.info(
                 f"Cannot get TD-1 data for {cur_lane.name}, toolhead is loaded"
@@ -1839,6 +1837,32 @@ class afcAMS(afcUnit):
         if spool_index is None:
             self.logger.error(f"Unable to resolve spool index for {cur_lane.name}")
             return False, "Unable to resolve spool index"
+
+        hub_values = getattr(self.oams, "hub_hes_value", None)
+        current_hub_loaded = False
+        other_hub_loaded = False
+        try:
+            if hub_values and spool_index < len(hub_values):
+                current_hub_loaded = bool(hub_values[spool_index])
+                other_hub_loaded = any(
+                    bool(value) for idx, value in enumerate(hub_values) if idx != spool_index
+                )
+        except Exception:
+            current_hub_loaded = False
+            other_hub_loaded = False
+
+        if other_hub_loaded:
+            self.logger.info(
+                "Skipping TD-1 capture for %s because another OpenAMS hub is already loaded",
+                cur_lane.name,
+            )
+            return False, "Another OpenAMS hub already loaded"
+
+        if hub_state and not current_hub_loaded:
+            self.logger.info(
+                f"Cannot get TD-1 data for {cur_lane.name}, hub shows filament in path"
+            )
+            return False, "Hub shows filament in path"
 
         try:
             self.oams.oams_load_spool_cmd.send([spool_index])
