@@ -748,9 +748,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
                 self.action_status_code = OAMSOpCode.ERROR_UNSPECIFIED
                 return False, "OAMS load operation timed out (MCU unresponsive)"
             # Use reactor.pause to wait without queueing into toolhead
-            # Increased from 0.1s to 1.0s to significantly reduce reactor pressure
-            # 1 second interval is imperceptible for long operations, reduces iterations by 96%
-            self.reactor.pause(self.reactor.monotonic() + 1.0)
+            # Poll every 0.2s for responsive stuck detection while managing reactor load
+            # 0.2s interval allows stuck detection abort to be noticed quickly (~1s)
+            # while still reducing iterations by 80% compared to original 0.1s polling
+            self.reactor.pause(self.reactor.monotonic() + 0.2)
 
         if self.action_status_code == OAMSOpCode.SUCCESS:
             self.current_spool = spool_idx
@@ -797,9 +798,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
                 self.action_status_code = OAMSOpCode.ERROR_UNSPECIFIED
                 return False, "OAMS unload operation timed out (MCU unresponsive)"
             # Use reactor.pause to wait without queueing into toolhead
-            # Increased from 0.1s to 1.0s to significantly reduce reactor pressure
-            # 1 second interval is imperceptible for long operations, reduces iterations by 96%
-            self.reactor.pause(self.reactor.monotonic() + 1.0)
+            # Poll every 0.2s for responsive stuck detection while managing reactor load
+            # 0.2s interval allows stuck detection abort to be noticed quickly (~1s)
+            # while still reducing iterations by 80% compared to original 0.1s polling
+            self.reactor.pause(self.reactor.monotonic() + 0.2)
 
         if self.action_status_code == OAMSOpCode.SUCCESS:
             self.current_spool = None
@@ -874,9 +876,14 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
             self.logger.info(f"OAMS[{self.oams_idx}]: Abort complete - ready for new operations")
         else:
+            # CRITICAL FIX: Must clear action_status even when not waiting
+            # Otherwise load_spool/unload_spool will keep polling until timeout
+            # The "while self.action_status is not None" loop needs this cleared
             self.action_status_code = code
+            self.action_status_value = None
+            self.action_status = None
             self.logger.debug(
-                f"OAMS[{self.oams_idx}]: Abort requested without waiting; awaiting MCU completion"
+                f"OAMS[{self.oams_idx}]: Abort requested without waiting - status cleared immediately"
             )
     cmd_OAMS_FOLLOWER_help = "Enable or disable follower and set its direction"
     def cmd_OAMS_FOLLOWER(self, gcmd):
@@ -940,11 +947,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             OAMSStatus.STOPPED,
         ):
             self.logger.debug(
-                f"OAMS status update (non-action) code={code} action={action}"
+                "OAMS status update (non-action) code=%d action=%d",
+                code,
+                action,
             )
         else:
             self.logger.debug(
-                f"OAMS status update (unhandled) code={code} action={action}"
+                "OAMS status update (unhandled) code=%d action=%d",
+                code,
+                action,
             )
 
     def float_to_u32(self, f: float) -> int:
