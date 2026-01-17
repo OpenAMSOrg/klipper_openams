@@ -194,6 +194,7 @@ class OAMSRunoutMonitor:
         self.hardware_service = None
         self.latest_lane_name: Optional[str] = None
         self._logged_f1s_error: bool = False
+        self._logged_lane_resolution_fallback: bool = False
         if AMSRunoutCoordinator is not None:
             try:
                 self.hardware_service = AMSRunoutCoordinator.register_runout_monitor(self)
@@ -236,19 +237,39 @@ class OAMSRunoutMonitor:
         
                     lane_name = None
                     spool_empty = None
-                    unit_name = self._normalize_oams_name(getattr(fps_state, "current_oams", None)) or self.fps_name
-        
+                    # Get OAMS name - strip "oams " prefix if present for hardware service lookup
+                    # fps_state.current_oams is "oams oams1" but hardware service expects "oams1"
+                    oams_full_name = getattr(fps_state, "current_oams", None) or self.fps_name
+                    unit_name = oams_full_name
+                    if isinstance(unit_name, str) and unit_name.startswith("oams "):
+                        unit_name = unit_name[5:]  # Strip "oams " prefix
+
                     if self.hardware_service is not None:
                         try:
                             lane_name = self.hardware_service.resolve_lane_for_spool(unit_name, spool_idx)
-                        except Exception:
-                            pass
-        
+                            # Successfully resolved - clear fallback flag so we log if it fails again
+                            if self._logged_lane_resolution_fallback:
+                                if lane_name is not None:
+                                    self.logger.debug(f"OAMS: Hardware service lane resolution recovered for {self.fps_name}")
+                                self._logged_lane_resolution_fallback = False
+                        except Exception as e:
+                            # Log exception details for debugging (only once)
+                            if not self._logged_lane_resolution_fallback:
+                                self.logger.debug(
+                                    f"OAMS: Hardware service resolve_lane_for_spool failed for {self.fps_name} "
+                                    f"(unit_name={unit_name}, spool_idx={spool_idx}): {e}"
+                                )
+                                self._logged_lane_resolution_fallback = True
+
                     if lane_name is None and fps_state.current_lane is not None:
                         lane_name = fps_state.current_lane
-                        self.logger.debug(
-                            f"OAMS: Using fps_state.current_lane '{lane_name}' (hardware_service didn't resolve lane name)"
-                        )
+                        # Only log once to prevent log spam (like F1S error handling)
+                        if not self._logged_lane_resolution_fallback:
+                            self.logger.debug(
+                                f"OAMS: Hardware service failed to resolve lane name for {self.fps_name}, "
+                                f"using fps_state.current_lane '{lane_name}' as fallback"
+                            )
+                            self._logged_lane_resolution_fallback = True
 
         
                     try:
@@ -613,23 +634,7 @@ class OAMSRunoutMonitor:
         return oams_obj
 
     def _normalize_oams_name(self, oams_name: Optional[str], oams_obj: Optional[Any] = None) -> Optional[str]:
-        if not oams_name:
-            return oams_name
-
-        base_name = oams_name[5:] if oams_name.startswith("oams ") else oams_name
-        if base_name in self.oams:
-            return base_name
-
-        if oams_obj is not None:
-            obj_name = getattr(oams_obj, "name", None)
-            if isinstance(obj_name, str):
-                obj_base = obj_name[5:] if obj_name.startswith("oams ") else obj_name
-                if obj_base in self.oams:
-                    return obj_base
-
         resolved_name, _ = self._resolve_oams_name(oams_name, oams_obj)
-        if isinstance(resolved_name, str) and resolved_name.startswith("oams "):
-            return resolved_name[5:]
         return resolved_name
 
     def _get_lane_extruder_name(self, lane) -> Optional[str]:
@@ -1705,7 +1710,7 @@ class OAMSManager:
             ("OAMSM_LOAD_FILAMENT", self.cmd_LOAD_FILAMENT, self.cmd_LOAD_FILAMENT_help),
             ("OAMSM_FOLLOWER", self.cmd_FOLLOWER, self.cmd_FOLLOWER_help),
             ("OAMSM_PULSE_FOLLOWER", self.cmd_PULSE_FOLLOWER, self.cmd_PULSE_FOLLOWER_help),
-            ("OAMS_PULSE_FOLLOWER", self.cmd_PULSE_FOLLOWER, self.cmd_PULSE_FOLLOWER_help),
+            ("OAMS_PULSE_FOLLOWER", self.cmd_PULSE_FOLLOWER, self.cmd_PULSE_FOLLOWER_help),  # Alias for compatibility
             ("OAMSM_FOLLOWER_RESET", self.cmd_FOLLOWER_RESET, self.cmd_FOLLOWER_RESET_help),
             ("OAMSM_CLEAR_ERRORS", self.cmd_CLEAR_ERRORS, self.cmd_CLEAR_ERRORS_help),
             ("OAMSM_CLEAR_LANE_MAPPINGS", self.cmd_CLEAR_LANE_MAPPINGS, self.cmd_CLEAR_LANE_MAPPINGS_help),
@@ -2397,6 +2402,7 @@ class OAMSManager:
 
         fps_state = self.current_state.fps_state[fps_name]
 
+        # If OAMS parameter provided, use it directly
         if oams_param:
             fps_state.current_oams = self._normalize_oams_name(oams_param)
         elif not fps_state.current_oams:
@@ -2460,6 +2466,7 @@ class OAMSManager:
 
         fps_state = self.current_state.fps_state[fps_name]
 
+        # If OAMS parameter provided, use it directly
         if oams_param:
             fps_state.current_oams = self._normalize_oams_name(oams_param)
         elif not fps_state.current_oams:
@@ -2728,23 +2735,22 @@ class OAMSManager:
         if not oams_name:
             return oams_name
 
-        base_name = oams_name[5:] if oams_name.startswith("oams ") else oams_name
-        if base_name in self.oams:
-            return base_name
+        if oams_name in self.oams:
+            return oams_name
 
         if oams_obj is not None:
             obj_name = getattr(oams_obj, "name", None)
-            if isinstance(obj_name, str):
-                obj_base = obj_name[5:] if obj_name.startswith("oams ") else obj_name
-                if obj_base in self.oams:
-                    return obj_base
+            if obj_name in self.oams:
+                return obj_name
 
         prefixed = f"oams {oams_name}"
         if prefixed in self.oams:
-            return oams_name
+            return prefixed
 
         if oams_name.startswith("oams "):
-            return oams_name[5:]
+            unprefixed = oams_name[5:]
+            if unprefixed in self.oams:
+                return unprefixed
 
         return oams_name
 
@@ -6230,10 +6236,10 @@ class OAMSManager:
         # Uses dual-threshold hysteresis to prevent flapping between stuck/unstuck states:
         #
         # State Transitions:
-        #   IDLE ? TIMER_RUNNING: pressure <= stuck_spool_pressure_threshold (0.08) AND encoder stopped
-        #   TIMER_RUNNING ? ACTIVE: timer exceeds STUCK_SPOOL_DWELL (5.0s)
-        #   ACTIVE ? IDLE: pressure >= stuck_spool_pressure_clear_threshold (0.12) OR encoder moving
-        #   TIMER_RUNNING ? IDLE: encoder moving OR pressure restored
+        #   IDLE → TIMER_RUNNING: pressure <= stuck_spool_pressure_threshold (0.08) AND encoder stopped
+        #   TIMER_RUNNING → ACTIVE: timer exceeds STUCK_SPOOL_DWELL (5.0s)
+        #   ACTIVE → IDLE: pressure >= stuck_spool_pressure_clear_threshold (0.12) OR encoder moving
+        #   TIMER_RUNNING → IDLE: encoder moving OR pressure restored
         #
         # Hysteresis prevents oscillation:
         #   - Lower threshold (0.08) to START detection
