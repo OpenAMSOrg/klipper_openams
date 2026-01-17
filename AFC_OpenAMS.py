@@ -1721,13 +1721,6 @@ class afcAMS(afcUnit):
                 pass
             return False, msg, 0
 
-        # Simulate lane loaded state so follower commands work
-        current_extruder = self.afc.function.get_current_extruder()
-        original_lane_loaded = None
-        if current_extruder and current_extruder in self.afc.tools:
-            original_lane_loaded = self.afc.tools[current_extruder].lane_loaded
-            self.afc.tools[current_extruder].lane_loaded = cur_lane.name
-
         hub_timeout = self.afc.reactor.monotonic() + 90.0
         hub_detected = False
         while self.afc.reactor.monotonic() < hub_timeout:
@@ -1752,9 +1745,6 @@ class afcAMS(afcUnit):
             gcode.run_script_from_command(
                 f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
             )
-            # Restore original lane loaded state
-            if current_extruder and current_extruder in self.afc.tools:
-                self.afc.tools[current_extruder].lane_loaded = original_lane_loaded
             try:
                 self.oams.oams_unload_spool_cmd.send()
             except Exception:
@@ -1790,9 +1780,6 @@ class afcAMS(afcUnit):
         )
 
         if not td1_detected:
-            # Restore original lane loaded state
-            if current_extruder and current_extruder in self.afc.tools:
-                self.afc.tools[current_extruder].lane_loaded = original_lane_loaded
             try:
                 self.oams.oams_unload_spool_cmd.send()
             except Exception:
@@ -1820,9 +1807,6 @@ class afcAMS(afcUnit):
         cur_lane.unit_obj.return_to_home()
         self.afc.save_vars()
 
-        # Restore original lane loaded state
-        if current_extruder and current_extruder in self.afc.tools:
-            self.afc.tools[current_extruder].lane_loaded = original_lane_loaded
         try:
             self.oams.oams_unload_spool_cmd.send()
         except Exception:
@@ -1912,13 +1896,6 @@ class afcAMS(afcUnit):
                 pass
             return False, "Unable to resolve FPS"
 
-        # Simulate lane loaded state so follower commands work
-        current_extruder = self.afc.function.get_current_extruder()
-        original_lane_loaded = None
-        if current_extruder and current_extruder in self.afc.tools:
-            original_lane_loaded = self.afc.tools[current_extruder].lane_loaded
-            self.afc.tools[current_extruder].lane_loaded = cur_lane.name
-
         hub_timeout = self.afc.reactor.monotonic() + 90.0
         hub_detected = False
         gcode.run_script_from_command(
@@ -1937,9 +1914,6 @@ class afcAMS(afcUnit):
             gcode.run_script_from_command(
                 f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
             )
-            # Restore original lane loaded state
-            if current_extruder and current_extruder in self.afc.tools:
-                self.afc.tools[current_extruder].lane_loaded = original_lane_loaded
             try:
                 self.oams.oams_unload_spool_cmd.send()
             except Exception:
@@ -1958,9 +1932,6 @@ class afcAMS(afcUnit):
             gcode.run_script_from_command(
                 f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
             )
-            # Restore original lane loaded state
-            if current_extruder and current_extruder in self.afc.tools:
-                self.afc.tools[current_extruder].lane_loaded = original_lane_loaded
             try:
                 self.oams.oams_unload_spool_cmd.send()
             except Exception:
@@ -1987,9 +1958,6 @@ class afcAMS(afcUnit):
             f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=1 OAMS={self.oams_name}"
         )
 
-        # Restore original lane loaded state
-        if current_extruder and current_extruder in self.afc.tools:
-            self.afc.tools[current_extruder].lane_loaded = original_lane_loaded
         try:
             self.oams.oams_unload_spool_cmd.send()
         except Exception:
