@@ -1761,9 +1761,13 @@ class afcAMS(afcUnit):
                 pass
             return False, msg, 0
 
-        hub_timeout = self.afc.reactor.monotonic() + 90.0
+        # Wait for hub to load after load command (should happen within 1-2 seconds)
+        # The load command automatically enables follower and feeds to hub
+        hub_timeout = self.afc.reactor.monotonic() + 5.0
         hub_detected = False
         while self.afc.reactor.monotonic() < hub_timeout:
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
+
             hub_loaded = None
             if cur_lane.hub_obj is not None:
                 hub_loaded = bool(cur_lane.hub_obj.state)
@@ -1775,11 +1779,8 @@ class afcAMS(afcUnit):
 
             if hub_loaded:
                 hub_detected = True
+                self.logger.debug(f"Hub sensor triggered for {cur_lane.name}")
                 break
-            gcode.run_script_from_command(
-                f"OAMSM_PULSE_FOLLOWER FPS={fps_id} DURATION=0.5 DIRECTION=1 OAMS={self.oams_name}"
-            )
-            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.7)
 
         if not hub_detected:
             gcode.run_script_from_command(
@@ -1798,18 +1799,27 @@ class afcAMS(afcUnit):
         except Exception:
             encoder_before = None
 
+        # Now cycle follower: disable 3.5s, enable forward 3.5s, repeat
+        # This allows TD-1 to detect filament during the movement
         compare_time = datetime.now()
         td1_timeout = self.afc.reactor.monotonic() + 180.0
         td1_detected = False
-        burst_duration = 4.0
-        rest_duration = 3.5
+        cycle_duration = 3.5
 
         while self.afc.reactor.monotonic() < td1_timeout:
+            # Disable follower for 3.5 seconds
             gcode.run_script_from_command(
-                f"OAMSM_PULSE_FOLLOWER FPS={fps_id} DURATION={burst_duration} DIRECTION=1 OAMS={self.oams_name}"
+                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=0 DIRECTION=0 OAMS={self.oams_name}"
             )
-            self.afc.reactor.pause(self.afc.reactor.monotonic() + burst_duration + rest_duration)
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + cycle_duration)
 
+            # Enable follower forward for 3.5 seconds
+            gcode.run_script_from_command(
+                f"OAMSM_FOLLOWER FPS={fps_id} ENABLE=1 DIRECTION=1 OAMS={self.oams_name}"
+            )
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + cycle_duration)
+
+            # Check for TD-1 data after each cycle
             if self.get_td1_data(cur_lane, compare_time):
                 td1_detected = True
                 break
