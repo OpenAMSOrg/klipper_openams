@@ -5953,12 +5953,14 @@ class OAMSManager:
             spool_label = str(fps_state.current_spool_idx) if fps_state.current_spool_idx is not None else "unknown"
 
             # User requirement: Stuck detection should trigger after couple seconds, not full timeout
-            # Use rate-limited command queue to abort from timer callback safely
+            # CRITICAL: Use wait=False because this runs in timer callback context
+            # Timer callbacks cannot use reactor.pause() properly (causes Klipper crashes)
+            # wait=False queues the abort without blocking - MCU will complete asynchronously
             # This makes the load fail after ~3-5 seconds instead of waiting 30 seconds for timeout
             try:
                 self.logger.info(f"Detected stuck spool on {fps_name}: {stuck_reason}")
                 if fps_state.current_oams and oams is not None:
-                    oams.abort_current_action(wait=True)
+                    oams.abort_current_action(wait=False)
                     self.logger.info(f"Requested abort for stuck load operation on {fps_name}")
             except Exception:
                 self.logger.error(f"Failed to abort load operation on {fps_name}")
