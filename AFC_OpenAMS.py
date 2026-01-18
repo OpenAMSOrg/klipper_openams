@@ -1754,14 +1754,14 @@ class afcAMS(afcUnit):
             return False, msg, 0
 
         # Load the spool before starting TD-1 calibration
-        # The OAMS hardware will automatically enable follower and feed to hub
+        # The load command is needed to move filament from spool bay to hub motor
         try:
             self.oams.oams_load_spool_cmd.send([spool_index])
         except Exception:
             self.logger.error(f"Failed to start spool load for TD-1 calibration on {cur_lane.name}")
             return False, "Failed to start spool load", 0
 
-        # Wait for hub to load after load command (should happen within 1-2 seconds)
+        # Wait for hub to load and STOP immediately when hub sensor triggers
         # IMPORTANT: Always use OAMS hardware sensor, not hub_obj (which doesn't update in real-time)
         hub_timeout = self.afc.reactor.monotonic() + 10.0
         hub_detected = False
@@ -1790,23 +1790,26 @@ class afcAMS(afcUnit):
                 break
 
         if not hub_detected:
-            # Stop the load and disable follower
+            # Abort the load operation and stop the follower
+            try:
+                self.oams.abort_current_action(wait=True, code=0)
+            except Exception:
+                self.logger.error(f"Failed to abort load action for {cur_lane.name}")
             try:
                 self.oams.set_oams_follower(0, 0)
             except Exception:
                 self.logger.error(f"Failed to disable follower for {cur_lane.name}")
-            try:
-                self.oams.oams_unload_spool_cmd.send()
-            except Exception:
-                self.logger.error(f"Failed to stop spool after TD-1 calibration for {cur_lane.name}")
             msg = f"Hub sensor did not trigger during TD-1 calibration for {cur_lane.name}"
             self.logger.error(msg)
             return False, msg, 0
 
-        # Hub loaded successfully - stop the follower and take manual control
-        # Don't use oams_unload_spool_cmd as that would retract to AMS
-        # Just stop the follower directly - that stops filament movement
-        self.logger.debug(f"Hub loaded, stopping follower and taking manual control for {cur_lane.name}")
+        # Hub loaded successfully - abort the load operation and take manual control
+        # This stops the FPS-based load and lets us control follower manually by distance
+        self.logger.debug(f"Hub loaded, aborting load operation and taking manual control for {cur_lane.name}")
+        try:
+            self.oams.abort_current_action(wait=True, code=0)
+        except Exception:
+            self.logger.error(f"Failed to abort load action for {cur_lane.name}")
         try:
             self.oams.set_oams_follower(0, 0)
         except Exception:
@@ -1957,7 +1960,7 @@ class afcAMS(afcUnit):
             return False, "Hub shows filament in path"
 
         # Load the spool before starting TD-1 capture
-        # The OAMS hardware will automatically enable follower and feed to hub
+        # The load command is needed to move filament from spool bay to follower (hub) motor
         try:
             self.oams.oams_load_spool_cmd.send([spool_index])
         except Exception:
@@ -1994,18 +1997,27 @@ class afcAMS(afcUnit):
             self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
 
         if not hub_detected:
+            # Abort the load operation and stop the follower
+            try:
+                self.oams.abort_current_action(wait=True, code=0)
+            except Exception:
+                pass
             try:
                 self.oams.set_oams_follower(0, 0)
             except Exception:
                 pass
-            try:
-                self.oams.oams_unload_spool_cmd.send()
-            except Exception:
-                self.logger.error(f"Failed to stop spool after TD-1 capture for {cur_lane.name}")
             self.logger.error(
                 f"Hub sensor did not trigger during TD-1 capture for {cur_lane.name}"
             )
             return False, "Hub sensor did not trigger"
+
+        # Hub detected - abort load operation and take manual control
+        # This stops FPS-based loading and lets us feed exact distance to TD-1
+        self.logger.debug(f"Hub detected, aborting load and taking manual control for {cur_lane.name}")
+        try:
+            self.oams.abort_current_action(wait=True, code=0)
+        except Exception:
+            self.logger.error(f"Failed to abort load action for {cur_lane.name}")
 
         try:
             encoder_before = int(self.oams.encoder_clicks)
@@ -2017,21 +2029,23 @@ class afcAMS(afcUnit):
                 self.oams.set_oams_follower(0, 0)
             except Exception:
                 pass
-            try:
-                self.oams.oams_unload_spool_cmd.send()
-            except Exception:
-                self.logger.error(f"Failed to stop spool after TD-1 capture for {cur_lane.name}")
             self.logger.error(
                 f"Unable to read encoder before TD-1 capture for {cur_lane.name}"
             )
             return False, "Unable to read encoder before capture"
 
         # Feed filament by td1_bowden_length + 5 clicks to get past TD-1 sensor
+        # Enable follower manually to feed the exact distance
         target_clicks = max(0, int(cur_lane.td1_bowden_length) + 5)
         compare_time = datetime.now()
         td1_timeout = self.afc.reactor.monotonic() + 30.0
 
-        self.logger.debug(f"TD-1 capture: waiting for {target_clicks} encoder clicks on {cur_lane.name}")
+        self.logger.debug(f"TD-1 capture: feeding {target_clicks} encoder clicks to TD-1 on {cur_lane.name}")
+        try:
+            self.oams.set_oams_follower(1, 1)  # Enable follower forward
+        except Exception:
+            self.logger.error(f"Failed to enable follower for TD-1 capture on {cur_lane.name}")
+            return False, "Failed to enable follower"
         while self.afc.reactor.monotonic() < td1_timeout:
             try:
                 encoder_now = int(self.oams.encoder_clicks)
