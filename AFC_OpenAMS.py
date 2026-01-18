@@ -2495,18 +2495,19 @@ class afcAMS(afcUnit):
                 is_printing = False
 
             if is_printing:
-                # CRITICAL: Only trigger runout detection if THIS lane is the one loaded to extruder
+                # CRITICAL: Only trigger runout detection if THIS lane is the one loaded to its extruder
                 # Skip runout detection on inactive lanes (e.g., when changing spools on different lane)
+                # In multi-extruder setups, check the specific extruder this lane is associated with
                 skip_runout = False
                 try:
-                    extruder_obj = getattr(self.afc, 'extruder', None)
+                    extruder_obj = getattr(lane, 'extruder_obj', None)
                     if extruder_obj is not None:
                         lane_loaded = getattr(extruder_obj, 'lane_loaded', None)
                         if lane_loaded is not None and lane_loaded != lane.name:
-                            # This lane is NOT the one loaded to extruder - skip runout detection
+                            # This lane is NOT the one loaded to its extruder - skip runout detection
                             self.logger.debug(
-                                f"F1S sensor False for {lane.name} but lane {lane_loaded} is loaded to extruder - "
-                                f"skipping runout detection on inactive lane"
+                                f"F1S sensor False for {lane.name} but lane {lane_loaded} is loaded to "
+                                f"{getattr(extruder_obj, 'name', 'extruder')} - skipping runout detection on inactive lane"
                             )
                             skip_runout = True
                 except Exception:
