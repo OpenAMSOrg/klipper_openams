@@ -5454,6 +5454,26 @@ class OAMSManager:
             fps_state.stuck_spool.restore_follower = False
             self.logger.info(f"Restarted follower for {fps_name} spool {fps_state.current_spool_idx} after {context}.")
     def _handle_printing_resumed(self, _eventtime):
+        # CRITICAL: Check if printer is actually still paused before processing resume
+        # The pause:resume event can fire during TOOL_UNLOAD operations while printer is paused
+        # Processing resume logic while paused causes conflicts (e.g., enabling follower during AFC_Cut)
+        pause_resume = self._pause_resume_obj
+        if pause_resume is None:
+            try:
+                pause_resume = self.printer.lookup_object("pause_resume")
+                self._pause_resume_obj = pause_resume
+            except Exception:
+                pause_resume = None
+
+        if pause_resume:
+            try:
+                is_paused = bool(getattr(pause_resume, "is_paused", False))
+                if is_paused:
+                    self.logger.debug("Skipping resume processing - printer is still paused (likely TOOL_UNLOAD operation)")
+                    return
+            except Exception:
+                pass  # If we can't determine pause state, proceed with resume logic
+
         # Check if monitors were stopped and need to be restarted
         if not self.monitor_timers:
             self.logger.info("Restarting monitors after pause/intervention")
@@ -6318,10 +6338,35 @@ class OAMSManager:
             except Exception:
                 is_printing = False
 
+        # Check if printer is paused (same logic as stuck spool detection)
+        pause_resume = self._pause_resume_obj
+        if pause_resume is None:
+            try:
+                pause_resume = self.printer.lookup_object("pause_resume")
+                self._pause_resume_obj = pause_resume
+            except Exception:
+                pause_resume = False
+
+        is_paused = False
+        if pause_resume:
+            try:
+                is_paused = bool(getattr(pause_resume, "is_paused", False))
+            except Exception:
+                is_paused = False
+
         monitor = self.runout_monitors.get(fps_name)
         if monitor is not None and monitor.state != OAMSRunoutState.MONITORING:
             if fps_state.clog.active and oams is not None and fps_state.current_spool_idx is not None:
                 self._set_led_error_if_changed(oams, fps_state.current_oams, fps_state.current_spool_idx, 0, "runout monitor inactive")
+
+            fps_state.reset_clog_tracker()
+            return
+
+        # Skip clog detection when printer is paused (e.g., during manual TOOL_UNLOAD operations)
+        # AFC operations like cutting and unloading cause extruder movement that would trigger false clogs
+        if is_paused:
+            if fps_state.clog.active and oams is not None and fps_state.current_spool_idx is not None:
+                self._set_led_error_if_changed(oams, fps_state.current_oams, fps_state.current_spool_idx, 0, "printer paused")
 
             fps_state.reset_clog_tracker()
             return
