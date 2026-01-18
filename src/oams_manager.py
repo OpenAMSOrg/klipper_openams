@@ -6169,8 +6169,8 @@ class OAMSManager:
         # Skip stuck spool detection if NO lane is synced to extruder/toolhead
         # This prevents false positives when filament is only in the hub but not loaded to toolhead
         # (e.g., after manual unload from toolhead but filament still in AMS)
-        # Only skip if lane_loaded is explicitly None - if it has any value (even if different
-        # from current_lane), proceed with detection as we may be mid-load or have an actual issue
+        # CRITICAL: Also skip if THIS fps_state's lane is NOT the one actively loaded to toolhead
+        # This prevents monitoring inactive lanes (e.g., when changing spools on a different lane)
         if fps_state.current_lane is not None:
             try:
                 afc = self._get_afc()
@@ -6184,6 +6184,15 @@ class OAMSManager:
                             fps_state.stuck_spool.start_time = None
                             if fps_state.stuck_spool.active and oams is not None and fps_state.current_spool_idx is not None:
                                 self._set_led_error_if_changed(oams, fps_state.current_oams, fps_state.current_spool_idx, 0, "no lane synced to extruder")
+
+                            fps_state.reset_stuck_spool_state(preserve_restore=fps_state.stuck_spool.restore_follower)
+                            return
+                        elif lane_loaded != fps_state.current_lane:
+                            # CRITICAL: This lane is NOT the one loaded to extruder - skip detection
+                            # Prevents monitoring inactive lanes during spool changes
+                            fps_state.stuck_spool.start_time = None
+                            if fps_state.stuck_spool.active and oams is not None and fps_state.current_spool_idx is not None:
+                                self._set_led_error_if_changed(oams, fps_state.current_oams, fps_state.current_spool_idx, 0, f"different lane loaded to extruder ({lane_loaded})")
 
                             fps_state.reset_stuck_spool_state(preserve_restore=fps_state.stuck_spool.restore_follower)
                             return
@@ -6427,6 +6436,25 @@ class OAMSManager:
         except Exception:
             # Don't crash if bypass check fails, just continue with detection
             pass
+
+        # CRITICAL: Skip clog detection if THIS lane is NOT the one actively loaded to toolhead
+        # This prevents monitoring inactive lanes (e.g., when changing spools on a different lane)
+        if fps_state.current_lane is not None:
+            try:
+                afc = self._get_afc()
+                if afc is not None:
+                    extruder_obj = getattr(afc, 'extruder', None)
+                    if extruder_obj is not None:
+                        lane_loaded = getattr(extruder_obj, 'lane_loaded', None)
+                        if lane_loaded is not None and lane_loaded != fps_state.current_lane:
+                            # This lane is NOT the one loaded to extruder - skip clog detection
+                            if fps_state.clog.active and oams is not None and fps_state.current_spool_idx is not None:
+                                self._set_led_error_if_changed(oams, fps_state.current_oams, fps_state.current_spool_idx, 0, f"different lane loaded to extruder ({lane_loaded})")
+                            fps_state.reset_clog_tracker()
+                            return
+            except Exception:
+                # If we can't determine sync state, proceed with detection to avoid masking real issues
+                pass
 
         # Suppress clog detection during engagement verification to avoid false positives
         # while the extruder is deliberately driving filament for the check.
