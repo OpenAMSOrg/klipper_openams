@@ -146,6 +146,8 @@ class ClogState:
     last_extruder: Optional[float] = None       # Last extruder position checked
     last_wait_log_time: Optional[float] = None  # Last time we logged a wait for extrusion window
     last_check_time: Optional[float] = None     # Last time clog detection ran
+    retraction_count: int = 0                   # Number of retractions detected in current window
+    last_retraction_time: Optional[float] = None  # Timestamp of most recent retraction
 
 
 class OAMSRunoutMonitor:
@@ -830,6 +832,8 @@ class FPSState:
         self.clog.last_extruder = None
         self.clog.last_wait_log_time = None
         self.clog.last_check_time = None
+        self.clog.retraction_count = 0
+        self.clog.last_retraction_time = None
 
     def reset_engagement_tracking(self) -> None:
         """Reset engagement tracking state for clean retry attempts."""
@@ -848,6 +852,8 @@ class FPSState:
         self.clog.max_pressure = pressure
         self.clog.last_wait_log_time = None
         self.clog.last_check_time = timestamp
+        self.clog.retraction_count = 0
+        self.clog.last_retraction_time = None
         
     def __repr__(self) -> str:
         state_names = {0: "UNLOADED", 1: "LOADED", 2: "LOADING", 3: "UNLOADING"}
@@ -6475,6 +6481,24 @@ class OAMSManager:
             return
 
         if extruder_pos < (fps_state.clog.last_extruder or extruder_pos):
+            # Retraction detected - track retraction density to filter out fast detailed prints
+            fps_state.clog.retraction_count += 1
+            fps_state.clog.last_retraction_time = now
+
+            # If we see very high retraction density, this is likely a detailed print
+            # with lots of small moves/retracts, not a clog - reset tracker to prevent false positive
+            # Threshold: 5+ retractions in 10 seconds = very active detailed printing
+            if fps_state.clog.retraction_count >= 5 and fps_state.clog.start_time is not None:
+                window_duration = now - fps_state.clog.start_time
+                if window_duration < 10.0:  # 5+ retractions in 10 seconds = high density activity
+                    self.logger.debug(
+                        f"{fps_name}: Resetting clog tracker - high retraction density detected "
+                        f"({fps_state.clog.retraction_count} retractions in {window_duration:.1f}s)"
+                    )
+                    fps_state.prime_clog_tracker(extruder_pos, encoder_value, pressure, now)
+                    return
+
+            # Normal retraction - just reset tracker
             fps_state.prime_clog_tracker(extruder_pos, encoder_value, pressure, now)
             return
 
