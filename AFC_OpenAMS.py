@@ -309,6 +309,9 @@ class afcAMS(afcUnit):
         self._cached_lane_objects: Dict[str, Any] = {}
         self._cached_oams_index: Optional[int] = None
 
+        # Track pending spool_loaded event timers to avoid duplicates
+        self._pending_spool_loaded_timers: Dict[str, Any] = {}
+
         self.oams = None
         self.hardware_service = None
 
@@ -2048,8 +2051,8 @@ class afcAMS(afcUnit):
             self.logger.error(f"Failed to disable follower after TD-1 capture for {cur_lane.name}")
 
         # Wait for TD-1 to read data
-        # Allow extra time for TD-1 + OpenAMS to settle before unload
-        self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.5)
+        # Reduced from 3.5s to 1.0s per user request - TD-1 reads fast enough
+        self.afc.reactor.pause(self.afc.reactor.monotonic() + 1.0)
         self.get_td1_data(cur_lane, compare_time)
 
         # Unload filament after successful TD-1 capture
@@ -2587,6 +2590,38 @@ class afcAMS(afcUnit):
             self.logger.debug(f"Sensor confirmed empty state for lane {getattr(lane, 'name', 'unknown')} - clearing runout flag")
         return False
 
+    def _publish_spool_loaded_delayed(self, lane_name, spool_index, original_eventtime):
+        """
+        Timer callback to publish spool_loaded event after 3-second delay.
+        This allows the AMS auto-load sequence to complete (loads near hub → retracts → settles).
+
+        CRITICAL: This is called from timer context - must not use reactor.pause() or wait=True.
+        """
+        def _timer_callback(eventtime):
+            try:
+                # Clean up pending timer tracking
+                if lane_name in self._pending_spool_loaded_timers:
+                    del self._pending_spool_loaded_timers[lane_name]
+
+                # Publish the event
+                if self.event_bus is not None:
+                    try:
+                        self.event_bus.publish("spool_loaded",
+                            unit_name=self.name,
+                            spool_index=spool_index,
+                            eventtime=original_eventtime,
+                        )
+                        self.logger.info(f"Published delayed spool_loaded event for {lane_name} (3s after F1S detection)")
+                    except Exception as e:
+                        self.logger.error(f"Failed to publish delayed spool_loaded event for {lane_name}: {e}")
+            except Exception as e:
+                self.logger.error(f"Error in _publish_spool_loaded_delayed timer callback for {lane_name}: {e}")
+
+            # Return NEVER to stop the timer from repeating
+            return self.reactor.NEVER
+
+        return _timer_callback
+
     def _update_shared_lane(self, lane, lane_val, eventtime, *, allow_clear: bool = True):
         """Synchronise shared prep/load sensor lanes without triggering errors."""
         # Check if runout handling requires blocking this sensor update
@@ -2617,18 +2652,29 @@ class afcAMS(afcUnit):
 
             self._mirror_lane_to_virtual_sensor(lane, eventtime)
 
-            # Publish spool_loaded event to trigger TD-1 capture if td1_when_loaded is enabled
-            # This was missing - causing td1_when_loaded feature to never trigger
+            # Schedule delayed spool_loaded event to trigger TD-1 capture if td1_when_loaded is enabled
+            # 3-second delay allows AMS auto-load sequence to complete (loads near hub → retracts → settles)
             if self.event_bus is not None:
                 try:
                     spool_index = self._get_openams_spool_index(lane)
-                    self.event_bus.publish("spool_loaded",
-                        unit_name=self.name,
-                        spool_index=spool_index,
-                        eventtime=eventtime,
-                    )
+                    lane_name = lane.name
+
+                    # Cancel any existing pending timer for this lane
+                    if lane_name in self._pending_spool_loaded_timers:
+                        try:
+                            old_timer = self._pending_spool_loaded_timers[lane_name]
+                            self.reactor.unregister_timer(old_timer)
+                        except Exception:
+                            pass  # Timer may have already fired
+
+                    # Register new timer with 3-second delay
+                    timer_callback = self._publish_spool_loaded_delayed(lane_name, spool_index, eventtime)
+                    timer = self.reactor.register_timer(timer_callback, self.reactor.monotonic() + 3.0)
+                    self._pending_spool_loaded_timers[lane_name] = timer
+
+                    self.logger.info(f"Scheduled spool_loaded event for {lane_name} in 3 seconds (allowing AMS to settle)")
                 except Exception as e:
-                    self.logger.error(f"Failed to publish spool_loaded event for {lane.name}: {e}")
+                    self.logger.error(f"Failed to schedule spool_loaded event for {lane.name}: {e}")
         else:
             # Sensor False - filament left spool bay
             # Update sensor state but don't aggressively clear everything (align with Box Turtle behavior)
@@ -2636,6 +2682,17 @@ class afcAMS(afcUnit):
             lane.prep_callback(eventtime, False)
 
             self._mirror_lane_to_virtual_sensor(lane, eventtime)
+
+            # Cancel any pending spool_loaded timer since filament was removed
+            lane_name = lane.name
+            if lane_name in self._pending_spool_loaded_timers:
+                try:
+                    timer = self._pending_spool_loaded_timers[lane_name]
+                    self.reactor.unregister_timer(timer)
+                    del self._pending_spool_loaded_timers[lane_name]
+                    self.logger.debug(f"Cancelled pending spool_loaded timer for {lane_name} (filament removed)")
+                except Exception as e:
+                    self.logger.error(f"Error cancelling spool_loaded timer for {lane_name}: {e}")
 
             # Shared prep/load sensors stay in sync for AMS lanes; treat False as fully unloaded
             try:
@@ -3227,15 +3284,6 @@ class afcAMS(afcUnit):
 
         return str(unit_name).lower() in candidates
 
-    def _wait_for_insert_hub_ready(self, lane, spool_index: Optional[int]) -> bool:
-        """Wait for spool insert settle time before TD-1 capture."""
-        self.logger.debug(
-            "Spool insert: waiting 3s before TD-1 capture for %s",
-            lane.name,
-        )
-        self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.0)
-        return True
-
     def _handle_spool_loaded_event(self, *, event_type=None, **kwargs):
         """Update local state in response to a spool_loaded event."""
         unit_name = kwargs.get("unit_name")
@@ -3265,8 +3313,7 @@ class afcAMS(afcUnit):
         # This eliminates manual state management and ensures proper state transitions
         lane.set_loaded()
         if not previous_loaded and getattr(lane, "td1_when_loaded", False):
-            if self._wait_for_insert_hub_ready(lane, normalized_index):
-                lane._prep_capture_td1()
+            lane._prep_capture_td1()
         extruder_name = getattr(lane, "extruder_name", None)
         if extruder_name is None and self.registry is not None:
             try:
