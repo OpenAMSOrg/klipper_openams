@@ -2495,15 +2495,33 @@ class afcAMS(afcUnit):
                 is_printing = False
 
             if is_printing:
-                self.logger.info("F1S sensor False for {} (spool empty, printing), triggering runout detection".format(lane.name))
+                # CRITICAL: Only trigger runout detection if THIS lane is the one loaded to extruder
+                # Skip runout detection on inactive lanes (e.g., when changing spools on different lane)
+                skip_runout = False
                 try:
-                    self.handle_runout_detected(bay, None, lane_name=lane.name)
+                    extruder_obj = getattr(self.afc, 'extruder', None)
+                    if extruder_obj is not None:
+                        lane_loaded = getattr(extruder_obj, 'lane_loaded', None)
+                        if lane_loaded is not None and lane_loaded != lane.name:
+                            # This lane is NOT the one loaded to extruder - skip runout detection
+                            self.logger.debug(
+                                f"F1S sensor False for {lane.name} but lane {lane_loaded} is loaded to extruder - "
+                                f"skipping runout detection on inactive lane"
+                            )
+                            skip_runout = True
                 except Exception:
-                    self.logger.error(
-                        f"Failed to handle runout detection for {lane.name} "
-                        f"(spool_index={bay}, runout_lane={getattr(lane, 'runout_lane', None)})\n"
-                        f"{traceback.format_exc()}"
-                    )
+                    pass
+
+                if not skip_runout:
+                    self.logger.info("F1S sensor False for {} (spool empty, printing), triggering runout detection".format(lane.name))
+                    try:
+                        self.handle_runout_detected(bay, None, lane_name=lane.name)
+                    except Exception:
+                        self.logger.error(
+                            f"Failed to handle runout detection for {lane.name} "
+                            f"(spool_index={bay}, runout_lane={getattr(lane, 'runout_lane', None)})\n"
+                            f"{traceback.format_exc()}"
+                        )
             else:
                 self.logger.debug("F1S sensor False for {} but not printing - skipping runout detection (likely filament insertion/removal)".format(lane.name))
 
