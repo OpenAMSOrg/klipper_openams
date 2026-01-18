@@ -3228,32 +3228,13 @@ class afcAMS(afcUnit):
         return str(unit_name).lower() in candidates
 
     def _wait_for_insert_hub_ready(self, lane, spool_index: Optional[int]) -> bool:
-        """Wait for hub detection after spool insert before TD-1 capture."""
-        if self.oams is None or spool_index is None:
-            return False
-
-        hub_timeout = self.afc.reactor.monotonic() + 10.0
-        hub_detected = False
-
-        while self.afc.reactor.monotonic() < hub_timeout:
-            try:
-                hub_detected = bool(self.oams.hub_hes_value[spool_index])
-            except Exception:
-                hub_detected = False
-            if hub_detected:
-                self.logger.debug(
-                    "Spool insert: hub sensor triggered for %s, waiting 2s before TD-1 capture",
-                    lane.name,
-                )
-                self.afc.reactor.pause(self.afc.reactor.monotonic() + 2.0)
-                return True
-            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
-
-        self.logger.info(
-            "Spool insert: hub sensor did not trigger for %s before TD-1 capture",
+        """Wait for spool insert settle time before TD-1 capture."""
+        self.logger.debug(
+            "Spool insert: waiting 3s before TD-1 capture for %s",
             lane.name,
         )
-        return False
+        self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.0)
+        return True
 
     def _handle_spool_loaded_event(self, *, event_type=None, **kwargs):
         """Update local state in response to a spool_loaded event."""
