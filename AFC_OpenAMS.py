@@ -1896,16 +1896,20 @@ class afcAMS(afcUnit):
         if cur_lane.td1_device_id is None:
             return False, "TD-1 device ID not configured"
 
+        # Check if toolhead actually has filament loaded (not just hub)
+        # tool_loaded indicates filament is loaded all the way to the toolhead
+        # This is different from the lane being "current" which just means it's in the hub
+        if getattr(cur_lane, "tool_loaded", False):
+            self.logger.info(
+                f"Cannot get TD-1 data for {cur_lane.name}, toolhead is loaded"
+            )
+            return False, "Toolhead is loaded"
+
         # Fix hub state logic - only check if hub exists and is loaded
         hub_state = False
         if cur_lane.hub_obj is not None:
             hub_state = bool(cur_lane.hub_obj.state)
 
-        if self.afc.function.get_current_lane_obj() is not None:
-            self.logger.info(
-                f"Cannot get TD-1 data for {cur_lane.name}, toolhead is loaded"
-            )
-            return False, "Toolhead is loaded"
         if cur_lane.td1_bowden_length is None:
             self.logger.info(
                 f"td1_bowden_length not set for {cur_lane.name}, skipping TD-1 capture"
@@ -2044,7 +2048,8 @@ class afcAMS(afcUnit):
             self.logger.error(f"Failed to disable follower after TD-1 capture for {cur_lane.name}")
 
         # Wait for TD-1 to read data
-        self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.5)
+        # Reduced from 3.5s to 1.0s per user request - TD-1 reads fast enough
+        self.afc.reactor.pause(self.afc.reactor.monotonic() + 1.0)
         self.get_td1_data(cur_lane, compare_time)
 
         # Unload filament after successful TD-1 capture
@@ -2611,6 +2616,19 @@ class afcAMS(afcUnit):
                 lane.load_callback(eventtime, True)
 
             self._mirror_lane_to_virtual_sensor(lane, eventtime)
+
+            # Publish spool_loaded event to trigger TD-1 capture if td1_when_loaded is enabled
+            # This was missing - causing td1_when_loaded feature to never trigger
+            if self.event_bus is not None:
+                try:
+                    spool_index = self._get_openams_spool_index(lane)
+                    self.event_bus.publish("spool_loaded", {
+                        "unit_name": self.name,
+                        "spool_index": spool_index,
+                        "eventtime": eventtime,
+                    })
+                except Exception as e:
+                    self.logger.error(f"Failed to publish spool_loaded event for {lane.name}: {e}")
         else:
             # Sensor False - filament left spool bay
             # Update sensor state but don't aggressively clear everything (align with Box Turtle behavior)
