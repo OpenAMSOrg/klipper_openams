@@ -2048,8 +2048,8 @@ class afcAMS(afcUnit):
             self.logger.error(f"Failed to disable follower after TD-1 capture for {cur_lane.name}")
 
         # Wait for TD-1 to read data
-        # Reduced from 3.5s to 1.0s per user request - TD-1 reads fast enough
-        self.afc.reactor.pause(self.afc.reactor.monotonic() + 1.0)
+        # Allow extra time for TD-1 + OpenAMS to settle before unload
+        self.afc.reactor.pause(self.afc.reactor.monotonic() + 3.5)
         self.get_td1_data(cur_lane, compare_time)
 
         # Unload filament after successful TD-1 capture
@@ -3227,6 +3227,34 @@ class afcAMS(afcUnit):
 
         return str(unit_name).lower() in candidates
 
+    def _wait_for_insert_hub_ready(self, lane, spool_index: Optional[int]) -> bool:
+        """Wait for hub detection after spool insert before TD-1 capture."""
+        if self.oams is None or spool_index is None:
+            return False
+
+        hub_timeout = self.afc.reactor.monotonic() + 10.0
+        hub_detected = False
+
+        while self.afc.reactor.monotonic() < hub_timeout:
+            try:
+                hub_detected = bool(self.oams.hub_hes_value[spool_index])
+            except Exception:
+                hub_detected = False
+            if hub_detected:
+                self.logger.debug(
+                    "Spool insert: hub sensor triggered for %s, waiting 2s before TD-1 capture",
+                    lane.name,
+                )
+                self.afc.reactor.pause(self.afc.reactor.monotonic() + 2.0)
+                return True
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
+
+        self.logger.info(
+            "Spool insert: hub sensor did not trigger for %s before TD-1 capture",
+            lane.name,
+        )
+        return False
+
     def _handle_spool_loaded_event(self, *, event_type=None, **kwargs):
         """Update local state in response to a spool_loaded event."""
         unit_name = kwargs.get("unit_name")
@@ -3256,7 +3284,8 @@ class afcAMS(afcUnit):
         # This eliminates manual state management and ensures proper state transitions
         lane.set_loaded()
         if not previous_loaded and getattr(lane, "td1_when_loaded", False):
-            lane._prep_capture_td1()
+            if self._wait_for_insert_hub_ready(lane, normalized_index):
+                lane._prep_capture_td1()
         extruder_name = getattr(lane, "extruder_name", None)
         if extruder_name is None and self.registry is not None:
             try:
