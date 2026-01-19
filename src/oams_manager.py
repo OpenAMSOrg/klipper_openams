@@ -148,6 +148,8 @@ class ClogState:
     last_check_time: Optional[float] = None     # Last time clog detection ran
     retraction_count: int = 0                   # Number of retractions detected in current window
     last_retraction_time: Optional[float] = None  # Timestamp of most recent retraction
+    restore_follower: bool = False              # Whether follower was enabled before clog pause
+    restore_direction: int = 1                  # Follower direction to restore after resume
 
 
 class OAMSRunoutMonitor:
@@ -821,7 +823,7 @@ class FPSState:
             self.stuck_spool.restore_follower = False
             self.stuck_spool.restore_direction = 1
 
-    def reset_clog_tracker(self) -> None:
+    def reset_clog_tracker(self, preserve_restore: bool = False) -> None:
         """Reset clog detection state."""
         self.clog.active = False
         self.clog.start_extruder = None
@@ -834,6 +836,9 @@ class FPSState:
         self.clog.last_check_time = None
         self.clog.retraction_count = 0
         self.clog.last_retraction_time = None
+        if not preserve_restore:
+            self.clog.restore_follower = False
+            self.clog.restore_direction = 1
 
     def reset_engagement_tracking(self) -> None:
         """Reset engagement tracking state for clean retry attempts."""
@@ -2312,6 +2317,8 @@ class OAMSManager:
         # DIRECTION is optional when disabling (ENABLE=0), defaults to 0
         direction = gcmd.get_int('DIRECTION', 0)
         fps_name = "fps " + gcmd.get('FPS')
+        # Optional OAMS parameter to override auto-detection
+        oams_override = gcmd.get('OAMS', None)
 
         if fps_name not in self.fpss:
             gcmd.respond_info(f"FPS {fps_name} does not exist")
@@ -2326,6 +2333,11 @@ class OAMSManager:
             self.logger.debug(f"OAMSM_FOLLOWER ignored because {fps_name} is busy")
 
             return
+
+        # Apply OAMS override if provided
+        if oams_override:
+            fps_state.current_oams = oams_override
+            self.logger.info(f"OAMSM_FOLLOWER: overriding current_oams to {oams_override} for {fps_name}")
 
         if not fps_state.current_oams:
             try:
@@ -2369,8 +2381,13 @@ class OAMSManager:
         # When enabling, we need a valid OAMS
         oams_obj = self._get_oams_object(fps_state.current_oams)
         if oams_obj is None:
-            gcmd.respond_info(f"OAMS {fps_state.current_oams} is not available")
-
+            if fps_state.current_oams is None:
+                gcmd.respond_info(
+                    f"Cannot enable follower on {fps_name}: no OAMS/lane currently loaded. "
+                    f"Load filament first or specify OAMS=<oams_name> to override."
+                )
+            else:
+                gcmd.respond_info(f"OAMS {fps_state.current_oams} is not available for {fps_name}")
             return
 
         try:
@@ -6677,8 +6694,23 @@ class OAMSManager:
                     f"Reset FPS state to LOADED after clog pause on {fps_name} to allow recovery commands"
                 )
 
-            # Do not change follower direction during clog detection error flows.
-            # User can manually set follower direction as needed during recovery.
+            # Enable follower during clog pause so manual extrusion remains available for recovery
+            # Similar to stuck spool detection, keep follower forward for user intervention
+            if oams is not None and fps_state.current_spool_idx is not None:
+                # Save current follower state for potential restore on RESUME
+                current_direction = fps_state.direction if fps_state.following else 1
+                fps_state.clog.restore_follower = fps_state.following
+                fps_state.clog.restore_direction = current_direction
+
+                # Enable follower forward during clog pause for manual recovery
+                self._enable_follower(
+                    fps_name,
+                    fps_state,
+                    oams,
+                    1,  # Always forward during clog so user can manually extrude
+                    "clog pause - keep follower forward for manual recovery",
+                )
+                self.logger.info(f"Follower enabled forward on {fps_name} during clog pause for manual recovery")
 
     def start_monitors(self):
         """Start all monitoring timers"""
