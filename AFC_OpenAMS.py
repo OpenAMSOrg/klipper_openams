@@ -65,6 +65,7 @@ _ORIGINAL_PERFORM_INFINITE_RUNOUT = getattr(AFCLane, "_perform_infinite_runout",
 _ORIGINAL_PREP_CAPTURE_TD1 = getattr(AFCLane, "_prep_capture_td1", None)
 _ORIGINAL_GET_TD1_DATA = getattr(AFCLane, "get_td1_data", None)
 _ORIGINAL_TD1_PREP = getattr(afcPrep, "_td1_prep", None)
+_ORIGINAL_LANE_UNLOAD = None  # Will be set during patching
 
 class _VirtualRunoutHelper:
     """Minimal runout helper used by AMS-managed virtual sensors."""
@@ -693,25 +694,6 @@ class afcAMS(afcUnit):
               {name}
             </span>
             """).format(name=self.name)
-
-    def LANE_UNLOAD(self, cur_lane):
-        """Override LANE_UNLOAD to block manual ejection on OpenAMS lanes.
-
-        OpenAMS units manage filament automatically via hardware and don't support
-        manual lane ejection like Box Turtle units. Attempting manual ejection causes
-        Klipper to hang waiting for operations that won't complete properly.
-        """
-        self.logger.info(
-            f"LANE_UNLOAD is not supported for OpenAMS lane {cur_lane.name}. "
-            f"OpenAMS units handle filament automatically - just remove the spool physically. "
-            f"Use TOOL_UNLOAD if you need to unload from the toolhead."
-        )
-        if self._cached_gcode is not None:
-            self._cached_gcode.respond_info(
-                f"LANE_UNLOAD is not supported for OpenAMS lanes like {cur_lane.name}. "
-                f"OpenAMS units handle filament automatically - just remove the spool physically. "
-                f"Use TOOL_UNLOAD if you need to unload from the toolhead."
-            )
 
     def _ensure_virtual_tool_sensor(self) -> bool:
         """Resolve or create the virtual tool-start sensor for AMS extruders."""
@@ -4112,6 +4094,68 @@ def _patch_infinite_runout_handler() -> None:
     AFCLane._perform_infinite_runout = _ams_perform_infinite_runout
     AFCLane._ams_infinite_runout_patched = True
 
+def _patch_lane_unload_for_ams() -> None:
+    """Block LANE_UNLOAD for OpenAMS lanes to prevent Klipper hangs.
+
+    OpenAMS units manage filament automatically via hardware and don't support
+    manual lane ejection like Box Turtle units. Attempting manual ejection causes
+    the command to hang waiting for operations that won't complete properly.
+    """
+    global _ORIGINAL_LANE_UNLOAD
+
+    # Import here to avoid circular dependencies
+    try:
+        from extras.AFC import afc as AFC_Class
+    except Exception:
+        # If we can't import AFC, we can't patch it
+        return
+
+    if getattr(AFC_Class, "_ams_lane_unload_patched", False):
+        return
+
+    # Save original LANE_UNLOAD method
+    _ORIGINAL_LANE_UNLOAD = getattr(AFC_Class, "LANE_UNLOAD", None)
+    if not callable(_ORIGINAL_LANE_UNLOAD):
+        return
+
+    def _ams_lane_unload(self, cur_lane):
+        """Patched LANE_UNLOAD that blocks manual ejection on OpenAMS lanes."""
+        # Check if this is an OpenAMS lane
+        unit_obj = getattr(cur_lane, 'unit_obj', None)
+        if unit_obj is not None:
+            unit_type = getattr(unit_obj, 'type', None)
+            has_oams_name = hasattr(unit_obj, 'oams_name')
+
+            if unit_type == "OpenAMS" or has_oams_name:
+                # Block LANE_UNLOAD for OpenAMS lanes
+                lane_name = getattr(cur_lane, 'name', 'unknown')
+                self.logger.info(
+                    f"LANE_UNLOAD is not supported for OpenAMS lane {lane_name}. "
+                    f"OpenAMS units handle filament automatically - just remove the spool physically. "
+                    f"Use TOOL_UNLOAD if you need to unload from the toolhead."
+                )
+
+                # Try to respond to user via gcode
+                try:
+                    gcode = self.gcode or self.printer.lookup_object("gcode")
+                    if gcode:
+                        gcode.respond_info(
+                            f"LANE_UNLOAD is not supported for OpenAMS lanes like {lane_name}. "
+                            f"OpenAMS units handle filament automatically - just remove the spool physically. "
+                            f"Use TOOL_UNLOAD if you need to unload from the toolhead."
+                        )
+                except Exception:
+                    pass
+
+                return  # Block the operation
+
+        # Not an OpenAMS lane - call original LANE_UNLOAD
+        if callable(_ORIGINAL_LANE_UNLOAD):
+            return _ORIGINAL_LANE_UNLOAD(self, cur_lane)
+
+    AFC_Class.LANE_UNLOAD = _ams_lane_unload
+    AFC_Class._ams_lane_unload_patched = True
+
 def _has_openams_hardware(printer):
     """Check if any OpenAMS hardware is configured in the system.
 
@@ -4141,4 +4185,5 @@ def load_config_prefix(config):
     _patch_lane_pre_sensor_for_ams()
     _patch_extruder_for_virtual_ams()
     _patch_infinite_runout_handler()
+    _patch_lane_unload_for_ams()
     return afcAMS(config)
