@@ -4798,10 +4798,10 @@ class OAMSManager:
         # Schedule pause to happen ASAP (0.05s delay to let current command finish)
         self.reactor.register_timer(_do_pause, self.reactor.monotonic() + 0.05)
 
-    def _pause_printer_message(self, message, oams_name: Optional[str] = None):
+    def _pause_printer_message(self, message, oams_name: Optional[str] = None, notify_afc: bool = True):
         self.logger.info(message)
 
-        if AMSRunoutCoordinator is not None and oams_name:
+        if notify_afc and AMSRunoutCoordinator is not None and oams_name:
             try:
                 AMSRunoutCoordinator.notify_afc_error(self.printer, oams_name, message, pause=False)
             except Exception:
@@ -5684,9 +5684,11 @@ class OAMSManager:
                 self.logger.error(f"Failed to abort current action on {fps_name} during stuck spool pause")
 
         # Pause printer with error message
+        # CRITICAL: Do NOT notify AFC during stuck spool pause - AFC will try to unload which fails
+        # during printing. Just pause and let user manually fix the stuck spool.
         # SAFETY: Wrap pause in try/except to prevent crash if pause logic fails
         try:
-            self._pause_printer_message(message, fps_state.current_oams)
+            self._pause_printer_message(message, fps_state.current_oams, notify_afc=False)
             # Note: Removed reactor.pause() - cannot block in timer callback during printing
         except Exception:
             self.logger.error(f"Failed to pause printer during stuck spool on {fps_name} - continuing with error state")
@@ -6673,9 +6675,11 @@ class OAMSManager:
             fps_state.clog.active = True
 
             # Pause printer with error message
+            # CRITICAL: Do NOT notify AFC during clog pause - AFC will try to unload which fails
+            # during printing. Just pause and let user manually fix the clog.
             # SAFETY: Wrap pause in try/except to prevent crash if pause logic fails
             try:
-                self._pause_printer_message(message, fps_state.current_oams)
+                self._pause_printer_message(message, fps_state.current_oams, notify_afc=False)
                 # Note: Removed reactor.pause() - cannot block in timer callback
                 # System will settle naturally through event loop processing
             except Exception:
