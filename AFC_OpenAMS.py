@@ -694,6 +694,25 @@ class afcAMS(afcUnit):
             </span>
             """).format(name=self.name)
 
+    def LANE_UNLOAD(self, cur_lane):
+        """Override LANE_UNLOAD to block manual ejection on OpenAMS lanes.
+
+        OpenAMS units manage filament automatically via hardware and don't support
+        manual lane ejection like Box Turtle units. Attempting manual ejection causes
+        Klipper to hang waiting for operations that won't complete properly.
+        """
+        self.logger.info(
+            f"LANE_UNLOAD is not supported for OpenAMS lane {cur_lane.name}. "
+            f"OpenAMS units handle filament automatically - just remove the spool physically. "
+            f"Use TOOL_UNLOAD if you need to unload from the toolhead."
+        )
+        if self._cached_gcode is not None:
+            self._cached_gcode.respond_info(
+                f"LANE_UNLOAD is not supported for OpenAMS lanes like {cur_lane.name}. "
+                f"OpenAMS units handle filament automatically - just remove the spool physically. "
+                f"Use TOOL_UNLOAD if you need to unload from the toolhead."
+            )
+
     def _ensure_virtual_tool_sensor(self) -> bool:
         """Resolve or create the virtual tool-start sensor for AMS extruders."""
         if self._virtual_tool_sensor is not None:
