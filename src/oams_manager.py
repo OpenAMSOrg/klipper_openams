@@ -6814,15 +6814,6 @@ class OAMSManager:
         settings = self.clog_settings
         if extrusion_delta < settings["extrusion_window"]:
             # Not enough extrusion yet to check for clog
-            if (
-                fps_state.clog.last_wait_log_time is None
-                or now - fps_state.clog.last_wait_log_time >= 10.0
-            ):
-                fps_state.clog.last_wait_log_time = now
-                self.logger.debug(
-                    f"{fps_name}: Clog detection waiting for extrusion window - "
-                    f"extruded={extrusion_delta:.1f}mm (need {settings['extrusion_window']}mm)"
-                )
             return
 
         # CRITICAL: Check if average pressure is within the target band
@@ -6834,22 +6825,11 @@ class OAMSManager:
         # If pressure is outside the target band, this is NOT a clog condition
         # Could be stuck spool (too low), active heavy extrusion (too high), or other anomaly
         if pressure_deviation > settings["pressure_band"]:
-            self.logger.debug(
-                f"{fps_name}: Clog detection OK - pressure outside target band "
-                f"(pressure_mid={pressure_mid:.2f}, target={self.clog_pressure_target:.2f}, "
-                f"deviation={pressure_deviation:.2f} > band={settings['pressure_band']})"
-            )
             fps_state.prime_clog_tracker(extruder_pos, encoder_value, pressure, now)
             return
 
         if (encoder_delta > settings["encoder_slack"] or pressure_span > settings["pressure_band"]):
             # Encoder is moving or pressure is varying - filament is flowing
-            self.logger.debug(
-                f"{fps_name}: Clog detection OK - filament flowing "
-                f"(encoder_delta={encoder_delta} vs slack={settings['encoder_slack']}, "
-                f"pressure_span={pressure_span:.2f} vs band={settings['pressure_band']})"
-            )
-
             # If clog was previously active, clear it and ensure follower keeps up
             if fps_state.clog.active:
                 self.logger.info(
@@ -6891,11 +6871,6 @@ class OAMSManager:
 
         if remaining > 0:
             # Timer is counting down
-            self.logger.debug(
-                f"{fps_name}: CLOG COUNTDOWN - {remaining:.1f}s remaining "
-                f"(extruded={extrusion_delta:.1f}mm, encoder_delta={encoder_delta}, "
-                f"pressure_span={pressure_span:.2f})"
-            )
             return
 
         if not fps_state.clog.active:
