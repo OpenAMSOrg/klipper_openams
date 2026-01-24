@@ -68,7 +68,8 @@ class OAMS:
         self.section_name = config.get_name().split()[-1]
         self.mcu = mcu.get_printer_mcu(self.printer, config.get("mcu", "mcu"))
         self.reactor = self.printer.get_reactor()
-        afc_obj = self.printer.lookup_object("AFC")
+        # Use load_object to ensure AFC is loaded even if not yet initialized
+        afc_obj = self.printer.load_object(config, "AFC")
         self.logger = afc_obj.logger
 
         # OPTIMIZATION: Cache gcode object
@@ -346,7 +347,9 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         id = str(self.oams_idx)
         # OPTIMIZATION: Cache gcode object lookup
         if self._cached_gcode is None:
-            self._cached_gcode = self.printer.lookup_object("gcode")
+            self._cached_gcode = self.printer.lookup_object("gcode", None)
+            if self._cached_gcode is None:
+                return  # Gcode not available yet
 
         gcode = self._cached_gcode
 
@@ -679,7 +682,11 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         extrusion_speed_per_min = (60 * target_flow / (pi * (1.75 / 2) ** 2))
         extrusion_length = (extrusion_speed_per_min / 60 * 30)
 
-        gcode = self.printer.lookup_object("gcode")
+        # Use cached gcode object if available, otherwise lookup with None check
+        gcode = self._cached_gcode or self.printer.lookup_object("gcode", None)
+        if gcode is None:
+            gcmd.error("Failed to access gcode object")
+            return
 
         gcode.send("M104 S%f" % target_temp)
         gcode.send("G1 E%f F%f" % (extrusion_length, extrusion_speed_per_min))
@@ -702,7 +709,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         if self.action_status_code == OAMSOpCode.SUCCESS:
             value = self.u32_to_float(self.action_status_value)
             gcmd.respond_info("Calibrated HES %d to %f threshold" % (spool_idx, value))
-            configfile = self.printer.lookup_object("configfile")
+            configfile = self.printer.lookup_object("configfile", None)
+            if configfile is None:
+                gcmd.error("Failed to access configfile object")
+                return
 
             self.hub_hes_on[spool_idx] = value
             values = ",".join(map(str, self.hub_hes_on))
@@ -725,7 +735,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             self.reactor.pause(self.reactor.monotonic() + 0.5)
         if self.action_status_code == OAMSOpCode.SUCCESS:
             gcmd.respond_info("Calibrated PTFE length to %d" % self.action_status_value)
-            configfile = self.printer.lookup_object("configfile")
+            configfile = self.printer.lookup_object("configfile", None)
+            if configfile is None:
+                gcmd.error("Failed to access configfile object")
+                return
 
             configfile.set(self.name, "ptfe_length", "%d" % (self.action_status_value,))
             gcmd.respond_info("Done calibrating clicks, please note this value and update parameter ptfe_length in the configuration")
