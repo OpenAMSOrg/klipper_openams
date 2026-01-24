@@ -59,6 +59,10 @@ reload_before_toolhead_distance: 0.0
 
 # Optional: lane-wide clog sensitivity (low/medium/high)
 clog_sensitivity: medium
+
+# Optional: enable/disable detection systems
+enable_clog_detection: True
+enable_stuck_spool_detection: True
 ```
 
 </details>
@@ -88,8 +92,7 @@ map: T1
 mcu: oams_mcu1
 load_retry_max: 3
 unload_retry_max: 2
-retry_backoff_base: 1.0
-retry_backoff_max: 5.0
+retry_delay: 3.0
 ```
 
 </details>
@@ -129,7 +132,7 @@ The system has transitioned from filament groups to a lane-based architecture fo
 
 - **Lane-Based Architecture**: Integration with AFC lanes for flexible spool configuration and mapping
 - **Event-Driven Sensors**: Efficient event-based monitoring instead of constant polling for better performance
-- **Automatic Retry Logic**: Configurable retry attempts for both load and unload operations with exponential backoff
+- **Automatic Retry Logic**: Configurable retry attempts for both load and unload operations with a configurable delay
 - **Clog Detection**: Three sensitivity levels (low, medium, high) to detect filament clogs during printing
 - **Runout Handling**: Automatic filament runout detection integrated with AFC lane system
 - **Infinite Spooling**: Seamless lane switching for continuous printing using AFC runout configuration
@@ -357,6 +360,10 @@ reload_before_toolhead_distance: 0.0
 # Controls how aggressive the clog detection system is
 clog_sensitivity: medium
 
+# Optional: Enable/disable detection systems (default: True)
+enable_clog_detection: True
+enable_stuck_spool_detection: True
+
 # Optional: F1S runout debounce duration (seconds)
 # Defaults to AFC debounce_delay if available
 debounce_delay: 0.0
@@ -365,6 +372,7 @@ debounce_delay: 0.0
 **Configuration Tips:**
 - **reload_before_toolhead_distance**: Set this to a positive value to load replacement spool sooner. Helpful with longer ptfe lengths and faster printing speeds. May require manual tuning to get just right for your printer.
 - **clog_sensitivity**: Start with `medium`. Increase to `high` if clogs go undetected. Decrease to `low` if false positives occur.
+- **enable_clog_detection / enable_stuck_spool_detection**: Disable only when diagnosing issues or if you need to run without automated pauses.
 - **debounce_delay**: Increase if you see false runouts from noisy F1S sensors.
 
 If you need a per-FPS override, set `reload_before_toolhead_distance` in the `[fps ...]` section for that sensor.
@@ -384,8 +392,9 @@ mcu: oams_mcu1
 # Retry Configuration (all optional - defaults shown in comments)
 load_retry_max: 3              # Maximum number of load retry attempts (default: 3)
 unload_retry_max: 2            # Maximum number of unload retry attempts (default: 2)
-retry_backoff_base: 1.0        # Base delay in seconds between retries (default: 1.0)
-retry_backoff_max: 5.0         # Maximum delay between retries (default: 5.0)
+retry_delay: 3.0               # Delay in seconds between retries (default: 3.0)
+# Extra retract overlap before unload (default: -10.0)
+extra_retract: -10.0
 # auto_unload_on_failed_load: True  # Defaults to True - only set if you need False
 
 # Optional load behavior
@@ -426,7 +435,7 @@ current_kd: 0.0
 
 2. **Retry Settings**: The defaults work well for most setups, but you may need to adjust:
    - Increase `load_retry_max` if filament occasionally fails to load on first attempt
-   - Increase `retry_backoff_base` if your hardware needs more recovery time
+   - Increase `retry_delay` if your hardware needs more recovery time
   
 
 ### Retry Behavior
@@ -471,6 +480,9 @@ Fine-tune pressure-based detection in `[oams_manager]` when calibrating new hard
 # Delay before stuck spool checks begin after a load starts (default: 8.0s)
 stuck_spool_load_grace: 8.0
 
+# Max stuck spool retry attempts before pause (default: 2)
+stuck_spool_max_attempts: 2
+
 # Pressure thresholds for stuck spool detection (defaults: 0.08 / 0.12)
 stuck_spool_pressure_threshold: 0.08
 stuck_spool_pressure_clear_threshold: 0.12  # Must be greater than threshold
@@ -487,12 +499,11 @@ load_fps_stuck_threshold: 0.75
 # Pressure drop threshold to confirm engagement during post-load verification (default: 0.6)
 engagement_pressure_threshold: 0.6
 
-# Default preretract distance (mm) applied before unloads (default: -10.0)
-preretract: -10.0
 ```
 
 **Tuning guidance:**
 - Increase `stuck_spool_load_grace` if sensitive sensors flag issues during the first seconds of a load.
+- Raise `stuck_spool_max_attempts` if you want the manager to retry more before pausing.
 - Raise `stuck_spool_pressure_threshold` or `load_fps_stuck_threshold` if reliable hardware still reports premature “stuck” errors.
 - Lower `clog_pressure_target` or shorten `post_load_pressure_dwell` if high-flow materials routinely trigger clog detection.
 
@@ -714,7 +725,7 @@ If you experience issues with stuck spool detection during load or unload operat
 [oams oams1]
 load_retry_max: 3         # Try 3 times before giving up
 unload_retry_max: 2       # Try 2 times before giving up
-retry_backoff_base: 1.0   # Wait 1s, 2s, 3s between attempts
+retry_delay: 3.0          # Delay between retry attempts
 ```
 
 **Verify retry behavior:**
