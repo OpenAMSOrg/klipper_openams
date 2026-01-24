@@ -126,7 +126,10 @@ class _VirtualFilamentSensor:
                 hidden_key = "_" + self._object_name
                 objects[hidden_key] = objects.pop(self._object_name)
 
-        gcode = printer.lookup_object("gcode")
+        # Use lookup with None to prevent errors if gcode not yet loaded
+        gcode = printer.lookup_object("gcode", None)
+        if gcode is None:
+            return
         try:
             gcode.register_mux_command("QUERY_FILAMENT_SENSOR", "SENSOR", name, self.cmd_QUERY_FILAMENT_SENSOR, desc=self.QUERY_HELP)
         except Exception:
@@ -724,7 +727,10 @@ class afcAMS(afcUnit):
             sensor = self.printer.lookup_object(f"filament_switch_sensor {normalized}", None)
 
         if sensor is None:
-            pins = self.printer.lookup_object("pins")
+            # Use lookup with None to prevent errors if pins not yet loaded
+            pins = self.printer.lookup_object("pins", None)
+            if pins is None:
+                return False
             if not getattr(self.afc, "_virtual_ams_chip_registered", False):
                 try:
                     pins.register_chip("afc_virtual_ams", self.afc)
