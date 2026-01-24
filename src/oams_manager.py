@@ -872,7 +872,8 @@ class OAMSManager:
         self.config = config
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
-        self.afc = self.printer.lookup_object("AFC")
+        # Use load_object to ensure AFC is loaded even if not yet initialized
+        self.afc = self.printer.load_object(config, "AFC")
         self.logger = self.afc.logger
 
         self.oams: Dict[str, Any] = {}
@@ -1965,7 +1966,8 @@ class OAMSManager:
         return None, None, None
         
     def register_commands(self):
-        gcode = self.printer.lookup_object("gcode")
+        # Use load_object to ensure gcode is loaded
+        gcode = self.printer.load_object(self.config, "gcode")
 
         commands = [
             ("OAMSM_UNLOAD_FILAMENT", self.cmd_UNLOAD_FILAMENT, self.cmd_UNLOAD_FILAMENT_help),
