@@ -66,6 +66,9 @@ _ORIGINAL_PREP_CAPTURE_TD1 = getattr(AFCLane, "_prep_capture_td1", None)
 _ORIGINAL_GET_TD1_DATA = getattr(AFCLane, "get_td1_data", None)
 _ORIGINAL_TD1_PREP = getattr(afcPrep, "_td1_prep", None)
 _ORIGINAL_LANE_UNLOAD = None  # Will be set during patching
+_ORIGINAL_BUFFER_SET_MULTIPLIER = None  # Will be set during patching
+_ORIGINAL_BUFFER_QUERY = None  # Will be set during patching
+_ORIGINAL_BUFFER_GET_STATUS = None  # Will be set during patching
 
 class _VirtualRunoutHelper:
     """Minimal runout helper used by AMS-managed virtual sensors."""
@@ -2561,7 +2564,8 @@ class afcAMS(afcUnit):
             cur_lane.select_lane()
 
             if afc_self.tool_cut:
-                afc_self.afc_stats.increase_cut_total()
+                # Stats moved from AFC_stats to AFC_extruder (AFCExtruderStats)
+                cur_lane.extruder_obj.estats.increase_cut_total()
                 afc_self.gcode.run_script_from_command(afc_self.tool_cut_cmd)
                 afc_self.afcDeltaTime.log_with_time("TOOL_UNLOAD: After cut")
                 afc_self.function.log_toolhead_pos()
@@ -2606,7 +2610,9 @@ class afcAMS(afcUnit):
                 )
                 afc_self.gcode.run_script_from_command("OAMSM_UNLOAD_FILAMENT FPS={}".format(fps_id))
 
-                cur_lane.loaded_to_hub = True
+                # OpenAMS: After unload, filament retracts to f1s (shared prep/load sensor), not hub
+                # Hub sensor will be FALSE. Set loaded_to_hub accordingly.
+                cur_lane.loaded_to_hub = False
                 cur_lane.set_tool_unloaded()
                 cur_lane.status = AFCLaneState.LOADED
                 cur_lane.unit_obj.lane_tool_unloaded(cur_lane)
@@ -4254,6 +4260,121 @@ def _patch_infinite_runout_handler() -> None:
     AFCLane._perform_infinite_runout = _ams_perform_infinite_runout
     AFCLane._ams_infinite_runout_patched = True
 
+def _patch_buffer_for_ams() -> None:
+    """Patch AFC_buffer methods to handle None extruder_stepper safely.
+
+    The base AFCLane class can have extruder_stepper set to None, but some
+    buffer methods assume it's always available. This patch adds null checks
+    to prevent AttributeError crashes.
+    """
+    global _ORIGINAL_BUFFER_SET_MULTIPLIER, _ORIGINAL_BUFFER_QUERY, _ORIGINAL_BUFFER_GET_STATUS
+
+    # Import here to avoid circular dependencies
+    try:
+        from extras.AFC_buffer import AFCTrigger
+    except Exception:
+        # If we can't import AFC_buffer, we can't patch it
+        return
+
+    if getattr(AFCTrigger, "_ams_buffer_patched", False):
+        return
+
+    # Save original methods
+    _ORIGINAL_BUFFER_SET_MULTIPLIER = getattr(AFCTrigger, "set_multiplier", None)
+    _ORIGINAL_BUFFER_QUERY = getattr(AFCTrigger, "cmd_QUERY_BUFFER", None)
+    _ORIGINAL_BUFFER_GET_STATUS = getattr(AFCTrigger, "get_status", None)
+
+    if not callable(_ORIGINAL_BUFFER_SET_MULTIPLIER):
+        return
+
+    def _patched_set_multiplier(self, multiplier):
+        """Patched set_multiplier with null check for extruder_stepper."""
+        if not self.enable:
+            return
+        cur_stepper = self.afc.function.get_current_lane_obj()
+        if cur_stepper is None:
+            return
+        if cur_stepper.extruder_stepper is None:
+            return
+
+        # Execute the original method's logic with the fix
+        cur_stepper.update_rotation_distance(multiplier)
+        if multiplier > 1:
+            self.last_state = "Advancing"
+            if self.led:
+                self.afc.function.afc_led(self.led_trailing, self.led_index)
+        elif multiplier < 1:
+            self.last_state = "Trailing"
+            if self.led:
+                self.afc.function.afc_led(self.led_advancing, self.led_index)
+        self.logger.debug("New rotation distance after applying factor: {:.4f}".format(
+            cur_stepper.extruder_stepper.stepper.get_rotation_distance()[0]))
+
+    def _patched_cmd_query_buffer(self, gcmd):
+        """Patched cmd_QUERY_BUFFER with null check for extruder_stepper."""
+        # We need to reimplement the method with the fix since we can't easily
+        # inject the check into the middle of the original method
+        state_mapping = {
+            "Trailing": ' (buffer is compressing)',
+            "Advancing": ' (buffer is expanding)',
+        }
+
+        buffer_status = self.buffer_status()
+        state_info = "{}{}".format(buffer_status, state_mapping.get(buffer_status, ''))
+
+        if self.enable:
+            lane = self.afc.function.get_current_lane_obj()
+            if lane is not None and lane.extruder_stepper is not None:
+                stepper = lane.extruder_stepper.stepper
+                rotation_dist = stepper.get_rotation_distance()[0]
+                state_info += ("\n{} Rotation distance: {:.4f}".format(lane.name, rotation_dist))
+            if self.error_sensitivity > 0:
+                state_info += "\nFault detection enabled, sensitivity {}".format(self.error_sensitivity)
+
+        self.logger.info("{} : {}".format(self.name, state_info))
+
+    def _patched_get_status(self, eventtime=None):
+        """Patched get_status with null check for extruder_stepper."""
+        self.response = {}
+        self.response['state'] = self.last_state
+        self.response['lanes'] = [lane.name for lane in self.lanes.values()]
+        self.response['enabled'] = self.enable
+
+        # Add current rotation distance if buffer is enabled and lane is loaded
+        if self.enable:
+            lane = self.afc.function.get_current_lane_obj()
+            if lane is not None and lane.extruder_stepper is not None:
+                stepper = lane.extruder_stepper.stepper
+                self.response['rotation_distance'] = stepper.get_rotation_distance()[0]
+            else:
+                self.response['rotation_distance'] = None
+        else:
+            self.response['rotation_distance'] = None
+
+        # Add fault detection information
+        self.response['fault_detection_enabled'] = self.error_sensitivity > 0
+        self.response['error_sensitivity'] = self.error_sensitivity
+        self.response['fault_timer'] = self.fault_timer
+        # Add current extruder position and error threshold only when actively tracking
+        if self.error_sensitivity > 0 and self.filament_error_pos is not None:
+            current_pos = self.get_extruder_pos()
+            if current_pos is not None:
+                self.response['distance_to_fault'] = self.filament_error_pos - current_pos
+                self.response['filament_error_pos'] = self.filament_error_pos
+                self.response['current_pos'] = current_pos
+            else:
+                self.response['distance_to_fault'] = None
+        else:
+            self.response['distance_to_fault'] = None
+
+        return self.response
+
+    # Apply patches
+    AFCTrigger.set_multiplier = _patched_set_multiplier
+    AFCTrigger.cmd_QUERY_BUFFER = _patched_cmd_query_buffer
+    AFCTrigger.get_status = _patched_get_status
+    AFCTrigger._ams_buffer_patched = True
+
 def _patch_lane_unload_for_ams() -> None:
     """Block LANE_UNLOAD for OpenAMS lanes to prevent Klipper hangs.
 
@@ -4346,4 +4467,5 @@ def load_config_prefix(config):
     _patch_extruder_for_virtual_ams()
     _patch_infinite_runout_handler()
     _patch_lane_unload_for_ams()
+    _patch_buffer_for_ams()
     return afcAMS(config)
