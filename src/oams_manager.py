@@ -2236,27 +2236,44 @@ class OAMSManager:
         gcmd.respond_info("OAMS errors cleared and system re-initialized")
 
     def _load_afc_var_unit_snapshot(self) -> Optional[Dict[str, Any]]:
-        """Load the current AFC.var.unit snapshot from the live AFC object."""
+        """Load the current AFC.var.unit snapshot from the JSON file on disk."""
+        import json
+        import os
 
         afc = self._get_afc()
         if afc is None:
             return None
 
         try:
-            var_obj = getattr(afc, "var", None)
-            if isinstance(var_obj, dict):
-                snapshot = var_obj.get("unit")
+            # AFC saves to VarFile + '.unit' (e.g., printer_data/config/AFC/AFC.var.unit)
+            var_file_path = getattr(afc, "VarFile", None)
+            if not var_file_path:
+                self.logger.debug("AFC.VarFile path not found")
+                return None
 
-            else:
-                snapshot = getattr(var_obj, "unit", None)
+            unit_file = f"{var_file_path}.unit"
+
+            # Check if file exists and has content
+            if not os.path.exists(unit_file) or os.stat(unit_file).st_size == 0:
+                self.logger.debug(f"AFC.var.unit file not found or empty: {unit_file}")
+                return None
+
+            # Load and parse JSON
+            with open(unit_file, 'r') as f:
+                snapshot = json.load(f)
 
             if isinstance(snapshot, dict):
                 return snapshot
-        except Exception:
-            self.logger.debug("Failed to read AFC.var.unit from live AFC object")
+            else:
+                self.logger.debug("AFC.var.unit file contents are not a dictionary")
+                return None
 
-
-        return None
+        except json.JSONDecodeError as e:
+            self.logger.debug(f"Failed to parse AFC.var.unit JSON: {e}")
+            return None
+        except Exception as e:
+            self.logger.debug(f"Failed to read AFC.var.unit from file: {e}")
+            return None
 
     def _sync_virtual_tool_sensors(self, gcmd: Optional[Any] = None) -> None:
         """Sync AFC virtual tool sensors based on current lane state."""
