@@ -2070,35 +2070,16 @@ class OAMSManager:
                         restart_monitors = False
                         continue
 
-                    # Step 1: Clear hardware errors
+                    # Step 1: Clear hardware errors (this also clears all LED errors)
+                    # Note: clear_errors() already loops through all LEDs and clears them
                     oam.clear_errors()
-                    self.reactor.pause(self.reactor.monotonic() + 0.1)  # Wait for MCU
+                    self.reactor.pause(self.reactor.monotonic() + 0.2)  # Wait for MCU to process all commands
                     if not self._is_oams_mcu_ready(oam):
                         restart_monitors = False
                         continue
 
-                    # Step 2: Explicitly clear all spool LED errors
-                    # This ensures LEDs are actually off, not just tracked as off
+                    # Step 2: Clear LED tracking state
                     bay_count = getattr(oam, "num_spools", 4) or 4
-                    for bay_idx in range(bay_count):
-                        if not self._is_oams_mcu_ready(oam):
-                            restart_monitors = False
-                            break
-                        try:
-                            if hasattr(oam, "set_led_error"):
-                                oam.set_led_error(bay_idx, 0)
-                        except Exception:
-                            self.logger.warning(f"Failed to clear LED {bay_idx} on {oams_name}")
-                    if not self._is_oams_mcu_ready(oam):
-                        continue
-
-                    # Wait for all LED commands to complete
-                    self.reactor.pause(self.reactor.monotonic() + 0.2)
-                    if not self._is_oams_mcu_ready(oam):
-                        restart_monitors = False
-                        continue
-
-                    # Step 3: Clear LED tracking state
                     for bay_idx in range(bay_count):
                         led_key = f"{oams_name}:{bay_idx}"
                         self.led_error_state[led_key] = 0
@@ -4623,13 +4604,18 @@ class OAMSManager:
                 if detected_lane == lane_name:
                     return False, f"Lane {lane_name} is already loaded to {fps_name}"
 
+                # Use AFC's TOOL_UNLOAD to properly unload with cut, form_tip, and retract
+                # instead of raw OAMSM_UNLOAD_FILAMENT which skips the cut sequence
                 try:
                     gcode = self._gcode_obj
                     if gcode is None:
                         gcode = self.printer.lookup_object("gcode")
                         self._gcode_obj = gcode
-                    fps_param = fps_name.replace("fps ", "", 1)
-                    gcode.run_script_from_command(f"OAMSM_UNLOAD_FILAMENT FPS={fps_param}")
+                    self.logger.info(
+                        f"Auto-unloading {detected_lane} from {fps_name} before loading {lane_name} "
+                        f"(using TOOL_UNLOAD for proper cut/retract sequence)"
+                    )
+                    gcode.run_script_from_command(f"TOOL_UNLOAD LANE={detected_lane}")
                     gcode.run_script_from_command("M400")
                 except Exception:
                     return False, f"Failed to unload existing lane {detected_lane} from {fps_name}"
