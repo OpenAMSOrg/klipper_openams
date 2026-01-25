@@ -1,4 +1,4 @@
-# Armored Turtle Automated Filament Changer  # Armored Turtle Automated Filament Changer  
+# Armored Turtle Automated Filament Changer  
 #
 # Copyright (C) 2024 Armored Turtle
 #
@@ -1301,28 +1301,12 @@ class afcAMS(afcUnit):
         self._saved_unit_mtime = mtime
         return self._saved_unit_cache
 
-    def _get_live_unit_snapshot(self) -> Optional[Dict[str, Any]]:
-        afc = self.printer.lookup_object("AFC", None)
-        if afc is None:
-            return None
-
-        try:
-            var_obj = getattr(afc, "var", None)
-            if isinstance(var_obj, dict):
-                snapshot = var_obj.get("unit")
-            else:
-                snapshot = getattr(var_obj, "unit", None)
-            if isinstance(snapshot, dict):
-                return snapshot
-        except Exception:
-            return None
-
-        return None
-
     def _get_unit_snapshot(self) -> Optional[Dict[str, Any]]:
-        snapshot = self._get_live_unit_snapshot()
-        if isinstance(snapshot, dict):
-            return snapshot
+        """Get AFC.var.unit snapshot from file.
+
+        AFC doesn't have a .var object attribute - it saves to VarFile + '.unit' file.
+        Always load from the saved file which is kept up-to-date by AFC's save_vars().
+        """
         return self._load_saved_unit_snapshot()
 
     def _find_lane_snapshot(self, lane_name: Optional[str], unit_name: Optional[str] = None) -> Optional[Dict[str, Any]]:
