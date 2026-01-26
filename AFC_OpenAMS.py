@@ -50,6 +50,7 @@ try:
         LaneRegistry,
         AMSEventBus,
         normalize_extruder_name,
+        OPENAMS_VERSION,
     )
 except Exception:
     AMSHardwareService = None
@@ -57,8 +58,7 @@ except Exception:
     LaneRegistry = None
     AMSEventBus = None
     normalize_extruder_name = None
-
-OPENAMS_VERSION = "0.0.3"
+    OPENAMS_VERSION = "0.0.3"  # Fallback if import fails
 
 _ORIGINAL_LANE_PRE_SENSOR = getattr(AFCLane, "get_toolhead_pre_sensor_state", None)
 _ORIGINAL_PERFORM_INFINITE_RUNOUT = getattr(AFCLane, "_perform_infinite_runout", None)
@@ -67,8 +67,8 @@ _ORIGINAL_GET_TD1_DATA = getattr(AFCLane, "get_td1_data", None)
 _ORIGINAL_TD1_PREP = getattr(afcPrep, "_td1_prep", None)
 _ORIGINAL_LANE_UNLOAD = None  # Will be set during patching
 _ORIGINAL_BUFFER_SET_MULTIPLIER = None  # Will be set during patching
-_ORIGINAL_BUFFER_QUERY = None  # Will be set during patching
 _ORIGINAL_BUFFER_GET_STATUS = None  # Will be set during patching
+_ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE = None  # Will be set during patching
 
 class _VirtualRunoutHelper:
     """Minimal runout helper used by AMS-managed virtual sensors."""
@@ -263,6 +263,11 @@ class afcAMS(afcUnit):
         self.type = "OpenAMS"
         self.logger = self.afc.logger
 
+        # AMS units don't have physical buffers - force buffer_obj to None
+        # This prevents buffer monitoring/fault detection from running on AMS lanes
+        # even if user accidentally configured a buffer parameter
+        self.buffer_obj = None
+
         # Ensure LED attributes are set (inherited from AFC_unit but may not be set if AFC base is missing)
         # These are needed by AFC_lane.py handle_unit_connect (lines 391-393)
         if not hasattr(self, 'led_tool_loaded'):
@@ -295,12 +300,12 @@ class afcAMS(afcUnit):
             except Exception:
                 self.logger.error("Failed to subscribe to AMS events")
 
-        # PHASE 2 REFACTOR: Remove duplicate state tracking dictionaries
-        # AFC native objects already track this state:
-        # - extruder.lane_loaded (replaces _last_loaded_lane_by_extruder)
-        # - lane.load_state (replaces _last_lane_states)
-        # - lane.loaded_to_hub (replaces _last_hub_states)
-        # - lane.tool_loaded (replaces _last_virtual_tool_state and _lane_tool_latches)
+        # NOTE: This class uses AFC native state exclusively (no duplicate tracking):
+        # - extruder.lane_loaded - which lane is loaded to toolhead
+        # - lane.load_state - filament at F1S sensor
+        # - lane.loaded_to_hub - filament at hub sensor
+        # - lane.tool_loaded - filament loaded to extruder
+        # Previous versions maintained local caches, now removed for single source of truth
 
         self._saved_unit_cache: Optional[Dict[str, Any]] = None
         self._saved_unit_mtime: Optional[float] = None
@@ -648,6 +653,17 @@ class afcAMS(afcUnit):
             self._cached_oams_index = getattr(self.oams, "oams_idx", None)
 
         self._ensure_virtual_tool_sensor()
+
+        # CRITICAL: Ensure all AMS lanes have buffer_obj = None
+        # AMS units don't have physical buffers - this prevents buffer monitoring
+        # from running even if users accidentally configure buffers at lane level
+        for lane in self.lanes.values():
+            if lane.buffer_obj is not None:
+                self.logger.warning(
+                    f"Lane {lane.name} had buffer '{lane.buffer_obj.name}' configured, "
+                    f"but OpenAMS units don't have physical buffers. Removing buffer assignment."
+                )
+            lane.buffer_obj = None
 
         #  Register each lane with the shared registry
         for lane in self.lanes.values():
@@ -1599,7 +1615,6 @@ class afcAMS(afcUnit):
                 self.lane_fault(cur_lane)
                 msg += '<span class=error--text> NOT READY</span>'
                 cur_lane.do_enable(False)
-                cur_lane.disable_buffer()
                 msg = '<span class=error--text>CHECK FILAMENT Prep: False - Load: True</span>'
                 succeeded = False
         else:
@@ -1608,20 +1623,11 @@ class afcAMS(afcUnit):
             if not cur_lane.load_state:
                 msg += '<span class=error--text> NOT LOADED</span>'
                 self.lane_not_ready(cur_lane)
-                cur_lane.disable_buffer()
                 succeeded = False
             else:
                 cur_lane.status = AFCLaneState.LOADED
                 msg += '<span class=success--text> AND LOADED</span>'
                 self.lane_illuminate_spool(cur_lane)
-
-                # Enable buffer if: (prep AND hub sensor) OR tool_loaded
-                # Check hub sensor to distinguish loaded lanes from lanes with just filament present
-                hub_loaded = cur_lane.hub_obj and cur_lane.hub_obj.state
-                if hub_loaded or cur_lane.tool_loaded:
-                    cur_lane.enable_buffer()
-                else:
-                    cur_lane.disable_buffer()
 
                 if cur_lane.tool_loaded:
                     tool_ready = (cur_lane.get_toolhead_pre_sensor_state() or cur_lane.extruder_obj.tool_start == "buffer" or cur_lane.extruder_obj.tool_end_state)
@@ -1646,8 +1652,6 @@ class afcAMS(afcUnit):
                     elif tool_ready:
                         msg += '<span class=error--text> error in ToolHead. Lane identified as loaded but not identified as loaded in extruder</span>'
                         succeeded = False
-                        # Disable buffer on error
-                        cur_lane.disable_buffer()
 
         if assignTcmd:
             self.afc.function.TcmdAssign(cur_lane)
@@ -2108,25 +2112,25 @@ class afcAMS(afcUnit):
         return False, msg, 0
 
     def _sync_afc_from_hardware_at_startup(self):
-        """Align AFC state with OpenAMS hardware sensors during startup.
+        """Align AFC state with OpenAMS hardware sensors.
 
-        After Klipper restarts, AFC.var.unit might have stale state (e.g., from a crash).
-        This method uses hardware sensors as the source of truth to update AFC if needed.
+        This reconciles AFC.var.unit and AFC live state with actual hardware sensors.
+        Can be called at startup or on-demand (e.g., OAMSM_CLEAR_ERRORS).
 
         Priority hierarchy:
         1. Tool sensor (F1S/virtual) = Highest priority (actual filament in toolhead)
         2. Hub sensor = Secondary (filament present in AMS)
-        3. AFC.var.unit = Lowest priority (might be stale after restart)
+        3. AFC.var.unit = Lowest priority (might be stale)
         """
         if not hasattr(self, 'afc') or self.afc is None:
-            self.logger.debug("Startup sync: AFC not available, skipping")
+            self.logger.debug("State sync: AFC not available, skipping")
             return
 
         if not hasattr(self, 'lanes') or not self.lanes:
-            self.logger.debug("Startup sync: No lanes configured, skipping")
+            self.logger.debug("State sync: No lanes configured, skipping")
             return
 
-        self.logger.info(f"Startup sync: Reconciling AFC state with {self.name} hardware sensors")
+        self.logger.info(f"State sync: Reconciling AFC state with {self.name} hardware sensors")
 
         synced_count = 0
         cleared_count = 0
@@ -2159,7 +2163,15 @@ class afcAMS(afcUnit):
                     pass
 
                 # Hub sensor shows filament in AMS (but not necessarily in toolhead)
-                hub_loaded = getattr(lane, 'loaded_to_hub', False)
+                # CRITICAL: Read ACTUAL hardware sensor, not AFC state!
+                hub_loaded = False
+                if self.oams is not None:
+                    try:
+                        spool_index = self._get_openams_spool_index(lane)
+                        if spool_index is not None:
+                            hub_loaded = bool(self.oams.hub_hes_value[spool_index])
+                    except Exception:
+                        pass
 
                 # Read what AFC THINKS
                 afc_lane_loaded = getattr(extruder_obj, 'lane_loaded', None)
@@ -2178,14 +2190,33 @@ class afcAMS(afcUnit):
                     if extruder_name in extruder_loaded_lanes and len(extruder_loaded_lanes[extruder_name]) > 1:
                         # Multiple lanes show loaded for same extruder - don't auto-fix
                         self.logger.error(
-                            f"Startup sync: Multiple lanes show tool filament for {extruder_name}: "
+                            f"State sync: Multiple lanes show tool filament for {extruder_name}: "
                             f"{extruder_loaded_lanes[extruder_name]}. Manual intervention required."
                         )
                         conflict_count += 1
                         continue
 
+                    # Check if AFC thinks a non-AMS lane is loaded - don't override non-AMS lanes!
+                    if afc_lane_loaded is not None:
+                        # Look up what AFC thinks is loaded and check if it's an AMS lane
+                        loaded_lane_obj = self.afc.lanes.get(afc_lane_loaded) if hasattr(self.afc, 'lanes') else None
+                        if loaded_lane_obj is not None:
+                            loaded_unit_obj = getattr(loaded_lane_obj, 'unit_obj', None)
+                            loaded_unit_type = getattr(loaded_unit_obj, 'type', None) if loaded_unit_obj else None
+
+                            if loaded_unit_type != "OpenAMS":
+                                # AFC thinks a non-AMS lane (Box Turtle, etc.) is loaded
+                                # Don't auto-correct based on AMS sensors!
+                                self.logger.debug(
+                                    f"State sync: AMS sensors show {lane_name} on {extruder_name}, "
+                                    f"but AFC thinks non-AMS lane '{afc_lane_loaded}' (type={loaded_unit_type}) is loaded. "
+                                    f"Skipping auto-correction to preserve non-AMS state."
+                                )
+                                skipped_count += 1
+                                continue
+
                     self.logger.info(
-                        f"Startup sync: Sensors show {lane_name} loaded to {extruder_name}, "
+                        f"State sync: Sensors show {lane_name} loaded to {extruder_name}, "
                         f"but AFC thinks '{afc_lane_loaded}' is loaded. Updating AFC to match hardware."
                     )
                     try:
@@ -2195,14 +2226,14 @@ class afcAMS(afcUnit):
                         if hasattr(self.afc, 'save_vars'):
                             self.afc.save_vars()
                     except Exception as e:
-                        self.logger.error(f"Startup sync: Failed to update AFC for {lane_name}: {e}")
+                        self.logger.error(f"State sync: Failed to update AFC for {lane_name}: {e}")
 
                 elif not tool_loaded and afc_thinks_this_lane:
                     # AFC thinks loaded but no filament detected
                     if not hub_loaded:
                         # Really empty - clear stale AFC state
                         self.logger.info(
-                            f"Startup sync: No filament detected for {lane_name}, but AFC thinks it's loaded. "
+                            f"State sync: No filament detected for {lane_name}, but AFC thinks it's loaded. "
                             f"Clearing stale AFC state."
                         )
                         try:
@@ -2212,30 +2243,30 @@ class afcAMS(afcUnit):
                             if hasattr(self.afc, 'save_vars'):
                                 self.afc.save_vars()
                         except Exception as e:
-                            self.logger.error(f"Startup sync: Failed to clear AFC state for {lane_name}: {e}")
+                            self.logger.error(f"State sync: Failed to clear AFC state for {lane_name}: {e}")
                     else:
                         # Filament in hub but not tool - this is a mid-load state, don't change it
                         self.logger.debug(
-                            f"Startup sync: {lane_name} has filament in hub but not tool. "
+                            f"State sync: {lane_name} has filament in hub but not tool. "
                             f"Leaving AFC state as-is (mid-load state)."
                         )
                         skipped_count += 1
 
                 elif tool_loaded and afc_thinks_this_lane:
                     # Hardware and AFC agree - all good
-                    self.logger.debug(f"Startup sync: {lane_name} state matches between hardware and AFC")
+                    self.logger.debug(f"State sync: {lane_name} state matches between hardware and AFC")
 
                 elif not tool_loaded and not afc_thinks_this_lane:
                     # Both agree it's not loaded - all good
-                    self.logger.debug(f"Startup sync: {lane_name} correctly shows as unloaded in both hardware and AFC")
+                    self.logger.debug(f"State sync: {lane_name} correctly shows as unloaded in both hardware and AFC")
 
             except Exception as e:
-                self.logger.error(f"Startup sync: Failed to process lane {getattr(lane, 'name', 'unknown')}: {e}")
+                self.logger.error(f"State sync: Failed to process lane {getattr(lane, 'name', 'unknown')}: {e}")
                 skipped_count += 1
 
         # Summary log
         self.logger.info(
-            f"Startup sync complete for {self.name}: "
+            f"State sync complete for {self.name}: "
             f"{synced_count} lanes synced to AFC, "
             f"{cleared_count} stale states cleared, "
             f"{skipped_count} skipped, "
@@ -2244,13 +2275,26 @@ class afcAMS(afcUnit):
 
         if conflict_count > 0:
             self.logger.error(
-                f"Startup sync: {conflict_count} conflicts detected. "
+                f"State sync: {conflict_count} conflicts detected. "
                 f"Multiple lanes show loaded for the same extruder. "
                 f"Use TOOL_UNLOAD and load the correct lane manually."
             )
 
     def handle_ready(self):
         """Resolve the OpenAMS object once Klippy is ready."""
+        # CRITICAL: Re-enforce buffer_obj = None on all AMS lanes FIRST
+        # This runs during klippy:ready AFTER AFC_lane._handle_ready() has initialized lanes
+        # AFC_lane._handle_ready() may assign buffers from unit/extruder, we must override to None
+        # MUST run BEFORE any early returns to ensure buffers are always cleared
+        for lane in self.lanes.values():
+            if lane.buffer_obj is not None:
+                buffer_name = getattr(lane.buffer_obj, 'name', 'unknown')
+                self.logger.warning(
+                    f"Lane {lane.name} was assigned buffer '{buffer_name}' during initialization, "
+                    f"but OpenAMS units don't have physical buffers. Removing buffer assignment."
+                )
+                lane.buffer_obj = None
+
         # First check if ANY OpenAMS hardware exists in the system
         if not _has_openams_hardware(self.printer):
             self.logger.info(
@@ -2491,7 +2535,6 @@ class afcAMS(afcUnit):
             if cur_lane.get_toolhead_pre_sensor_state() and hasattr(cur_lane, 'tool_loaded') and cur_lane.tool_loaded:
                 afc_self.logger.debug(f"Lane {cur_lane.name} already loaded to toolhead, skipping load")
                 cur_lane.set_tool_loaded()
-                cur_lane.enable_buffer()
                 afc_self.save_vars()
                 return True
 
@@ -2530,7 +2573,6 @@ class afcAMS(afcUnit):
                 return False
 
             cur_lane.set_tool_loaded()
-            cur_lane.enable_buffer()
             afc_self.save_vars()
             return True
 
@@ -2547,7 +2589,6 @@ class afcAMS(afcUnit):
 
             afc_self.move_e_pos(-2, cur_extruder.tool_unload_speed, "Quick Pull", wait_tool=False)
             afc_self.function.log_toolhead_pos("TOOL_UNLOAD quick pull: ")
-            cur_lane.disable_buffer()
             cur_lane.unit_obj.lane_unloading(cur_lane)
             cur_lane.sync_to_extruder()
             cur_lane.do_enable(True)
@@ -4254,121 +4295,6 @@ def _patch_infinite_runout_handler() -> None:
     AFCLane._perform_infinite_runout = _ams_perform_infinite_runout
     AFCLane._ams_infinite_runout_patched = True
 
-def _patch_buffer_for_ams() -> None:
-    """Patch AFC_buffer methods to handle None extruder_stepper safely.
-
-    The base AFCLane class can have extruder_stepper set to None, but some
-    buffer methods assume it's always available. This patch adds null checks
-    to prevent AttributeError crashes.
-    """
-    global _ORIGINAL_BUFFER_SET_MULTIPLIER, _ORIGINAL_BUFFER_QUERY, _ORIGINAL_BUFFER_GET_STATUS
-
-    # Import here to avoid circular dependencies
-    try:
-        from extras.AFC_buffer import AFCTrigger
-    except Exception:
-        # If we can't import AFC_buffer, we can't patch it
-        return
-
-    if getattr(AFCTrigger, "_ams_buffer_patched", False):
-        return
-
-    # Save original methods
-    _ORIGINAL_BUFFER_SET_MULTIPLIER = getattr(AFCTrigger, "set_multiplier", None)
-    _ORIGINAL_BUFFER_QUERY = getattr(AFCTrigger, "cmd_QUERY_BUFFER", None)
-    _ORIGINAL_BUFFER_GET_STATUS = getattr(AFCTrigger, "get_status", None)
-
-    if not callable(_ORIGINAL_BUFFER_SET_MULTIPLIER):
-        return
-
-    def _patched_set_multiplier(self, multiplier):
-        """Patched set_multiplier with null check for extruder_stepper."""
-        if not self.enable:
-            return
-        cur_stepper = self.afc.function.get_current_lane_obj()
-        if cur_stepper is None:
-            return
-        if cur_stepper.extruder_stepper is None:
-            return
-
-        # Execute the original method's logic with the fix
-        cur_stepper.update_rotation_distance(multiplier)
-        if multiplier > 1:
-            self.last_state = "Advancing"
-            if self.led:
-                self.afc.function.afc_led(self.led_trailing, self.led_index)
-        elif multiplier < 1:
-            self.last_state = "Trailing"
-            if self.led:
-                self.afc.function.afc_led(self.led_advancing, self.led_index)
-        self.logger.debug("New rotation distance after applying factor: {:.4f}".format(
-            cur_stepper.extruder_stepper.stepper.get_rotation_distance()[0]))
-
-    def _patched_cmd_query_buffer(self, gcmd):
-        """Patched cmd_QUERY_BUFFER with null check for extruder_stepper."""
-        # We need to reimplement the method with the fix since we can't easily
-        # inject the check into the middle of the original method
-        state_mapping = {
-            "Trailing": ' (buffer is compressing)',
-            "Advancing": ' (buffer is expanding)',
-        }
-
-        buffer_status = self.buffer_status()
-        state_info = "{}{}".format(buffer_status, state_mapping.get(buffer_status, ''))
-
-        if self.enable:
-            lane = self.afc.function.get_current_lane_obj()
-            if lane is not None and lane.extruder_stepper is not None:
-                stepper = lane.extruder_stepper.stepper
-                rotation_dist = stepper.get_rotation_distance()[0]
-                state_info += ("\n{} Rotation distance: {:.4f}".format(lane.name, rotation_dist))
-            if self.error_sensitivity > 0:
-                state_info += "\nFault detection enabled, sensitivity {}".format(self.error_sensitivity)
-
-        self.logger.info("{} : {}".format(self.name, state_info))
-
-    def _patched_get_status(self, eventtime=None):
-        """Patched get_status with null check for extruder_stepper."""
-        self.response = {}
-        self.response['state'] = self.last_state
-        self.response['lanes'] = [lane.name for lane in self.lanes.values()]
-        self.response['enabled'] = self.enable
-
-        # Add current rotation distance if buffer is enabled and lane is loaded
-        if self.enable:
-            lane = self.afc.function.get_current_lane_obj()
-            if lane is not None and lane.extruder_stepper is not None:
-                stepper = lane.extruder_stepper.stepper
-                self.response['rotation_distance'] = stepper.get_rotation_distance()[0]
-            else:
-                self.response['rotation_distance'] = None
-        else:
-            self.response['rotation_distance'] = None
-
-        # Add fault detection information
-        self.response['fault_detection_enabled'] = self.error_sensitivity > 0
-        self.response['error_sensitivity'] = self.error_sensitivity
-        self.response['fault_timer'] = self.fault_timer
-        # Add current extruder position and error threshold only when actively tracking
-        if self.error_sensitivity > 0 and self.filament_error_pos is not None:
-            current_pos = self.get_extruder_pos()
-            if current_pos is not None:
-                self.response['distance_to_fault'] = self.filament_error_pos - current_pos
-                self.response['filament_error_pos'] = self.filament_error_pos
-                self.response['current_pos'] = current_pos
-            else:
-                self.response['distance_to_fault'] = None
-        else:
-            self.response['distance_to_fault'] = None
-
-        return self.response
-
-    # Apply patches
-    AFCTrigger.set_multiplier = _patched_set_multiplier
-    AFCTrigger.cmd_QUERY_BUFFER = _patched_cmd_query_buffer
-    AFCTrigger.get_status = _patched_get_status
-    AFCTrigger._ams_buffer_patched = True
-
 def _patch_lane_unload_for_ams() -> None:
     """Block LANE_UNLOAD for OpenAMS lanes to prevent Klipper hangs.
 
@@ -4431,6 +4357,144 @@ def _patch_lane_unload_for_ams() -> None:
     AFC_Class.LANE_UNLOAD = _ams_lane_unload
     AFC_Class._ams_lane_unload_patched = True
 
+def _patch_buffer_multiplier_for_ams() -> None:
+    """Guard buffer multiplier updates when OpenAMS lanes lack an extruder stepper."""
+    global _ORIGINAL_BUFFER_SET_MULTIPLIER
+
+    try:
+        from extras.AFC_buffer import AFCTrigger
+    except Exception:
+        return
+
+    if getattr(AFCTrigger, "_ams_buffer_multiplier_patched", False):
+        return
+
+    _ORIGINAL_BUFFER_SET_MULTIPLIER = getattr(AFCTrigger, "set_multiplier", None)
+    if not callable(_ORIGINAL_BUFFER_SET_MULTIPLIER):
+        return
+
+    def _ams_set_multiplier(self, multiplier):
+        cur_lane = self.afc.function.get_current_lane_obj()
+        if cur_lane is None:
+            return _ORIGINAL_BUFFER_SET_MULTIPLIER(self, multiplier)
+
+        unit_obj = getattr(cur_lane, "unit_obj", None)
+        unit_type = getattr(unit_obj, "type", None) if unit_obj is not None else None
+        is_openams = unit_type == "OpenAMS" or hasattr(unit_obj, "oams_name")
+        if not is_openams:
+            return _ORIGINAL_BUFFER_SET_MULTIPLIER(self, multiplier)
+
+        extruder_stepper = getattr(cur_lane, "extruder_stepper", None)
+        stepper = getattr(extruder_stepper, "stepper", None) if extruder_stepper is not None else None
+        if is_openams and stepper is None:
+            self.logger.debug(
+                "Skipping buffer multiplier update for OpenAMS lane {} (no extruder stepper)".format(
+                    cur_lane.name
+                )
+            )
+            return None
+
+        return _ORIGINAL_BUFFER_SET_MULTIPLIER(self, multiplier)
+
+    AFCTrigger.set_multiplier = _ams_set_multiplier
+    AFCTrigger._ams_buffer_multiplier_patched = True
+
+def _patch_buffer_status_for_missing_stepper() -> None:
+    """Guard buffer status reporting when a lane lacks an extruder stepper."""
+    global _ORIGINAL_BUFFER_GET_STATUS
+
+    try:
+        from extras.AFC_buffer import AFCTrigger
+    except Exception:
+        return
+
+    if getattr(AFCTrigger, "_ams_buffer_status_patched", False):
+        return
+
+    _ORIGINAL_BUFFER_GET_STATUS = getattr(AFCTrigger, "get_status", None)
+    if not callable(_ORIGINAL_BUFFER_GET_STATUS):
+        return
+
+    def _ams_get_status(self, eventtime=None):
+        cur_lane = self.afc.function.get_current_lane_obj()
+        unit_obj = getattr(cur_lane, "unit_obj", None) if cur_lane is not None else None
+        unit_type = getattr(unit_obj, "type", None) if unit_obj is not None else None
+        is_openams = unit_type == "OpenAMS" or hasattr(unit_obj, "oams_name")
+        if not is_openams:
+            return _ORIGINAL_BUFFER_GET_STATUS(self, eventtime)
+        try:
+            return _ORIGINAL_BUFFER_GET_STATUS(self, eventtime)
+        except AttributeError as exc:
+            if "stepper" not in str(exc):
+                raise
+
+        response = {}
+        response["state"] = self.last_state
+        response["lanes"] = [lane.name for lane in self.lanes.values()]
+        response["enabled"] = self.enable
+        response["rotation_distance"] = None
+        response["fault_detection_enabled"] = self.error_sensitivity > 0
+        response["error_sensitivity"] = self.error_sensitivity
+        response["fault_timer"] = self.fault_timer
+
+        if self.error_sensitivity > 0 and self.filament_error_pos is not None:
+            current_pos = self.get_extruder_pos()
+            if current_pos is not None:
+                response["distance_to_fault"] = self.filament_error_pos - current_pos
+                response["filament_error_pos"] = self.filament_error_pos
+                response["current_pos"] = current_pos
+            else:
+                response["distance_to_fault"] = None
+        else:
+            response["distance_to_fault"] = None
+
+        return response
+
+    AFCTrigger.get_status = _ams_get_status
+    AFCTrigger._ams_buffer_status_patched = True
+
+def _patch_buffer_fault_detection_for_ams() -> None:
+    """Skip buffer fault detection timers for OpenAMS lanes."""
+    global _ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE
+
+    try:
+        import extras.AFC_buffer as _afc_buffer_mod
+    except Exception:
+        return
+
+    AFCTrigger = getattr(_afc_buffer_mod, "AFCTrigger", None)
+    if AFCTrigger is None:
+        return
+
+    if getattr(AFCTrigger, "_ams_buffer_fault_patched", False):
+        return
+
+    _ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE = getattr(AFCTrigger, "extruder_pos_update_event", None)
+    if not callable(_ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE):
+        return
+
+    timeout = getattr(_afc_buffer_mod, "CHECK_RUNOUT_TIMEOUT", 0.5)
+
+    def _ams_extruder_pos_update_event(self, eventtime):
+        cur_lane = self.afc.function.get_current_lane_obj()
+        if cur_lane is None:
+            return _ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE(self, eventtime)
+
+        unit_obj = getattr(cur_lane, "unit_obj", None)
+        if unit_obj is None:
+            unit_name = getattr(cur_lane, "unit", None)
+            units = getattr(self.afc, "units", {})
+            unit_obj = units.get(unit_name) if unit_name else None
+        unit_type = getattr(unit_obj, "type", None) if unit_obj is not None else None
+        is_openams = unit_type == "OpenAMS" or hasattr(unit_obj, "oams_name")
+        if is_openams:
+            return eventtime + timeout
+
+        return _ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE(self, eventtime)
+
+    AFCTrigger.extruder_pos_update_event = _ams_extruder_pos_update_event
+    AFCTrigger._ams_buffer_fault_patched = True
+
 def _has_openams_hardware(printer):
     """Check if any OpenAMS hardware is configured in the system.
 
@@ -4461,5 +4525,9 @@ def load_config_prefix(config):
     _patch_extruder_for_virtual_ams()
     _patch_infinite_runout_handler()
     _patch_lane_unload_for_ams()
-    _patch_buffer_for_ams()
+    _patch_buffer_multiplier_for_ams()
+    _patch_buffer_status_for_missing_stepper()
+    _patch_buffer_fault_detection_for_ams()
+    # Note: Buffer patching removed - AFC natively handles buffer_obj=None correctly
+    # We only need to ensure buffer_obj=None on AMS lanes (done in handle_ready)
     return afcAMS(config)
