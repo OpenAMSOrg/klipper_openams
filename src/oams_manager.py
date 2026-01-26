@@ -1931,6 +1931,20 @@ class OAMSManager:
         if fps_state is not None and fps_state.state == FPSLoadState.LOADED and fps_state.current_lane:
             lane = afc.lanes.get(fps_state.current_lane)
             if lane is not None:
+                lane_tool_loaded = bool(getattr(lane, "tool_loaded", False))
+                lane_loaded_to_hub = bool(getattr(lane, "loaded_to_hub", False))
+                lane_extruder = getattr(lane, "extruder_obj", None)
+                extruder_loaded_lane = getattr(lane_extruder, "lane_loaded", None) if lane_extruder else None
+                if (not lane_tool_loaded and not lane_loaded_to_hub and
+                        extruder_loaded_lane != fps_state.current_lane):
+                    self.logger.debug(
+                        f"Skipping fps_state fallback for {fps_state.current_lane} on {fps_name}: "
+                        "lane has no tool_loaded/loaded_to_hub flags and extruder lane_loaded is "
+                        f"{extruder_loaded_lane or 'None'}"
+                    )
+                    lane = None
+
+            if lane is not None:
                 unit_str = getattr(lane, "unit", None)
                 if isinstance(unit_str, str) and ':' in unit_str:
                     base_unit_name, slot_str = unit_str.split(':', 1)
