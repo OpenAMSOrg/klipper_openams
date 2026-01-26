@@ -1,4 +1,4 @@
-## OpenAMS Mainboard
+# OpenAMS Mainboard
 #
 # Copyright (C) 2025 JR Lomas <lomas.jr@gmail.com>
 #
@@ -11,15 +11,14 @@ from math import pi
 from typing import Tuple, List, Optional, Dict
 
 try:  # pragma: no cover - optional dependency during unit tests
-    from extras.openams_integration import AMSHardwareService
+    from extras.openams_integration import AMSHardwareService, OPENAMS_VERSION
 except Exception:  # pragma: no cover - best-effort integration only
     AMSHardwareService = None
+    OPENAMS_VERSION = "0.0.3"  # Fallback if import fails
 
-# Pre-compiled struct formats for float conversions 
+# Pre-compiled struct formats for float conversions
 _FLOAT_STRUCT = struct.Struct("f")
 _U32_STRUCT = struct.Struct("I")
-
-OPENAMS_VERSION = "0.0.3"
 
 # OAMS Hardware Status Constants
 class OAMSStatus:
@@ -194,6 +193,50 @@ class OAMS:
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
+    def _resolve_lane_name_from_afc(self, spool_idx: int) -> Optional[str]:
+        """Resolve lane name by looking up AFC units directly.
+
+        Fallback method when hardware_service.resolve_lane_for_spool() fails.
+        Searches AFC units for one with matching oams_name, then finds the lane
+        with the matching slot number (spool_idx + 1).
+
+        Args:
+            spool_idx: 0-indexed spool position (0-3)
+
+        Returns:
+            Lane name (e.g., "lane8") or None if not found
+        """
+        try:
+            afc = self.printer.lookup_object("AFC", None)
+            if afc is None or not hasattr(afc, 'units'):
+                return None
+
+            # Find the AFC unit that corresponds to this OAMS
+            # self.section_name is like "oams1", unit.oams_name should match
+            for unit_name, unit_obj in afc.units.items():
+                if not hasattr(unit_obj, 'oams_name'):
+                    continue
+                if unit_obj.oams_name != self.section_name:
+                    continue
+
+                # Found matching unit, now find lane with matching slot
+                # Slot is 1-indexed (1-4), spool_idx is 0-indexed (0-3)
+                target_slot = spool_idx + 1
+                if hasattr(unit_obj, 'lanes'):
+                    for lane_name, lane_obj in unit_obj.lanes.items():
+                        # Lane's unit is like "AMS_1:2" where 2 is the slot
+                        lane_unit = getattr(lane_obj, 'unit', None)
+                        if lane_unit and ':' in lane_unit:
+                            try:
+                                slot = int(lane_unit.split(':')[1])
+                                if slot == target_slot:
+                                    return lane_name
+                            except (ValueError, IndexError):
+                                continue
+            return None
+        except Exception:
+            return None
+
     def get_status(self, eventtime: float) -> dict:
         """Return current hardware status for monitoring."""
         return {
@@ -337,9 +380,16 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         if 0 <= spool_val <= 3:
             return spool_val
 
-        self.logger.info(
-            f"OAMS[{self.oams_idx}]: Hardware reported invalid spool index {spool_val} (expected 0-3); treating as no spool loaded"
-        )
+        # Spool index 255 (0xFF) is the hardware's way of saying "no spool loaded"
+        # Only log if it's an unexpected invalid value
+        if spool_val != 255:
+            self.logger.warning(
+                f"OAMS[{self.oams_idx}]: Unexpected spool index {spool_val} from hardware (expected 0-3 or 255); treating as no spool loaded"
+            )
+        else:
+            self.logger.debug(
+                f"OAMS[{self.oams_idx}]: No spool loaded (hardware returned 255)"
+            )
         return None
         
 
@@ -446,8 +496,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         while retry_count < retry_limit:
             if retry_count > 0:
                 delay = self._calculate_retry_delay(retry_count)
+                # Resolve lane name for retry message
+                lane_name = None
+                if self.hardware_service is not None:
+                    lane_name = self.hardware_service.resolve_lane_for_spool(self.section_name, spool_idx)
+                if lane_name is None:
+                    lane_name = self._resolve_lane_name_from_afc(spool_idx)
+                lane_label = f"lane {lane_name}" if lane_name else f"lane (spool {spool_idx})"
                 self.logger.info(
-                    f"OAMS[{self.oams_idx}]: Load retry {retry_count + 1}/{retry_limit} for spool {spool_idx}, waiting {delay:.1f}s"
+                    f"OAMS[{self.oams_idx}]: Load retry {retry_count + 1}/{retry_limit} for {lane_label}, waiting {delay:.1f}s"
                 )
                 self.reactor.pause(self.reactor.monotonic() + delay)
 
@@ -465,10 +522,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
                 else:
                     self._last_load_was_retry[spool_idx] = False
                 self._reset_load_retry_count(spool_idx)
+                # Try to resolve lane name for better user messaging
                 lane_name = None
                 if self.hardware_service is not None:
-                    lane_name = self.hardware_service.resolve_lane_for_spool(self.name, spool_idx)
-                lane_label = f"lane {lane_name}" if lane_name else f"spool {spool_idx}"
+                    lane_name = self.hardware_service.resolve_lane_for_spool(self.section_name, spool_idx)
+                # Fallback to direct AFC lookup if hardware service didn't resolve
+                if lane_name is None:
+                    lane_name = self._resolve_lane_name_from_afc(spool_idx)
+                # Always use "lane X" terminology to align with AFC system
+                lane_label = f"lane {lane_name}" if lane_name else f"lane (spool {spool_idx})"
                 self.logger.info(
                     f"OAMS[{self.oams_idx}]: Successfully loaded {lane_label} on attempt {retry_count + 1}"
                 )
@@ -477,27 +539,37 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             # Load failed - record attempt in history
             attempt_history.append(f"Attempt {retry_count + 1}: {message}")
 
+            # Resolve lane name for error messages
+            lane_name = None
+            if self.hardware_service is not None:
+                lane_name = self.hardware_service.resolve_lane_for_spool(self.section_name, spool_idx)
+            if lane_name is None:
+                lane_name = self._resolve_lane_name_from_afc(spool_idx)
+            lane_label = f"lane {lane_name}" if lane_name else f"lane (spool {spool_idx})"
 
             if retry_count + 1 < retry_limit:
                 self.logger.warning(
-                    f"OAMS[{self.oams_idx}]: Load failed for spool {spool_idx}: {message}. Attempt {retry_count + 1}/{retry_limit}"
+                    f"OAMS[{self.oams_idx}]: Load failed for {lane_label}: {message}. Attempt {retry_count + 1}/{retry_limit}"
                 )
 
                 if self.auto_unload_on_failed_load:
-                    self.logger.info(f"OAMS[{self.oams_idx}]: Auto-unloading before retry")
+                    # Unload retry: Always use raw unload (no cut needed)
+                    # This handles stuck spool during load - filament hasn't engaged with extruder yet
+                    self.logger.info(f"OAMS[{self.oams_idx}]: Auto-unloading before retry (raw unload, no cut)")
                     unload_success, unload_msg = self.unload_spool_with_retry()
+
                     if not unload_success:
                         self.logger.error(
                             f"OAMS[{self.oams_idx}]: Failed to unload before retry: {unload_msg}"
                         )
-                        # FIX: Abort load retry sequence if auto-unload fails
+                        # Abort load retry sequence if auto-unload fails
                         # Filament is likely stuck in the tube - continuing load attempts will fail
                         self._reset_load_retry_count(spool_idx)
                         # Record retry failure for monitoring
                         self._load_retry_failures += 1
                         self._last_load_failure_time = self.reactor.monotonic()
                         return False, (
-                            f"Failed to unload spool {spool_idx} back to AMS before retry. "
+                            f"Failed to unload {lane_label} back to AMS before retry. "
                             f"Load aborted after {retry_count + 1} attempts. {unload_msg}"
                         )
 
@@ -512,10 +584,18 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         self._load_retry_failures += 1
         self._last_load_failure_time = self.reactor.monotonic()
 
+        # Resolve lane name for final error message
+        lane_name = None
+        if self.hardware_service is not None:
+            lane_name = self.hardware_service.resolve_lane_for_spool(self.section_name, spool_idx)
+        if lane_name is None:
+            lane_name = self._resolve_lane_name_from_afc(spool_idx)
+        lane_label = f"lane {lane_name}" if lane_name else f"lane (spool {spool_idx})"
+
         # Build detailed error message with attempt history
         history_str = "; ".join(attempt_history) if attempt_history else message
         return False, (
-            f"Failed to load spool {spool_idx} after {retry_limit} attempts. "
+            f"Failed to load {lane_label} after {retry_limit} attempts. "
             f"Attempt history: {history_str}"
         )
 
@@ -579,8 +659,18 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
             if success:
                 self._reset_unload_retry_count()
+                # Get lane name for better user messaging (use current_spool which was just unloaded)
+                lane_name = None
+                if self.current_spool is not None:
+                    if self.hardware_service is not None:
+                        lane_name = self.hardware_service.resolve_lane_for_spool(self.section_name, self.current_spool)
+                    # Fallback to direct AFC lookup if hardware service didn't resolve
+                    if lane_name is None:
+                        lane_name = self._resolve_lane_name_from_afc(self.current_spool)
+                # Always use "lane X" terminology to align with AFC system
+                lane_label = f"lane {lane_name}" if lane_name else "filament"
                 self.logger.info(
-                    f"OAMS[{self.oams_idx}]: Successfully unloaded spool on attempt {attempt_number}"
+                    f"OAMS[{self.oams_idx}]: Successfully unloaded {lane_label} on attempt {attempt_number}"
                 )
                 return True, message
 
