@@ -2510,6 +2510,19 @@ class afcAMS(afcUnit):
         afc_function.unset_lane_loaded = unset_lane_loaded_wrapper
         self.logger.debug("Wrapped AFC.function.unset_lane_loaded for OpenAMS state sync")
 
+    def _disable_buffers_for_openams_load(self, afc, cur_lane) -> None:
+        """Disable all lane buffers before an OpenAMS load to avoid stray buffer faults."""
+        try:
+            for lane_name, lane_obj in afc.lanes.items():
+                if lane_obj is None:
+                    continue
+                try:
+                    lane_obj.disable_buffer()
+                except Exception:
+                    self.logger.debug(f"Failed to disable buffer for lane {lane_name}")
+        except Exception:
+            self.logger.error(f"Failed to disable buffers before loading lane {cur_lane.name}")
+
     def _patch_afc_sequences(self) -> None:
         """Patch AFC load/unload sequences to delegate OpenAMS lanes."""
         if not hasattr(self, "afc") or self.afc is None:
@@ -2537,6 +2550,8 @@ class afcAMS(afcUnit):
                 cur_lane.set_tool_loaded()
                 afc_self.save_vars()
                 return True
+
+            self._disable_buffers_for_openams_load(afc_self, cur_lane)
 
             if afc_self._check_extruder_temp(cur_lane):
                 afc_self.afcDeltaTime.log_with_time("Done heating toolhead")
@@ -4528,6 +4543,4 @@ def load_config_prefix(config):
     _patch_buffer_multiplier_for_ams()
     _patch_buffer_status_for_missing_stepper()
     _patch_buffer_fault_detection_for_ams()
-    # Note: Buffer patching removed - AFC natively handles buffer_obj=None correctly
-    # We only need to ensure buffer_obj=None on AMS lanes (done in handle_ready)
     return afcAMS(config)
