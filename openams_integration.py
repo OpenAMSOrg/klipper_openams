@@ -813,6 +813,47 @@ class AMSHardwareService:
         # Use registry
         return self.registry.resolve_lane_name(unit_name, normalized)
 
+    def resolve_lane_for_spool_with_afc(self, unit_name: str, spool_index: Optional[int]) -> Optional[str]:
+        """Resolve lane name via registry with AFC fallback if needed."""
+        lane_name = self.resolve_lane_for_spool(unit_name, spool_index)
+        if lane_name is not None:
+            return lane_name
+        return self._resolve_lane_name_from_afc(unit_name, spool_index)
+
+    def _resolve_lane_name_from_afc(self, unit_name: str, spool_index: Optional[int]) -> Optional[str]:
+        """Fallback: resolve lane name by looking up AFC units directly."""
+        if spool_index is None:
+            return None
+        try:
+            normalized_index = int(spool_index)
+        except (TypeError, ValueError):
+            return None
+
+        try:
+            afc = self.printer.lookup_object("AFC", None)
+        except Exception:
+            afc = None
+        if afc is None or not hasattr(afc, 'units'):
+            return None
+
+        for unit_obj in afc.units.values():
+            if not hasattr(unit_obj, 'oams_name'):
+                continue
+            if unit_obj.oams_name != unit_name:
+                continue
+
+            target_slot = normalized_index + 1
+            for lane_name, lane_obj in getattr(unit_obj, 'lanes', {}).items():
+                lane_unit = getattr(lane_obj, 'unit', None)
+                if lane_unit and ':' in lane_unit:
+                    try:
+                        slot = int(lane_unit.split(':', 1)[1])
+                    except (ValueError, IndexError):
+                        continue
+                    if slot == target_slot:
+                        return lane_name
+        return None
+
     def latest_lane_snapshot_for_spool(self, unit_name: str, spool_index: Optional[int]) -> Optional[Dict[str, Any]]:
         """Return the most recent state snapshot for a spool by its index."""
         lane_name = self.resolve_lane_for_spool(unit_name, spool_index)
