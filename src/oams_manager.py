@@ -1198,6 +1198,17 @@ class OAMSManager:
             afc = self._get_afc()
             if afc is None or not hasattr(afc, 'lanes'):
                 return
+            afc_function = getattr(afc, "function", None)
+            if afc_function is not None and hasattr(afc_function, "get_current_lane_obj"):
+                try:
+                    current_lane = afc_function.get_current_lane_obj()
+                except Exception:
+                    current_lane = None
+                if current_lane is not None and getattr(current_lane, "name", None) == lane_name:
+                    unset_lane_loaded = getattr(afc_function, "unset_lane_loaded", None)
+                    if callable(unset_lane_loaded):
+                        unset_lane_loaded()
+                        return
             lane_obj = afc.lanes.get(lane_name)
             if lane_obj is None:
                 return
@@ -4210,10 +4221,7 @@ class OAMSManager:
                 self.logger.error(f"Exception while retrying unload on {fps_name}")
 
         if success:
-            fps_state.state = FPSLoadState.UNLOADED
-            fps_state.following = False
-            fps_state.direction = 0
-            fps_state.since = self.reactor.monotonic()
+            since_time = self.reactor.monotonic()
 
             # Notify AFC that lane is unloaded from toolhead using the normal AFC process
             # This triggers AFC's _apply_lane_sensor_state() which handles everything properly:
@@ -4233,7 +4241,7 @@ class OAMSManager:
                         lane_name,
                         loaded=False,
                         spool_index=spool_index,
-                        eventtime=fps_state.since
+                        eventtime=since_time
                     )
                     lane_notified = True
                     self.logger.debug(f"Notified AFC coordinator that lane {lane_name} unloaded from toolhead")
@@ -4257,7 +4265,7 @@ class OAMSManager:
                                         afc_lane_name,
                                         loaded=False,
                                         spool_index=spool_index,
-                                        eventtime=fps_state.since
+                                        eventtime=since_time
                                     )
                                     self.logger.debug(f"Notified AFC coordinator (via location lookup) that lane {afc_lane_name} unloaded")
                                 except Exception:
@@ -4269,6 +4277,10 @@ class OAMSManager:
             if fps_state.stuck_spool.active and oams is not None and spool_index is not None:
                 self._clear_error_led(oams, spool_index, fps_name, "successful unload")
 
+            fps_state.state = FPSLoadState.UNLOADED
+            fps_state.following = False
+            fps_state.direction = 0
+            fps_state.since = since_time
             fps_state.current_lane = None
             fps_state.current_spool_idx = None
             fps_state.reset_stuck_spool_state()
@@ -6266,7 +6278,11 @@ class OAMSManager:
                     except Exception:
                         pass
 
-                    if not is_runout_active and not is_tool_operation and fps_state.consecutive_idle_polls % 2 == 0:  # Check every 2 polls (4 seconds)
+                    if (
+                        not is_runout_active
+                        and not is_tool_operation
+                        and fps_state.consecutive_idle_polls % 2 == 0
+                    ):  # Check every 2 polls (4 seconds)
                         old_lane = fps_state.current_lane
                         old_spool_idx = fps_state.current_spool_idx
                         (
