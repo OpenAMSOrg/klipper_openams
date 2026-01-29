@@ -440,7 +440,7 @@ class AMSHardwareService:
                 status = None
             if status:
                 self._update_status(status)
-            self.logger.debug("Attached OAMS controller %s", controller)
+            self.logger.debug(f"Attached OAMS controller {controller}")
 
     def resolve_controller(self) -> Optional[Any]:
         """Return the currently attached controller, attempting lookup if needed."""
