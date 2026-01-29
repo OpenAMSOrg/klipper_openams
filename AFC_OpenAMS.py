@@ -205,12 +205,13 @@ def _patch_extruder_for_virtual_ams() -> None:
     base_init = extruder_cls.__init__
 
     class _ProxyConfig:
-        def __init__(self, original):
+        def __init__(self, original, pin_override):
             self._original = original
+            self._pin_override = pin_override
 
         def get(self, key, *args, **kwargs):
             if key == "pin_tool_start":
-                return "buffer"
+                return self._pin_override
             return self._original.get(key, *args, **kwargs)
 
         def __getattr__(self, item):
@@ -227,7 +228,20 @@ def _patch_extruder_for_virtual_ams() -> None:
 
         if normalized:
             if normalized.upper().startswith("AMS_"):
-                proxy_config = _ProxyConfig(config)
+                try:
+                    printer = config.get_printer()
+                    afc_obj = printer.lookup_object("AFC", None)
+                    pins = printer.lookup_object("pins", None)
+                    if afc_obj is not None and pins is not None:
+                        if not getattr(afc_obj, "_virtual_ams_chip_registered", False):
+                            pins.register_chip("afc_virtual_ams", afc_obj)
+                            afc_obj._virtual_ams_chip_registered = True
+                        pin_override = f"afc_virtual_ams:{normalized}"
+                        proxy_config = _ProxyConfig(config, pin_override)
+                    else:
+                        normalized = None
+                except Exception:
+                    normalized = None
             else:
                 normalized = None
 
@@ -236,7 +250,7 @@ def _patch_extruder_for_virtual_ams() -> None:
         if not normalized:
             return
 
-        show_sensor = getattr(self, "enable_sensors_in_gui", True)
+        show_sensor = False
         enable_runout = getattr(self, "enable_runout", False)
         runout_cb = getattr(self, "handle_start_runout", None)
 
@@ -755,7 +769,7 @@ class afcAMS(afcUnit):
                 else:
                     self.afc._virtual_ams_chip_registered = True
 
-            enable_gui = getattr(extruder, "enable_sensors_in_gui", True)
+            enable_gui = False
             runout_cb = getattr(extruder, "handle_start_runout", None)
             enable_runout = getattr(extruder, "enable_runout", False)
             debounce = getattr(extruder, "debounce_delay", 0.0)
@@ -2510,19 +2524,6 @@ class afcAMS(afcUnit):
         afc_function.unset_lane_loaded = unset_lane_loaded_wrapper
         self.logger.debug("Wrapped AFC.function.unset_lane_loaded for OpenAMS state sync")
 
-    def _disable_buffers_for_openams_load(self, afc, cur_lane) -> None:
-        """Disable all lane buffers before an OpenAMS load to avoid stray buffer faults."""
-        try:
-            for lane_name, lane_obj in afc.lanes.items():
-                if lane_obj is None:
-                    continue
-                try:
-                    lane_obj.disable_buffer()
-                except Exception:
-                    self.logger.debug(f"Failed to disable buffer for lane {lane_name}")
-        except Exception:
-            self.logger.error(f"Failed to disable buffers before loading lane {cur_lane.name}")
-
     def _patch_afc_sequences(self) -> None:
         """Patch AFC load/unload sequences to delegate OpenAMS lanes."""
         if not hasattr(self, "afc") or self.afc is None:
@@ -2531,6 +2532,24 @@ class afcAMS(afcUnit):
         afc = self.afc
         if getattr(afc, "_oams_sequences_patched", False):
             return
+
+        if not getattr(afc, "_oams_tool_swap_timing_patched", False):
+            try:
+                from extras.AFC_Toolchanger import AfcToolchanger
+            except Exception:
+                AfcToolchanger = None
+
+            if AfcToolchanger is not None:
+                original_tool_swap = AfcToolchanger.tool_swap
+
+                def tool_swap_wrapper(toolchanger_self, lane, set_start_time=True):
+                    suppress = getattr(toolchanger_self.afc, "_oams_suppress_tool_swap_timer", False)
+                    if suppress:
+                        return original_tool_swap(toolchanger_self, lane, set_start_time=False)
+                    return original_tool_swap(toolchanger_self, lane, set_start_time=set_start_time)
+
+                AfcToolchanger.tool_swap = tool_swap_wrapper
+                afc._oams_tool_swap_timing_patched = True
 
         if not hasattr(afc, "load_sequence") or not hasattr(afc, "unload_sequence"):
             return
@@ -2551,12 +2570,17 @@ class afcAMS(afcUnit):
                 afc_self.save_vars()
                 return True
 
-            self._disable_buffers_for_openams_load(afc_self, cur_lane)
-
             if afc_self._check_extruder_temp(cur_lane):
                 afc_self.afcDeltaTime.log_with_time("Done heating toolhead")
 
             try:
+                if afc_self.afcDeltaTime.start_time is None:
+                    afc_self.afcDeltaTime.set_start_time()
+                else:
+                    now = datetime.now()
+                    afc_self.afcDeltaTime.major_delta_time = now
+                    afc_self.afcDeltaTime.last_time = now
+                afc_self._oams_suppress_tool_swap_timer = True
                 afc_self.logger.debug(
                     f"OpenAMS load: delegating to OAMSM_LOAD_FILAMENT for lane {cur_lane.name}"
                 )
@@ -2575,6 +2599,8 @@ class afcAMS(afcUnit):
                 message = "OpenAMS load failed for {}: {}".format(cur_lane.name, str(e))
                 afc_self.error.handle_lane_failure(cur_lane, message)
                 return False
+            finally:
+                afc_self._oams_suppress_tool_swap_timer = False
 
             if not cur_lane.get_toolhead_pre_sensor_state():
                 message = (
@@ -2772,10 +2798,21 @@ class afcAMS(afcUnit):
             return
 
         hub = getattr(lane, "hub_obj", None)
+        hub_val = bool(value)
         if hub is None:
+            lane.loaded_to_hub = hub_val
+            if self.hardware_service is not None:
+                lane_state = getattr(lane, "load_state", False)
+                tool_state = self._lane_reports_tool_filament(lane)
+                try:
+                    self.hardware_service.update_lane_snapshot(
+                        self.oams_name, lane.name, lane_state, hub_val, eventtime,
+                        spool_index=bay, tool_state=tool_state
+                    )
+                except Exception:
+                    self.logger.error(f"Failed to update lane snapshot for {lane.name}")
             return
 
-        hub_val = bool(value)
         if hub_val != getattr(lane, "loaded_to_hub", False):
             hub.switch_pin_callback(eventtime, hub_val)
             # CRITICAL: Update lane.loaded_to_hub to match hub sensor state
@@ -4492,7 +4529,20 @@ def _patch_buffer_fault_detection_for_ams() -> None:
 
     def _ams_extruder_pos_update_event(self, eventtime):
         cur_lane = self.afc.function.get_current_lane_obj()
+        cur_extruder = None
         if cur_lane is None:
+            try:
+                toolhead = getattr(self.afc, "toolhead", None)
+                extruder_name = toolhead.get_extruder().name if toolhead is not None else None
+                cur_extruder = self.afc.tools.get(extruder_name) if extruder_name else None
+            except Exception:
+                cur_extruder = None
+            if cur_extruder is not None:
+                lane_name = getattr(cur_extruder, "lane_loaded", None)
+                cur_lane = self.afc.lanes.get(lane_name) if lane_name else None
+        else:
+            cur_extruder = getattr(cur_lane, "extruder_obj", None)
+        if cur_lane is None and cur_extruder is None:
             return _ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE(self, eventtime)
 
         unit_obj = getattr(cur_lane, "unit_obj", None)
@@ -4502,7 +4552,19 @@ def _patch_buffer_fault_detection_for_ams() -> None:
             unit_obj = units.get(unit_name) if unit_name else None
         unit_type = getattr(unit_obj, "type", None) if unit_obj is not None else None
         is_openams = unit_type == "OpenAMS" or hasattr(unit_obj, "oams_name")
-        if is_openams:
+        tool_pin = getattr(cur_extruder, "tool_start", None) if cur_extruder is not None else None
+        is_virtual_tool = False
+        try:
+            if tool_pin:
+                tool_pin_str = str(tool_pin).lower()
+                is_virtual_tool = (
+                    tool_pin_str.startswith("afc_virtual_ams:")
+                    or tool_pin_str.startswith("ams_")
+                    or tool_pin_str.startswith("ams_extruder")
+                )
+        except Exception:
+            is_virtual_tool = False
+        if is_openams or is_virtual_tool:
             return eventtime + timeout
 
         return _ORIGINAL_BUFFER_EXTRUDER_POS_UPDATE(self, eventtime)
