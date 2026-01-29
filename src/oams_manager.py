@@ -57,6 +57,7 @@ FILAMENT_PATH_LENGTH_FACTOR = 1.14
 MONITOR_ENCODER_PERIOD = 2.0
 MONITOR_ENCODER_PERIOD_IDLE = 4.0  # OPTIMIZATION: Longer interval when idle
 MONITOR_ENCODER_SPEED_GRACE = 3.0  # Increased from 2.0 to 3.0 - more grace time before stuck detection
+AUTO_DETECT_INSERT_GRACE = 10.0  # Seconds to suppress auto-detect after unload completes
 MIN_EXTRUDER_ENGAGEMENT_DELTA = 0.5  # Minimum extruder movement to confirm engagement
 ENGAGEMENT_SUPPRESSION_WINDOW = 10.0  # Increased from 6.0 to 10.0 - longer suppression after engagement to prevent false clog detection
 CLOG_CHECK_INTERVAL = 8.0  # Minimum seconds between clog checks to reduce log/CPU churn
@@ -215,6 +216,9 @@ class OAMSRunoutMonitor:
 
                 is_printing = idle_timeout.get_status(eventtime)["state"] == "Printing"
                 spool_idx = self.fps_state.current_spool_idx or self.runout_spool_idx
+
+                if not is_printing and self.state == OAMSRunoutState.MONITORING:
+                    return eventtime + MONITOR_ENCODER_PERIOD_IDLE
 
                 if self.state in (OAMSRunoutState.STOPPED, OAMSRunoutState.PAUSED, OAMSRunoutState.RELOADING):
                     # When not actively monitoring, use the idle interval to reduce timer churn
@@ -631,6 +635,73 @@ class OAMSRunoutMonitor:
 
         return oams_name, None
 
+    def _has_gcode_command(self, gcode, command: str) -> bool:
+        handlers = getattr(gcode, "ready_gcode_handlers", None)
+        if isinstance(handlers, dict):
+            return command in handlers
+        handlers = getattr(gcode, "gcode_handlers", None)
+        if isinstance(handlers, dict):
+            return command in handlers
+        handlers = getattr(gcode, "_gcode_handlers", None)
+        if isinstance(handlers, dict):
+            return command in handlers
+        get_command = getattr(gcode, "get_command", None)
+        if callable(get_command):
+            try:
+                return get_command(command) is not None
+            except Exception:
+                return False
+        lookup_command = getattr(gcode, "lookup_command", None)
+        if callable(lookup_command):
+            try:
+                lookup_command(command)
+                return True
+            except Exception:
+                return False
+        return False
+
+    def _run_tool_crash_detection(self, enable: bool) -> bool:
+        if getattr(self, "crash_detection_mode", "disabled") == "disabled":
+            self.logger.debug("Tool crash detection disabled; skipping")
+            return True
+        gcode = self._gcode_obj
+        if gcode is None:
+            try:
+                gcode = self.printer.lookup_object("gcode")
+            except Exception as exc:
+                self.logger.debug(f"Skipping tool crash detection; no gcode object: {exc}")
+                return False
+            self._gcode_obj = gcode
+        if enable:
+            if self.crash_detection_mode == "probe":
+                commands = ("START_TOOL_PROBE_CRASH_DETECTION",)
+            else:
+                commands = ("START_TOOL_CRASH_DETECTION",)
+        else:
+            if self.crash_detection_mode == "probe":
+                commands = ("STOP_TOOL_PROBE_CRASH_DETECTION",)
+            else:
+                commands = ("STOP_TOOL_CRASH_DETECTION",)
+        last_exc = None
+        for command in commands:
+            for candidate in (command, command.lower()):
+                try:
+                    self.logger.debug(f"Running tool crash detection command: {candidate}")
+                    gcode.run_script_from_command(candidate)
+                    self.logger.debug(f"Tool crash detection command completed: {candidate}")
+                    return True
+                except Exception as exc:
+                    self.logger.debug(
+                        f"Tool crash detection command failed: {candidate} ({exc})"
+                    )
+                    last_exc = exc
+                    continue
+        if last_exc is not None:
+            self.logger.debug(f"Skipping tool crash detection; failed {commands}: {last_exc}")
+        else:
+            self.logger.debug("Skipping tool crash detection command; none available")
+        return False
+
     def _get_oams_object(self, oams_name: Optional[str]):
         _, oams_obj = self._resolve_oams_name(oams_name)
         return oams_obj
@@ -865,6 +936,48 @@ class FPSState:
 
 class OAMSManager:
     """Main coordinator for OpenAMS system"""
+
+    def _run_tool_crash_detection(self, enable: bool) -> bool:
+        if getattr(self, "crash_detection_mode", "disabled") == "disabled":
+            self.logger.debug("Tool crash detection disabled; skipping")
+            return True
+        gcode = self._gcode_obj
+        if gcode is None:
+            try:
+                gcode = self.printer.lookup_object("gcode")
+            except Exception as exc:
+                self.logger.debug(f"Skipping tool crash detection; no gcode object: {exc}")
+                return False
+            self._gcode_obj = gcode
+        if enable:
+            if self.crash_detection_mode == "probe":
+                commands = ("START_TOOL_PROBE_CRASH_DETECTION",)
+            else:
+                commands = ("START_TOOL_CRASH_DETECTION",)
+        else:
+            if self.crash_detection_mode == "probe":
+                commands = ("STOP_TOOL_PROBE_CRASH_DETECTION",)
+            else:
+                commands = ("STOP_TOOL_CRASH_DETECTION",)
+        last_exc = None
+        for command in commands:
+            for candidate in (command, command.lower()):
+                try:
+                    self.logger.debug(f"Running tool crash detection command: {candidate}")
+                    gcode.run_script_from_command(candidate)
+                    self.logger.debug(f"Tool crash detection command completed: {candidate}")
+                    return True
+                except Exception as exc:
+                    self.logger.debug(
+                        f"Tool crash detection command failed: {candidate} ({exc})"
+                    )
+                    last_exc = exc
+                    continue
+        if last_exc is not None:
+            self.logger.debug(f"Skipping tool crash detection; failed {commands}: {last_exc}")
+        else:
+            self.logger.debug("Skipping tool crash detection command; none available")
+        return False
     
     def __init__(self, config):
         self.config = config
@@ -927,6 +1040,19 @@ class OAMSManager:
             self.logger.info("Clog detection is DISABLED by config")
         if not self.enable_stuck_spool_detection:
             self.logger.info("Stuck spool detection is DISABLED by config")
+
+        crash_detection_raw = config.get("crash_detection", "0")
+        crash_detection_mode = str(crash_detection_raw).strip().lower()
+        if crash_detection_mode in {"0", "off", "false", "disabled", "disable"}:
+            crash_detection_mode = "disabled"
+        elif crash_detection_mode in {"tool", "probe"}:
+            pass
+        else:
+            self.logger.warning(
+                f"Unknown crash_detection '{crash_detection_raw}', defaulting to disabled."
+            )
+            crash_detection_mode = "disabled"
+        self.crash_detection_mode = crash_detection_mode
 
         # Configurable detection thresholds and timing parameters with validation
         self.stuck_spool_load_grace = config.getfloat("stuck_spool_load_grace", STUCK_SPOOL_LOAD_GRACE, minval=0.0, maxval=60.0)
@@ -4876,14 +5002,21 @@ class OAMSManager:
         self.logger.debug(f"Loading lane {lane_name}: {oams_name} bay {bay_index} via {fps_name}")
 
         if getattr(oam, "dock_load", False):
-            try:
-                gcode = self._gcode_obj
-                if gcode is None:
+            gcode = self._gcode_obj
+            if gcode is None:
+                try:
                     gcode = self.printer.lookup_object("gcode")
-                    self._gcode_obj = gcode
-                gcode.run_script_from_command("STOP_TOOL_CRASH_DETECTION")
-                gcode.run_script_from_command("AFC_UNSELECT_TOOL")
-            except Exception:
+                except Exception:
+                    gcode = None
+                self._gcode_obj = gcode
+            if gcode is not None:
+                if not self._run_tool_crash_detection(False):
+                    self.logger.warning("Failed to stop tool crash detection before dock unload")
+                try:
+                    gcode.run_script_from_command("AFC_UNSELECT_TOOL")
+                except Exception:
+                    self.logger.warning(f"Failed to dock tool before loading {lane_name}")
+            else:
                 self.logger.warning(f"Failed to dock tool before loading {lane_name}")
 
         # Capture state BEFORE changing fps_state.state to avoid getting stuck
@@ -5070,8 +5203,9 @@ class OAMSManager:
                     if gcode is None:
                         gcode = self.printer.lookup_object("gcode")
                         self._gcode_obj = gcode
+                    if not self._run_tool_crash_detection(True):
+                        self.logger.warning("Failed to start tool crash detection before tool select")
                     gcode.run_script_from_command(f"AFC_SELECT_TOOL TOOL={extruder_name}")
-                    gcode.run_script_from_command("START_TOOL_CRASH_DETECTION")
                 except Exception:
                     self.logger.warning(f"Failed to select tool {extruder_name} after loading {lane_name}")
             else:
@@ -6278,9 +6412,14 @@ class OAMSManager:
                     except Exception:
                         pass
 
+                    recently_unloaded = (
+                        fps_state.since is not None
+                        and now - fps_state.since < AUTO_DETECT_INSERT_GRACE
+                    )
                     if (
                         not is_runout_active
                         and not is_tool_operation
+                        and not recently_unloaded
                         and fps_state.consecutive_idle_polls % 2 == 0
                     ):  # Check every 2 polls (4 seconds)
                         old_lane = fps_state.current_lane
