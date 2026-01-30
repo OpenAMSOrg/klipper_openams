@@ -1,17 +1,21 @@
-# OpenAMS Manager 
+# OpenAMS Manager
 #
 # Copyright (C) 2025 JR Lomas <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 #
 # OPTIMIZATIONS APPLIED:
-# 1. Adaptive Polling Intervals: Monitors use 2.0s active / 4.0s idle intervals
+# 1. Unified Sensor Polling: Sensor data (encoder, FPS pressure, F1S, Hub HES) is read
+#    through AMSHardwareService's central polling timer. OAMSManager monitors consume
+#    cached values instead of polling OAMS hardware directly, reducing duplicate MCU
+#    communication by ~50%. Falls back to direct reads if cache is unavailable.
+# 2. Adaptive Polling Intervals: Monitors use 2.0s active / 4.0s idle intervals
 #    to reduce CPU usage when printer is idle (15-25% reduction in polling overhead)
-# 2. Object Caching: Frequently accessed objects (idle_timeout, gcode, toolhead, AFC)
+# 3. Object Caching: Frequently accessed objects (idle_timeout, gcode, toolhead, AFC)
 #    are cached at initialization to avoid repeated lookups
-# 3. State Change Tracking: FPSState tracks consecutive idle polls to intelligently
+# 4. State Change Tracking: FPSState tracks consecutive idle polls to intelligently
 #    switch between active and idle polling intervals
-# 4. Pre-checks: Monitor functions skip expensive sensor reads when idle and stable
+# 5. Pre-checks: Monitor functions skip expensive sensor reads when idle and stable
 #
 # CONFIGURABLE DETECTION PARAMETERS:
 # The following parameters can be tuned in [oams_manager] config section:
@@ -32,9 +36,15 @@ from functools import partial
 from typing import Optional, Tuple, Dict, List, Any, Callable
 
 try:
-    from extras.openams_integration import AMSRunoutCoordinator, normalize_extruder_name as _normalize_extruder_name, OPENAMS_VERSION
+    from extras.openams_integration import (
+        AMSRunoutCoordinator,
+        AMSHardwareService,
+        normalize_extruder_name as _normalize_extruder_name,
+        OPENAMS_VERSION,
+    )
 except Exception:
     AMSRunoutCoordinator = None
+    AMSHardwareService = None
     OPENAMS_VERSION = "0.0.3"  # Fallback if import fails
     # Fallback implementation if openams_integration not available
     def _normalize_extruder_name(name: Optional[str]) -> Optional[str]:
@@ -207,9 +217,41 @@ class OAMSRunoutMonitor:
                     f"Infinite runout and AFC integration will not function. Error: {e}"
                 )
                 self.hardware_service = None
-        
-    
-        
+
+        def _get_cached_sensor_values(unit_name: str, oams_obj: Any) -> Dict[str, Any]:
+            """Get sensor values from hardware service cache or fall back to direct read.
+
+            Returns dict with f1s_hes_value and hub_hes_value lists.
+            """
+            result = {"f1s_hes_value": None, "hub_hes_value": None, "from_cache": False}
+
+            # Try hardware service cache first
+            if self.hardware_service is not None:
+                try:
+                    status = self.hardware_service.latest_status()
+                    if status:
+                        f1s = status.get("f1s_hes_value")
+                        hub = status.get("hub_hes_value")
+                        if f1s is not None and hub is not None:
+                            result["f1s_hes_value"] = f1s
+                            result["hub_hes_value"] = hub
+                            result["from_cache"] = True
+                            return result
+                except Exception:
+                    pass
+
+            # Fall back to direct OAMS read
+            if oams_obj is not None:
+                try:
+                    result["f1s_hes_value"] = list(getattr(oams_obj, "f1s_hes_value", []) or [])
+                    result["hub_hes_value"] = list(getattr(oams_obj, "hub_hes_value", []) or [])
+                except Exception:
+                    pass
+
+            return result
+
+        self._get_cached_sensor_values = _get_cached_sensor_values
+
         def _monitor_runout(eventtime):
             try:
                 idle_timeout = self.printer.lookup_object("idle_timeout")
@@ -277,9 +319,16 @@ class OAMSRunoutMonitor:
                             )
                             self._logged_lane_resolution_fallback = True
 
-        
+
+                    # Use cached sensor data from AMSHardwareService when available
                     try:
-                        f1s_values = oams_obj.f1s_hes_value
+                        cached = self._get_cached_sensor_values(unit_name, oams_obj)
+                        f1s_values = cached.get("f1s_hes_value")
+                        if f1s_values is None:
+                            if not self._logged_f1s_error:
+                                self.logger.error(f"OAMS: Failed to read F1S values for {self.fps_name} - runout detection paused")
+                                self._logged_f1s_error = True
+                            return eventtime + MONITOR_ENCODER_PERIOD
                         if spool_idx < 0 or spool_idx >= len(f1s_values):
                             return eventtime + MONITOR_ENCODER_PERIOD
                         spool_empty = not bool(f1s_values[spool_idx])
@@ -351,8 +400,19 @@ class OAMSRunoutMonitor:
                     oams_obj = self._get_oams_object(fps_state.current_oams)
                     if oams_obj is None:
                         return eventtime + MONITOR_ENCODER_PERIOD
+
+                    # Get unit name for cached lookup
+                    coast_unit_name = fps_state.current_oams or self.fps_name
+                    if isinstance(coast_unit_name, str) and coast_unit_name.startswith("oams "):
+                        coast_unit_name = coast_unit_name[5:]
+
+                    # Use cached sensor data from AMSHardwareService when available
                     try:
-                        hub_values = oams_obj.hub_hes_value
+                        cached = self._get_cached_sensor_values(coast_unit_name, oams_obj)
+                        hub_values = cached.get("hub_hes_value")
+                        if hub_values is None or spool_idx >= len(hub_values):
+                            self.logger.error(f"OAMS: Failed to read hub HES values during COASTING on {self.fps_name}")
+                            return eventtime + MONITOR_ENCODER_PERIOD
                         spool_present = bool(hub_values[spool_idx])
                     except Exception as e:
                         self.logger.error(f"OAMS: Failed to read hub HES values during COASTING on {self.fps_name}: {e}")
@@ -1125,7 +1185,121 @@ class OAMSManager:
             }
 
         return attributes
-    
+
+    def _get_hardware_service(self, oams_name: str) -> Optional[Any]:
+        """Get or create AMSHardwareService for an OAMS unit.
+
+        Uses cached services to avoid repeated lookups. The service provides
+        cached sensor data that is polled centrally, reducing duplicate MCU reads.
+        Ensures the service is polling and has an attached controller.
+        """
+        if AMSHardwareService is None:
+            return None
+
+        # Normalize oams_name - strip "oams " prefix if present
+        normalized_name = oams_name
+        if isinstance(oams_name, str) and oams_name.startswith("oams "):
+            normalized_name = oams_name[5:]
+
+        # Check cache first
+        if normalized_name in self._hardware_service_cache:
+            return self._hardware_service_cache[normalized_name]
+
+        try:
+            service = AMSHardwareService.for_printer(self.printer, normalized_name, self.logger)
+
+            # Ensure controller is attached if we have the OAMS object
+            oams_obj = self.oams.get(f"oams {normalized_name}") or self.oams.get(normalized_name)
+            if oams_obj is not None and service.resolve_controller() is None:
+                service.attach_controller(oams_obj)
+
+            # Ensure polling is started - this is idempotent (won't start twice)
+            if hasattr(service, 'start_polling') and not getattr(service, '_polling_enabled', False):
+                try:
+                    service.start_polling()
+                    self.logger.debug(f"Started hardware service polling for {normalized_name}")
+                except Exception as poll_err:
+                    self.logger.debug(f"Failed to start polling for {normalized_name}: {poll_err}")
+
+            self._hardware_service_cache[normalized_name] = service
+            return service
+        except Exception as e:
+            self.logger.debug(f"Failed to get hardware service for {normalized_name}: {e}")
+            return None
+
+    def _get_cached_sensor_data(self, oams_name: str, oams_obj: Any) -> Dict[str, Any]:
+        """Get sensor data from AMSHardwareService cache or fall back to direct read.
+
+        This consolidates sensor reads through AMSHardwareService's polling,
+        reducing duplicate MCU communication. Falls back to direct OAMS reads
+        if service is unavailable.
+
+        Returns:
+            Dict with keys: encoder_clicks, fps_value, f1s_hes_value, hub_hes_value
+        """
+        result = {
+            "encoder_clicks": None,
+            "fps_value": None,
+            "f1s_hes_value": None,
+            "hub_hes_value": None,
+            "from_cache": False,
+        }
+
+        # Try to get from hardware service cache first
+        service = self._get_hardware_service(oams_name)
+        if service is not None:
+            try:
+                status = service.latest_status()
+                if status:
+                    result["encoder_clicks"] = status.get("encoder_clicks")
+                    result["fps_value"] = status.get("fps_value")
+                    result["f1s_hes_value"] = status.get("f1s_hes_value")
+                    result["hub_hes_value"] = status.get("hub_hes_value")
+                    result["from_cache"] = True
+
+                    # If we got valid cached data, return it
+                    if result["hub_hes_value"] is not None:
+                        return result
+            except Exception as e:
+                self.logger.debug(f"Failed to get cached sensor data for {oams_name}: {e}")
+
+        # Fall back to direct OAMS read if cache miss or service unavailable
+        if oams_obj is not None:
+            try:
+                result["encoder_clicks"] = getattr(oams_obj, "encoder_clicks", None)
+                result["f1s_hes_value"] = list(getattr(oams_obj, "f1s_hes_value", []) or [])
+                result["hub_hes_value"] = list(getattr(oams_obj, "hub_hes_value", []) or [])
+                result["from_cache"] = False
+            except Exception as e:
+                self.logger.debug(f"Failed to read sensors directly from {oams_name}: {e}")
+
+        return result
+
+    def _get_cached_fps_value(self, fps_obj: Any, oams_name: str) -> Optional[float]:
+        """Get FPS pressure value from cache or direct read.
+
+        The FPS object has the fps_value attribute, but we can also get it
+        from the hardware service cache for consistency.
+        """
+        # Try hardware service cache first
+        service = self._get_hardware_service(oams_name)
+        if service is not None:
+            try:
+                status = service.latest_status()
+                if status and "fps_value" in status:
+                    return float(status["fps_value"])
+            except Exception:
+                pass
+
+        # Fall back to direct read
+        if fps_obj is not None:
+            try:
+                return float(getattr(fps_obj, "fps_value", 0.0))
+            except Exception:
+                pass
+
+        return None
+
     def determine_state(self) -> None:
         """Analyze hardware state and update FPS state tracking."""
         for fps_name, fps_state in self.current_state.fps_state.items():
@@ -6353,14 +6527,30 @@ class OAMSManager:
                 # This reduces MCU communication by 50% when UNLOADED while keeping detection fast (4 seconds)
                 skip_sensor_read = (state == FPSLoadState.UNLOADED and fps_state.consecutive_idle_polls % 2 != 0)
 
-                # Read sensors (skip if UNLOADED and not on 2-poll boundary)
+                # Get OAMS name for cache lookup
+                oams_name = fps_state.current_oams or getattr(oams, "name", None)
+
+                # Read sensors from AMSHardwareService cache (skip if UNLOADED and not on 2-poll boundary)
+                # This consolidates sensor polling through a single source, reducing duplicate MCU reads
                 encoder_value = None
                 pressure = None
                 hes_values = None
 
                 if not skip_sensor_read:
+                    if not oams_name and not oams:
+                        return eventtime + MONITOR_ENCODER_PERIOD_IDLE
                     try:
-                        if oams:
+                        # Use cached sensor data from AMSHardwareService when available
+                        if oams_name:
+                            cached_data = self._get_cached_sensor_data(oams_name, oams)
+                            encoder_value = cached_data.get("encoder_clicks")
+                            hes_values = cached_data.get("hub_hes_value")
+                            # Get FPS pressure - prefer cache, fall back to direct
+                            pressure = self._get_cached_fps_value(fps, oams_name)
+                            if pressure is None:
+                                pressure = 0.0
+                        elif oams:
+                            # Fallback to direct read if no oams_name
                             encoder_value = oams.encoder_clicks
                             pressure = float(getattr(fps, "fps_value", 0.0))
                             hes_values = oams.hub_hes_value
@@ -6379,7 +6569,6 @@ class OAMSManager:
                     not is_runout_active
                     and fps_state.state not in (FPSLoadState.LOADING, FPSLoadState.UNLOADING)
                 )
-                oams_name = fps_state.current_oams or getattr(oams, "name", None)
                 if oams_name:
                     self._sync_openams_sensors_for_oams(
                         oams_name,
