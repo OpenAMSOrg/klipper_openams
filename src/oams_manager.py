@@ -1144,6 +1144,7 @@ class OAMSManager:
         self._pause_resume_obj = None
         # Prevent duplicate detection logs when the same lane remains loaded
         self._last_logged_detected_lane: Dict[str, Optional[str]] = {}
+        self._afc_current_lane_patched = False
 
         self._initialize_oams()
 
@@ -3441,6 +3442,7 @@ class OAMSManager:
             # Validate cached object is still alive
             try:
                 _ = self.afc.lanes  # Quick attribute access test
+                self._patch_afc_current_lane(self.afc)
                 return self.afc
             except Exception:
                 self.logger.warning("Cached AFC object invalid, re-fetching")
@@ -3454,6 +3456,7 @@ class OAMSManager:
             try:
                 _ = cached_afc.lanes
                 self.afc = cached_afc
+                self._patch_afc_current_lane(self.afc)
                 return self.afc
             except Exception:
                 self.logger.warning("Cached AFC object in hardware service invalid, re-fetching")
@@ -3469,11 +3472,48 @@ class OAMSManager:
         self.afc = afc
         self._hardware_service_cache["afc_object"] = afc
         self._ensure_afc_lane_cache(afc)
+        self._patch_afc_current_lane(afc)
         if not self._afc_logged:
             self.logger.info("AFC integration detected; enabling same-FPS infinite runout support.")
 
             self._afc_logged = True
         return self.afc
+
+    def _patch_afc_current_lane(self, afc) -> None:
+        if self._afc_current_lane_patched:
+            return
+        afc_function = getattr(afc, "function", None)
+        if afc_function is None:
+            return
+        original_get_current_lane = getattr(afc_function, "get_current_lane", None)
+        if original_get_current_lane is None or getattr(afc_function, "_oams_current_lane_patched", False):
+            self._afc_current_lane_patched = True
+            return
+
+        def _get_current_lane_with_toolchange_fallback():
+            try:
+                lane = original_get_current_lane()
+            except Exception:
+                lane = None
+            if lane:
+                return lane
+            if not getattr(afc, "in_toolchange", False):
+                return None
+            try:
+                toolhead = getattr(afc, "toolhead", None)
+                if toolhead is None:
+                    return None
+                extruder_name = toolhead.get_extruder().name
+                tool_obj = getattr(afc, "tools", {}).get(extruder_name)
+                if tool_obj is None:
+                    return None
+                return getattr(tool_obj, "lane_loaded", None)
+            except Exception:
+                return None
+
+        afc_function.get_current_lane = _get_current_lane_with_toolchange_fallback
+        afc_function._oams_current_lane_patched = True
+        self._afc_current_lane_patched = True
 
     def _get_reload_params(self, lane_name: str) -> Tuple[Optional[float], Optional[float]]:
         """Get reload length and speed from AFC extruder config.
