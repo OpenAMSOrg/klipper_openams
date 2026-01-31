@@ -1330,7 +1330,7 @@ class OAMSManager:
             f1s_empty = False
             hub_has_filament = False
             if fps_state.current_oams and fps_state.current_spool_idx is not None:
-                oams_obj = self.oams.get(fps_state.current_oams)
+                oams_obj = self._get_oams_object(fps_state.current_oams)
                 if oams_obj:
                     try:
                         f1s_values = getattr(oams_obj, 'f1s_hes_value', None)
@@ -3160,7 +3160,7 @@ class OAMSManager:
 
 
         # Immediately update follower based on current hub sensor state
-        oams_obj = self.oams.get(fps_state.current_oams)
+        oams_obj = self._get_oams_object(fps_state.current_oams)
         if oams_obj:
             self._update_follower_for_oams(fps_state.current_oams, oams_obj)
             gcmd.respond_info(f"Follower state updated based on current hub sensors")
@@ -3638,7 +3638,7 @@ class OAMSManager:
             fps_state.engagement_in_progress = True
             try:
                 if fps_state.current_oams is not None and fps_state.current_spool_idx is not None:
-                    oams_obj = self.oams.get(fps_state.current_oams)
+                    oams_obj = self._get_oams_object(fps_state.current_oams)
                     if oams_obj is not None:
                         self._enable_follower(
                             fps_name,
@@ -3870,7 +3870,8 @@ class OAMSManager:
         # Follower should stay enabled throughout same-FPS runouts (never disabled)
         # This is a safety check to ensure follower is active for new lane
         if fps_state.current_oams and fps_state.current_spool_idx is not None:
-            oams = self.oams.get(fps_state.current_oams)
+            # Use _get_oams_object for proper name fallback (handles "oams1" vs "oams oams1" mismatch)
+            oams = self._get_oams_object(fps_state.current_oams)
             if oams:
                 self._ensure_forward_follower(fps_name, fps_state, "after infinite runout reload")
 
@@ -3926,6 +3927,16 @@ class OAMSManager:
             except Exception:
                 self.logger.error(f"Failed to clear source lane {source_lane_name} state after reload to {target_lane}")
 
+        # CRITICAL: Reset detection trackers after successful reload to prevent false positives
+        # The clog/stuck spool trackers may have stale encoder data from the old lane
+        # which would immediately trigger false clog detection on the new lane
+        fps_state.reset_clog_tracker()
+        fps_state.reset_stuck_spool_state()
+        fps_state.clear_encoder_samples()
+        # Record lane change time for clog/stuck detection grace period
+        fps_state.last_lane_change_time = self.reactor.monotonic()
+        self.logger.debug(f"Reset clog/stuck spool trackers after successful reload on {fps_name}")
+
         fps_state.reset_runout_positions()
         if monitor:
             monitor.reset()
@@ -3955,7 +3966,7 @@ class OAMSManager:
                 monitor.paused()
             return
 
-        oams_unload = self.oams.get(fps_state_obj.current_oams)
+        oams_unload = self._get_oams_object(fps_state_obj.current_oams)
         if oams_unload is None:
             self.logger.error(f"OAMS {fps_state_obj.current_oams} not found for unload")
             self._pause_printer_message(f"OAMS {fps_state_obj.current_oams} not found", active_oams)
@@ -4401,7 +4412,7 @@ class OAMSManager:
             else:
                 return False, f"FPS {fps_name} has no OAMS loaded"
 
-        oams = self.oams.get(fps_state.current_oams)
+        oams = self._get_oams_object(fps_state.current_oams)
         if oams is None:
             oams = self._resolve_oams_for_lane(fps_state.current_lane)
             if oams is not None:
@@ -4600,7 +4611,7 @@ class OAMSManager:
         fps_state.since = self.reactor.monotonic()
         fps_state.reset_stuck_spool_state(preserve_restore=True)
         if fps_state.current_oams:
-            oams_obj = self.oams.get(fps_state.current_oams)
+            oams_obj = self._get_oams_object(fps_state.current_oams)
             if oams_obj is not None:
                 self._set_follower_if_changed(
                     fps_state.current_oams,
@@ -5423,7 +5434,7 @@ class OAMSManager:
             except Exception:
                 raise gcmd.error("EXTRA_RETRACT must be a number")
         else:
-            oams_obj = self.oams.get(fps_state.current_oams) if fps_state.current_oams else None
+            oams_obj = self._get_oams_object(fps_state.current_oams) if fps_state.current_oams else None
             extra_retract = getattr(oams_obj, "extra_retract", None)
             if extra_retract is None:
                 extra_retract = self.extra_retract_default
@@ -5449,7 +5460,7 @@ class OAMSManager:
 
             # Ensure follower is enabled in reverse before the initial unload retract
             try:
-                oams_obj = self.oams.get(fps_state.current_oams) if fps_state.current_oams else None
+                oams_obj = self._get_oams_object(fps_state.current_oams) if fps_state.current_oams else None
                 if oams_obj is None:
                     oams_obj = self._resolve_oams_for_lane(extra_retract_lane)
                     if oams_obj is not None and fps_state.current_oams is None:
@@ -5743,7 +5754,7 @@ class OAMSManager:
 
             oams_obj = None
             if tracked_state.current_oams is not None:
-                oams_obj = self.oams.get(tracked_state.current_oams)
+                oams_obj = self._get_oams_object(tracked_state.current_oams)
             if (oams_obj is not None and tracked_state.current_spool_idx is not None):
                 try:
                     oams_obj.set_led_error(tracked_state.current_spool_idx, 1)
@@ -5846,12 +5857,16 @@ class OAMSManager:
     def _ensure_forward_follower(self, fps_name: str, fps_state: "FPSState", context: str) -> None:
         """Ensure follower is enabled forward when filament is present."""
         if fps_state.current_spool_idx is None:
+            self.logger.debug(f"_ensure_forward_follower skipped for {fps_name}: current_spool_idx is None ({context})")
             return
 
         oams = None
         if fps_state.current_oams is not None:
             oams = self._get_oams_object(fps_state.current_oams)
         if oams is None:
+            self.logger.warning(
+                f"_ensure_forward_follower failed for {fps_name}: OAMS '{fps_state.current_oams}' not found ({context})"
+            )
             return
 
         self._set_follower_state(
@@ -6259,7 +6274,7 @@ class OAMSManager:
             return
 
         if oams is None:
-            oams = self.oams.get(fps_state.current_oams)
+            oams = self._get_oams_object(fps_state.current_oams)
         if oams is None:
             return
 
@@ -6299,7 +6314,7 @@ class OAMSManager:
 
         # Clear any error LEDs on resume (error flags already cleared when pause was triggered)
         for fps_name, fps_state in self.current_state.fps_state.items():
-            oams = self.oams.get(fps_state.current_oams) if fps_state.current_oams else None
+            oams = self._get_oams_object(fps_state.current_oams) if fps_state.current_oams else None
 
             # Clear stuck_spool_active on resume to allow follower to restart
             if fps_state.stuck_spool.active:
@@ -6449,7 +6464,7 @@ class OAMSManager:
 
         spool_idx = fps_state.current_spool_idx
         if oams is None and fps_state.current_oams is not None:
-            oams = self.oams.get(fps_state.current_oams)
+            oams = self._get_oams_object(fps_state.current_oams)
 
         # Set LED to red to indicate error
         if oams is not None and spool_idx is not None:
@@ -6509,7 +6524,7 @@ class OAMSManager:
                 if fps_state is None or fps is None:
                     return eventtime + MONITOR_ENCODER_PERIOD_IDLE
 
-                oams = self.oams.get(fps_state.current_oams) if fps_state.current_oams else None
+                oams = self._get_oams_object(fps_state.current_oams) if fps_state.current_oams else None
 
                 # OPTIMIZATION: Use cached idle_timeout object
                 is_printing = False
@@ -6881,7 +6896,7 @@ class OAMSManager:
             # Follower doesn't interfere with stuck detection (encoder + FPS based)
             # Enable follower directly during stuck load, bypassing state checks
             if fps_state.current_oams and fps_state.current_spool_idx is not None:
-                oams_obj = self.oams.get(fps_state.current_oams)
+                oams_obj = self._get_oams_object(fps_state.current_oams)
                 if oams_obj is not None:
                     self._enable_follower(
                         fps_name,
