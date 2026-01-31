@@ -1232,7 +1232,7 @@ class OAMSManager:
 
         This consolidates sensor reads through AMSHardwareService's polling,
         reducing duplicate MCU communication. Falls back to direct OAMS reads
-        if service is unavailable.
+        if service is unavailable or cache has missing values.
 
         Returns:
             Dict with keys: encoder_clicks, fps_value, f1s_hes_value, hub_hes_value
@@ -1257,18 +1257,25 @@ class OAMSManager:
                     result["hub_hes_value"] = status.get("hub_hes_value")
                     result["from_cache"] = True
 
-                    # If we got valid cached data, return it
-                    if result["hub_hes_value"] is not None:
+                    # If we got ALL required values from cache, return it
+                    # Otherwise fall through to direct read to fill in missing values
+                    if (result["encoder_clicks"] is not None and
+                        result["hub_hes_value"] is not None and
+                        result["f1s_hes_value"] is not None):
                         return result
             except Exception as e:
                 self.logger.debug(f"Failed to get cached sensor data for {oams_name}: {e}")
 
         # Fall back to direct OAMS read if cache miss or service unavailable
+        # This fills in any missing values from partial cache hits
         if oams_obj is not None:
             try:
-                result["encoder_clicks"] = getattr(oams_obj, "encoder_clicks", None)
-                result["f1s_hes_value"] = list(getattr(oams_obj, "f1s_hes_value", []) or [])
-                result["hub_hes_value"] = list(getattr(oams_obj, "hub_hes_value", []) or [])
+                if result["encoder_clicks"] is None:
+                    result["encoder_clicks"] = getattr(oams_obj, "encoder_clicks", None)
+                if result["f1s_hes_value"] is None:
+                    result["f1s_hes_value"] = list(getattr(oams_obj, "f1s_hes_value", []) or [])
+                if result["hub_hes_value"] is None:
+                    result["hub_hes_value"] = list(getattr(oams_obj, "hub_hes_value", []) or [])
                 result["from_cache"] = False
             except Exception as e:
                 self.logger.debug(f"Failed to read sensors directly from {oams_name}: {e}")
@@ -6581,10 +6588,11 @@ class OAMSManager:
                 state_changed = False
 
                 # SAFETY: Check fps_state.since is not None before subtraction to prevent crash
-                if state == FPSLoadState.UNLOADING and fps_state.since is not None and now - fps_state.since > MONITOR_ENCODER_SPEED_GRACE:
+                # Also skip if encoder_value is None (cache not yet populated)
+                if state == FPSLoadState.UNLOADING and fps_state.since is not None and encoder_value is not None and now - fps_state.since > MONITOR_ENCODER_SPEED_GRACE:
                     self._check_unload_speed(fps_name, fps_state, oams, encoder_value, now)
                     state_changed = True
-                elif state == FPSLoadState.LOADING and fps_state.since is not None and now - fps_state.since > MONITOR_ENCODER_SPEED_GRACE:
+                elif state == FPSLoadState.LOADING and fps_state.since is not None and encoder_value is not None and now - fps_state.since > MONITOR_ENCODER_SPEED_GRACE:
                     self._check_load_speed(fps_name, fps_state, fps, oams, encoder_value, pressure, now)
                     state_changed = True
                 elif state == FPSLoadState.UNLOADED:
@@ -6662,8 +6670,10 @@ class OAMSManager:
                             if is_active_extruder:
                                 # Call stuck spool check with encoder value to prevent false positives
                                 # Requires BOTH low pressure AND encoder stopped (not just pressure alone)
-                                self._check_stuck_spool(fps_name, fps_state, fps, oams, encoder_value, pressure, hes_values, now)
-                                self._check_clog(fps_name, fps_state, fps, oams, encoder_value, pressure, now)
+                                # Skip detection if sensor values are None (cache not yet populated)
+                                if encoder_value is not None and pressure is not None:
+                                    self._check_stuck_spool(fps_name, fps_state, fps, oams, encoder_value, pressure, hes_values, now)
+                                    self._check_clog(fps_name, fps_state, fps, oams, encoder_value, pressure, now)
 
                         state_changed = True
                 # Update follower only when state changes or periodically during idle
