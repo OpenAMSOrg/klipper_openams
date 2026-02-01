@@ -1144,7 +1144,6 @@ class OAMSManager:
         self._pause_resume_obj = None
         # Prevent duplicate detection logs when the same lane remains loaded
         self._last_logged_detected_lane: Dict[str, Optional[str]] = {}
-        self._afc_current_lane_patched = False
 
         self._initialize_oams()
 
@@ -3442,7 +3441,6 @@ class OAMSManager:
             # Validate cached object is still alive
             try:
                 _ = self.afc.lanes  # Quick attribute access test
-                self._patch_afc_current_lane(self.afc)
                 return self.afc
             except Exception:
                 self.logger.warning("Cached AFC object invalid, re-fetching")
@@ -3456,7 +3454,6 @@ class OAMSManager:
             try:
                 _ = cached_afc.lanes
                 self.afc = cached_afc
-                self._patch_afc_current_lane(self.afc)
                 return self.afc
             except Exception:
                 self.logger.warning("Cached AFC object in hardware service invalid, re-fetching")
@@ -3472,48 +3469,11 @@ class OAMSManager:
         self.afc = afc
         self._hardware_service_cache["afc_object"] = afc
         self._ensure_afc_lane_cache(afc)
-        self._patch_afc_current_lane(afc)
         if not self._afc_logged:
             self.logger.info("AFC integration detected; enabling same-FPS infinite runout support.")
 
             self._afc_logged = True
         return self.afc
-
-    def _patch_afc_current_lane(self, afc) -> None:
-        if self._afc_current_lane_patched:
-            return
-        afc_function = getattr(afc, "function", None)
-        if afc_function is None:
-            return
-        original_get_current_lane = getattr(afc_function, "get_current_lane", None)
-        if original_get_current_lane is None or getattr(afc_function, "_oams_current_lane_patched", False):
-            self._afc_current_lane_patched = True
-            return
-
-        def _get_current_lane_with_toolchange_fallback():
-            try:
-                lane = original_get_current_lane()
-            except Exception:
-                lane = None
-            if lane:
-                return lane
-            if not getattr(afc, "in_toolchange", False):
-                return None
-            try:
-                toolhead = getattr(afc, "toolhead", None)
-                if toolhead is None:
-                    return None
-                extruder_name = toolhead.get_extruder().name
-                tool_obj = getattr(afc, "tools", {}).get(extruder_name)
-                if tool_obj is None:
-                    return None
-                return getattr(tool_obj, "lane_loaded", None)
-            except Exception:
-                return None
-
-        afc_function.get_current_lane = _get_current_lane_with_toolchange_fallback
-        afc_function._oams_current_lane_patched = True
-        self._afc_current_lane_patched = True
 
     def _get_reload_params(self, lane_name: str) -> Tuple[Optional[float], Optional[float]]:
         """Get reload length and speed from AFC extruder config.
@@ -3704,19 +3664,22 @@ class OAMSManager:
 
                 # Get gcode object for running extrusion command
                 gcode = self.printer.lookup_object('gcode')
-
-                # Run the engagement extrusion using gcode command
-                # M83: relative extrusion, G92 E0: reset position, G1: extrude
-                prime_length = 5.0
-                remaining_length = max(0.0, engagement_length - prime_length)
-                gcode.run_script_from_command("M83")  # Relative extrusion mode
-                gcode.run_script_from_command("G92 E0")  # Reset extruder position
-                gcode.run_script_from_command(f"G1 E{prime_length:.2f} F{engagement_speed:.0f}")  # Prime to help engagement
-                gcode.run_script_from_command("M400")  # Wait for moves to complete
-                self.reactor.pause(self.reactor.monotonic() + 0.2)
-                if remaining_length > 0.0:
-                    gcode.run_script_from_command(f"G1 E{remaining_length:.2f} F{engagement_speed:.0f}")  # Extrude to nozzle tip
+                gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_engagement")
+                try:
+                    # Run the engagement extrusion using gcode command
+                    # M83: relative extrusion, G92 E0: reset position, G1: extrude
+                    prime_length = 5.0
+                    remaining_length = max(0.0, engagement_length - prime_length)
+                    gcode.run_script_from_command("M83")  # Relative extrusion mode
+                    gcode.run_script_from_command("G92 E0")  # Reset extruder position
+                    gcode.run_script_from_command(f"G1 E{prime_length:.2f} F{engagement_speed:.0f}")  # Prime to help engagement
                     gcode.run_script_from_command("M400")  # Wait for moves to complete
+                    self.reactor.pause(self.reactor.monotonic() + 0.2)
+                    if remaining_length > 0.0:
+                        gcode.run_script_from_command(f"G1 E{remaining_length:.2f} F{engagement_speed:.0f}")  # Extrude to nozzle tip
+                        gcode.run_script_from_command("M400")  # Wait for moves to complete
+                finally:
+                    gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_engagement")
 
                 # Small pause to let encoder reading settle
                 self.reactor.pause(self.reactor.monotonic() + 0.2)
@@ -4569,10 +4532,14 @@ class OAMSManager:
                 if gcode is None:
                     gcode = self.printer.lookup_object("gcode")
                     self._gcode_obj = gcode
-                gcode.run_script_from_command("M83")  # Relative extrusion mode
-                gcode.run_script_from_command("G92 E0")  # Reset extruder position
-                gcode.run_script_from_command(f"G1 E-5.00 F{retract_feed:.0f}")
-                gcode.run_script_from_command("M400")
+                gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_unload_retry")
+                try:
+                    gcode.run_script_from_command("M83")  # Relative extrusion mode
+                    gcode.run_script_from_command("G92 E0")  # Reset extruder position
+                    gcode.run_script_from_command(f"G1 E-5.00 F{retract_feed:.0f}")
+                    gcode.run_script_from_command("M400")
+                finally:
+                    gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_unload_retry")
                 self.reactor.pause(self.reactor.monotonic() + 1.0)
                 success, message = oams.unload_spool_with_retry()
             except Exception:
@@ -4790,10 +4757,14 @@ class OAMSManager:
             engagement_length, engagement_speed = self._get_engagement_params(lane_name)
             if engagement_length is not None and engagement_speed is not None:
                 gcode = self.printer.lookup_object('gcode')
-                gcode.run_script_from_command("M83")  # Relative extrusion mode
-                gcode.run_script_from_command(f"G1 E-{engagement_length:.2f} F{engagement_speed:.0f}")
-                gcode.run_script_from_command("M400")  # Wait for moves to complete
-                gcode.run_script_from_command(f"G1 E-10.00 F{engagement_speed:.0f}")  # Overlap retract
+                gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_stuck_retract")
+                try:
+                    gcode.run_script_from_command("M83")  # Relative extrusion mode
+                    gcode.run_script_from_command(f"G1 E-{engagement_length:.2f} F{engagement_speed:.0f}")
+                    gcode.run_script_from_command("M400")  # Wait for moves to complete
+                    gcode.run_script_from_command(f"G1 E-10.00 F{engagement_speed:.0f}")  # Overlap retract
+                finally:
+                    gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_stuck_retract")
         except Exception:
             self.logger.error(f"Failed to retract extruder after stuck spool detection for {lane_name}")
 
@@ -4962,10 +4933,14 @@ class OAMSManager:
                 if engagement_length is not None and engagement_speed is not None:
                     self.logger.info(f"Retracting extruder {engagement_length:.1f}mm to reverse engagement extrusion for {lane_name}")
                     gcode = self.printer.lookup_object('gcode')
-                    gcode.run_script_from_command("M83")  # Relative extrusion mode
-                    gcode.run_script_from_command(f"G1 E-{engagement_length:.2f} F{engagement_speed:.0f}")
-                    gcode.run_script_from_command("M400")  # Wait for moves to complete
-                    gcode.run_script_from_command(f"G1 E-10.00 F{engagement_speed:.0f}")  # Overlap retract
+                    gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_engagement_fail")
+                    try:
+                        gcode.run_script_from_command("M83")  # Relative extrusion mode
+                        gcode.run_script_from_command(f"G1 E-{engagement_length:.2f} F{engagement_speed:.0f}")
+                        gcode.run_script_from_command("M400")  # Wait for moves to complete
+                        gcode.run_script_from_command(f"G1 E-10.00 F{engagement_speed:.0f}")  # Overlap retract
+                    finally:
+                        gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_engagement_fail")
                 else:
                     self.logger.warning(f"Could not get engagement params for {lane_name}, skipping extruder retraction")
             except Exception:
@@ -5423,10 +5398,14 @@ class OAMSManager:
                     if gcode is None:
                         gcode = self.printer.lookup_object("gcode")
                         self._gcode_obj = gcode
-                    gcode.run_script_from_command("M83")  # Relative extrusion mode
-                    gcode.run_script_from_command("G92 E0")  # Reset extruder position
-                    gcode.run_script_from_command(f"G1 E{purge_length:.2f} F{purge_feed:.0f}")
-                    gcode.run_script_from_command("M400")
+                    gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_post_purge")
+                    try:
+                        gcode.run_script_from_command("M83")  # Relative extrusion mode
+                        gcode.run_script_from_command("G92 E0")  # Reset extruder position
+                        gcode.run_script_from_command(f"G1 E{purge_length:.2f} F{purge_feed:.0f}")
+                        gcode.run_script_from_command("M400")
+                    finally:
+                        gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_post_purge")
                 except Exception:
                     self.logger.warning(f"Failed to run post-load purge for {lane_name}")
             if extruder_name:
@@ -5522,20 +5501,24 @@ class OAMSManager:
                 if gcode is None:
                     gcode = self.printer.lookup_object("gcode")
                     self._gcode_obj = gcode
-                gcode.run_script_from_command("M83")  # Relative extrusion mode
-                gcode.run_script_from_command("G92 E0")  # Reset extruder position
+                gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_extra_retract")
+                try:
+                    gcode.run_script_from_command("M83")  # Relative extrusion mode
+                    gcode.run_script_from_command("G92 E0")  # Reset extruder position
 
-                # First retract by the configured unload length (if available)
-                if unload_length is not None:
-                    unload_feed = unload_speed if unload_speed is not None else extra_retract_feed_rate
-                    gcode.run_script_from_command(f"G1 E-{unload_length:.2f} F{unload_feed:.0f}")
+                    # First retract by the configured unload length (if available)
+                    if unload_length is not None:
+                        unload_feed = unload_speed if unload_speed is not None else extra_retract_feed_rate
+                        gcode.run_script_from_command(f"G1 E-{unload_length:.2f} F{unload_feed:.0f}")
+                        gcode.run_script_from_command("M400")
+
+                    # Wait for retract moves to complete before extra retract/unload
                     gcode.run_script_from_command("M400")
 
-                # Wait for retract moves to complete before extra retract/unload
-                gcode.run_script_from_command("M400")
-
-                # Then issue the extra retract before unload
-                gcode.run_script_from_command(f"G1 E{extra_retract:.2f} F{extra_retract_feed_rate:.0f}")
+                    # Then issue the extra retract before unload
+                    gcode.run_script_from_command(f"G1 E{extra_retract:.2f} F{extra_retract_feed_rate:.0f}")
+                finally:
+                    gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_extra_retract")
             except Exception:
                 self.logger.warning(f"Skipping extra retract before unload on {fps_name}: unable to queue gcode")
         else:
@@ -6444,10 +6427,14 @@ class OAMSManager:
 
             # Step 1: Retract extruder to relieve pressure
             self.logger.debug(f"{fps_name}: Retracting extruder")
-            gcode.run_script_from_command("G91")
-            gcode.run_script_from_command("G1 E-10 F300")
-            gcode.run_script_from_command("G90")
-            gcode.run_script_from_command("M400")  # Wait for moves to finish
+            gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_blocked_retry")
+            try:
+                gcode.run_script_from_command("G91")  # Relative positioning
+                gcode.run_script_from_command("M83")  # Relative extrusion mode
+                gcode.run_script_from_command("G1 E-10 F300")
+                gcode.run_script_from_command("M400")  # Wait for moves to finish
+            finally:
+                gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_blocked_retry")
             self.reactor.pause(self.reactor.monotonic() + 0.5)
 
             # Step 2: Ensure follower is reverse for unload
@@ -7654,9 +7641,12 @@ class OAMSManager:
                         # 3. Z-hop to lift nozzle off print
                         self.logger.info("OAMS: Step 3 - Z-hop 5mm")
 
-                        gcode.run_script("G91")  # Relative positioning
-                        gcode.run_script("G1 Z5 F600")  # Lift 5mm
-                        gcode.run_script("G90")  # Absolute positioning
+                        gcode.run_script("SAVE_GCODE_STATE NAME=oams_zhop")
+                        try:
+                            gcode.run_script("G91")  # Relative positioning
+                            gcode.run_script("G1 Z5 F600")  # Lift 5mm
+                        finally:
+                            gcode.run_script("RESTORE_GCODE_STATE NAME=oams_zhop MOVE=0")
 
                         # 4. Get target lane and extruder
                         self.logger.info("OAMS: Step 4 - Getting target lane info")
