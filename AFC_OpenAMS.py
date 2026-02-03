@@ -293,9 +293,6 @@ class afcAMS(afcUnit):
 
         self.oams_name = config.get("oams", "oams1")
 
-        # TD-1 capture on insert: when True, automatically capture TD-1 data when filament is inserted into any lane on this unit
-        self.capture_td1_on_insert = config.getboolean("capture_td1_on_insert", False)
-
         self.reactor = self.printer.get_reactor()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
@@ -1714,7 +1711,8 @@ class afcAMS(afcUnit):
 
         hub_cleared = False
         unload_wait = 5.0
-        for attempt in range(2):
+        initial_delay = 2.0  # Give filament time to start retracting before checking hub
+        for attempt in range(3):  # Increased to 3 attempts
             # Send unload command first to retract spool motor
             try:
                 self.oams.oams_unload_spool_cmd.send([])
@@ -1726,6 +1724,9 @@ class afcAMS(afcUnit):
                 self.oams.set_oams_follower(1, 0)  # Enable reverse
             except Exception:
                 self.logger.error(f"Failed to enable reverse follower for {cur_lane.name}")
+
+            # Initial delay to let filament start retracting before checking hub
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + initial_delay)
 
             # Allow time for spool unload and reverse follower to clear the hub sensor.
             unload_deadline = self.afc.reactor.monotonic() + unload_wait
@@ -1739,14 +1740,35 @@ class afcAMS(afcUnit):
                 self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
             if hub_cleared:
                 break
-        # Disable follower after initiating unload
+            # Send another unload command between attempts
+            try:
+                self.oams.oams_unload_spool_cmd.send([])
+            except Exception:
+                pass
+
+        # Disable follower after unload completes or times out
         try:
             self.oams.set_oams_follower(0, 0)
         except Exception:
             self.logger.error(f"Failed to disable follower after unload for {cur_lane.name}")
+
+        # If hub still not cleared, wait a bit longer for mechanical settling
         if not hub_cleared:
-            self.logger.debug(f"TD-1 unload did not clear hub for {cur_lane.name}")
-        self.logger.info(f"TD-1 unload initiated for {cur_lane.name}")
+            self.logger.debug(f"TD-1 unload did not clear hub for {cur_lane.name}, waiting for settle")
+            settle_deadline = self.afc.reactor.monotonic() + 3.0
+            while self.afc.reactor.monotonic() < settle_deadline:
+                try:
+                    hub_cleared = not bool(self.oams.hub_hes_value[spool_index])
+                except Exception:
+                    hub_cleared = False
+                if hub_cleared:
+                    break
+                self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
+
+        if hub_cleared:
+            self.logger.info(f"TD-1 unload completed for {cur_lane.name}")
+        else:
+            self.logger.warning(f"TD-1 unload did not fully clear hub for {cur_lane.name}")
 
     def calibrate_td1(self, cur_lane, dis, tol):
         """
@@ -2291,10 +2313,11 @@ class afcAMS(afcUnit):
         return True, "TD-1 data captured"
 
     def prep_capture_td1(self, cur_lane):
+        # require_enabled=False - capture decision is made by capture_td1_data in AFC_prep
         return self._capture_td1_with_oams(
             cur_lane,
             require_loaded=True,
-            require_enabled=True,
+            require_enabled=False,
         )
 
     def capture_td1_data(self, cur_lane):
@@ -3085,8 +3108,8 @@ class afcAMS(afcUnit):
 
     def _trigger_td1_capture_delayed(self, lane_name):
         """
-        Timer callback to trigger TD-1 capture after 3-second delay.
-        This allows the AMS auto-load sequence to complete (loads near hub ? retracts ? settles).
+        Timer callback to trigger TD-1 capture after 4.2-second delay.
+        This allows the AMS auto-load sequence to complete (pushes to hub sensor -> retracts -> settles).
 
         CRITICAL: This is called from timer context - must not use reactor.pause() or wait=True.
         """
@@ -3794,7 +3817,16 @@ class afcAMS(afcUnit):
             previous_loaded = bool(getattr(lane, "load_state", False))
         else:
             previous_loaded = bool(previous_loaded)
-        self.logger.debug(f"_handle_spool_loaded_event: lane={lane.name} previous_loaded={previous_loaded} capture_td1_on_insert={self.capture_td1_on_insert}")
+
+        # Check global capture_td1_data setting from AFC_prep config
+        capture_td1_data = False
+        try:
+            prep_obj = self.printer.lookup_object('AFC_prep', None)
+            if prep_obj is not None:
+                capture_td1_data = getattr(prep_obj, "get_td1_data", False) and self.afc.td1_present
+        except Exception:
+            pass
+        self.logger.debug(f"_handle_spool_loaded_event: lane={lane.name} previous_loaded={previous_loaded} capture_td1_data={capture_td1_data}")
 
         eventtime = kwargs.get("eventtime", 0.0)
 
@@ -3806,30 +3838,22 @@ class afcAMS(afcUnit):
         # This eliminates manual state management and ensures proper state transitions
         lane.set_loaded()
 
-        # Schedule TD-1 capture with 3-second delay if capture_td1_on_insert is enabled
-        # The delay allows AMS auto-load sequence to complete (loads near hub ? retracts ? settles)
-        # Note: td1_when_loaded is for toolhead loading, capture_td1_on_insert is for lane insertion
+        # Schedule TD-1 capture with 4.2-second delay if capture_td1_data is enabled in AFC_prep
+        # The delay allows AMS auto-load sequence to complete (pushes to hub -> retracts -> settles)
         # Check lane-level td1_device_id first, fall back to unit-level
         td1_device = getattr(lane, "td1_device_id", None) or getattr(self, "td1_device_id", None)
 
-        # During prep, only capture TD-1 if capture_td1_data is enabled in prep config
+        # During PREP, skip event-based TD-1 capture - PREP's _td1_prep handles sequential capture
+        # This prevents all lanes from trying to capture simultaneously when their timers fire
         in_prep = not getattr(self.afc, "prep_done", True)
-        prep_allows_capture = True
-        if in_prep:
-            try:
-                prep_obj = self.printer.lookup_object('AFC_prep', None)
-                if prep_obj is not None:
-                    prep_allows_capture = getattr(prep_obj, "get_td1_data", False)
-            except Exception:
-                prep_allows_capture = False
 
         should_capture = (
             not previous_loaded
-            and self.capture_td1_on_insert
+            and capture_td1_data
             and td1_device
-            and prep_allows_capture
+            and not in_prep  # Only capture via events after PREP is done
         )
-        self.logger.debug(f"TD-1 capture decision: previous_loaded={previous_loaded} capture_td1_on_insert={self.capture_td1_on_insert} td1_device={td1_device} in_prep={in_prep} prep_allows_capture={prep_allows_capture} should_capture={should_capture}")
+        self.logger.debug(f"TD-1 capture decision: previous_loaded={previous_loaded} capture_td1_data={capture_td1_data} td1_device={td1_device} in_prep={in_prep} should_capture={should_capture}")
         if should_capture:
             lane_name = lane.name
             try:
@@ -3841,12 +3865,13 @@ class afcAMS(afcUnit):
                     except Exception:
                         pass  # Timer may have already fired
 
-                # Register new timer with 3-second delay for TD-1 capture
+                # Register new timer with 4.2-second delay for TD-1 capture
+                # AMS pushes filament to hub sensor then retracts - need time for this sequence
                 timer_callback = self._trigger_td1_capture_delayed(lane_name)
-                timer = self.reactor.register_timer(timer_callback, self.reactor.monotonic() + 3.0)
+                timer = self.reactor.register_timer(timer_callback, self.reactor.monotonic() + 4.2)
                 self._pending_spool_loaded_timers[lane_name] = timer
 
-                self.logger.info(f"Scheduled TD-1 capture for {lane_name} in 3 seconds (allowing AMS to settle)")
+                self.logger.info(f"Scheduled TD-1 capture for {lane_name} in 4.2 seconds (allowing AMS to settle)")
             except Exception as e:
                 self.logger.error(f"Failed to schedule TD-1 capture for {lane_name}: {e}")
         extruder_name = getattr(lane, "extruder_name", None)
