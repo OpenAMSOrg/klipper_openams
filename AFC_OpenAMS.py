@@ -293,6 +293,9 @@ class afcAMS(afcUnit):
 
         self.oams_name = config.get("oams", "oams1")
 
+        # TD-1 capture on insert: when True, automatically capture TD-1 data when filament is inserted into any lane on this unit
+        self.capture_td1_on_insert = config.getboolean("capture_td1_on_insert", False)
+
         self.reactor = self.printer.get_reactor()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
@@ -1853,6 +1856,7 @@ class afcAMS(afcUnit):
         compare_time = datetime.now()
         td1_timeout = self.afc.reactor.monotonic() + 180.0
         td1_detected = False
+        td1_scan_time = None  # Will store actual TD-1 detection time
         next_td1_poll = self.afc.reactor.monotonic()
         last_clicks_moved = 0
         last_progress_time = self.afc.reactor.monotonic()
@@ -1863,14 +1867,15 @@ class afcAMS(afcUnit):
             last_scan_times = {}
             self._td1_last_scan_time_calibration = last_scan_times
 
-        def _capture_td1_if_fresh() -> bool:
+        def _capture_td1_if_fresh():
+            """Returns (detected, scan_time) tuple."""
             td1_data = self.afc.moonraker.get_td1_data()
             if not td1_data or cur_lane.td1_device_id not in td1_data:
-                return False
+                return False, None
             data = td1_data[cur_lane.td1_device_id]
             scan_time = data.get("scan_time")
             if scan_time is None:
-                return False
+                return False, None
             if scan_time.endswith("+00:00Z"):
                 scan_time = scan_time[:-1]
             else:
@@ -1878,28 +1883,31 @@ class afcAMS(afcUnit):
             try:
                 scan_time = datetime.fromisoformat(scan_time).astimezone()
             except (AttributeError, ValueError):
-                return False
+                return False, None
             if scan_time <= compare_time.astimezone():
-                return False
+                return False, None
             last_scan_time = last_scan_times.get(cur_lane.td1_device_id)
             if last_scan_time is not None and scan_time <= last_scan_time:
-                return False
+                return False, None
             if data.get("td") is None or data.get("color") is None:
-                return False
+                return False, None
             last_scan_times[cur_lane.td1_device_id] = scan_time
-            return True
+            return True, scan_time
 
-        def _capture_td1_relaxed() -> bool:
+        def _capture_td1_relaxed():
+            """Returns (detected, scan_time) tuple."""
             td1_data = self.afc.moonraker.get_td1_data()
             if not td1_data or cur_lane.td1_device_id not in td1_data:
-                return False
+                return False, None
             data = td1_data[cur_lane.td1_device_id]
             if data.get("td") is None or data.get("color") is None:
-                return False
-            last_scan_times[cur_lane.td1_device_id] = datetime.now().astimezone()
-            return True
+                return False, None
+            scan_time = datetime.now().astimezone()
+            last_scan_times[cur_lane.td1_device_id] = scan_time
+            return True, scan_time
 
         self.logger.debug(f"Starting continuous follower feed for TD-1 detection on {cur_lane.name}")
+        follower_start_time = datetime.now().astimezone()  # Track when follower started
         try:
             self.oams.set_oams_follower(1, 1)
         except Exception:
@@ -1926,20 +1934,25 @@ class afcAMS(afcUnit):
 
             if self.afc.reactor.monotonic() >= next_td1_poll:
                 next_td1_poll = self.afc.reactor.monotonic() + 2.0
-                if _capture_td1_if_fresh():
+                detected, scan_time = _capture_td1_if_fresh()
+                if detected:
                     td1_detected = True
-                    self.logger.debug(f"TD-1 data detected for {cur_lane.name}")
+                    td1_scan_time = scan_time
+                    self.logger.debug(f"TD-1 data detected for {cur_lane.name} at scan_time={scan_time}")
                     break
                 if self.afc.reactor.monotonic() >= td1_relaxed_ready:
-                    if _capture_td1_relaxed():
+                    detected, scan_time = _capture_td1_relaxed()
+                    if detected:
                         td1_detected = True
+                        td1_scan_time = scan_time
                         self.logger.debug(
-                            f"TD-1 data detected (relaxed) for {cur_lane.name}"
+                            f"TD-1 data detected (relaxed) for {cur_lane.name} at scan_time={scan_time}"
                         )
                         break
             self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
 
         # Disable follower after detection attempt
+        follower_stop_time = datetime.now().astimezone()  # Track when follower stopped
         try:
             self.oams.set_oams_follower(0, 0)
         except Exception:
@@ -1962,7 +1975,31 @@ class afcAMS(afcUnit):
             self._unload_after_td1(cur_lane, spool_index, fps_id)
             return False, msg, 0
 
-        encoder_delta = abs(encoder_after - encoder_before)
+        encoder_delta_raw = abs(encoder_after - encoder_before)
+
+        # Apply scan_time correction to account for detection latency
+        # The follower continues feeding between when TD-1 actually detected the filament
+        # and when we polled and stopped the follower. Use the scan_time to correct for this.
+        encoder_delta = encoder_delta_raw
+        if td1_scan_time is not None and follower_start_time is not None:
+            try:
+                total_duration = (follower_stop_time - follower_start_time).total_seconds()
+                actual_duration = (td1_scan_time - follower_start_time).total_seconds()
+
+                if total_duration > 0 and actual_duration > 0 and actual_duration < total_duration:
+                    correction_factor = actual_duration / total_duration
+                    encoder_delta = int(encoder_delta_raw * correction_factor)
+                    overshoot_clicks = encoder_delta_raw - encoder_delta
+                    self.logger.info(
+                        f"TD-1 calibration correction: raw={encoder_delta_raw} corrected={encoder_delta} "
+                        f"(removed {overshoot_clicks} clicks, {total_duration - actual_duration:.2f}s overshoot)"
+                    )
+                else:
+                    self.logger.debug(
+                        f"TD-1 calibration: no correction applied (total={total_duration:.2f}s actual={actual_duration:.2f}s)"
+                    )
+            except Exception as e:
+                self.logger.debug(f"TD-1 calibration: correction calculation failed: {e}")
 
         # Unload filament after successful TD-1 calibration
         self._unload_after_td1(cur_lane, spool_index, fps_id)
@@ -2864,6 +2901,7 @@ class afcAMS(afcUnit):
 
         lane_val = bool(value)
         prev_val = getattr(lane, "load_state", False)
+        self.logger.debug(f"_on_f1s_changed: lane={lane.name} value={lane_val} prev={prev_val} ams_share_prep_load={getattr(lane, 'ams_share_prep_load', False)}")
 
         # Update lane state based on sensor FIRST
         if getattr(lane, "ams_share_prep_load", False):
@@ -2872,6 +2910,21 @@ class afcAMS(afcUnit):
             lane.load_callback(eventtime, lane_val)
             lane.prep_callback(eventtime, lane_val)
             self._mirror_lane_to_virtual_sensor(lane, eventtime)
+
+            # Publish spool_loaded/spool_unloaded event for non-shared lanes
+            # Pass previous_loaded state since lane.load_state is already updated by callbacks above
+            if self.event_bus is not None:
+                try:
+                    spool_index = self._get_openams_spool_index(lane)
+                    event_type_name = "spool_loaded" if lane_val else "spool_unloaded"
+                    self.event_bus.publish(event_type_name,
+                        unit_name=self.name,
+                        spool_index=spool_index,
+                        eventtime=eventtime,
+                        previous_loaded=prev_val,
+                    )
+                except Exception as e:
+                    self.logger.error(f"Failed to publish {event_type_name} event for {lane.name}: {e}")
 
         # Detect F1S sensor going False (spool empty) - trigger runout detection AFTER sensor update
         # Only trigger if printer is actively printing (not during filament insertion/removal)
@@ -3056,6 +3109,7 @@ class afcAMS(afcUnit):
         """Synchronise shared prep/load sensor lanes without triggering errors."""
         # Check if runout handling requires blocking this sensor update
         if self._should_block_sensor_update_for_runout(lane, lane_val):
+            self.logger.debug(f"_update_shared_lane: blocked by runout handling for {lane.name}")
             return
 
         previous = getattr(lane, "load_state", False)
@@ -3063,12 +3117,15 @@ class afcAMS(afcUnit):
         prep_state = getattr(lane, "prep_state", None)
         load_state = getattr(lane, "load_state", None)
 
+        self.logger.debug(f"_update_shared_lane: lane={lane.name} lane_val={lane_val_bool} previous={previous} prep_state={prep_state} load_state={load_state}")
+
         if (
             previous is not None
             and bool(previous) == lane_val_bool
             and (prep_state is None or bool(prep_state) == lane_val_bool)
             and (load_state is None or bool(load_state) == lane_val_bool)
         ):
+            self.logger.debug(f"_update_shared_lane: early return - state unchanged for {lane.name}")
             return
 
         if lane_val_bool:
@@ -3083,6 +3140,7 @@ class afcAMS(afcUnit):
             self._mirror_lane_to_virtual_sensor(lane, eventtime)
 
             # Publish spool_loaded event immediately (TD-1 capture delay happens in event handler)
+            # Pass previous_loaded state since lane.load_state is already updated by callbacks above
             if self.event_bus is not None:
                 try:
                     spool_index = self._get_openams_spool_index(lane)
@@ -3090,6 +3148,7 @@ class afcAMS(afcUnit):
                         unit_name=self.name,
                         spool_index=spool_index,
                         eventtime=eventtime,
+                        previous_loaded=previous,
                     )
                 except Exception as e:
                     self.logger.error(f"Failed to publish spool_loaded event for {lane.name}: {e}")
@@ -3716,10 +3775,17 @@ class afcAMS(afcUnit):
 
         lane = self._find_lane_by_spool(normalized_index)
         if lane is None:
+            self.logger.debug(f"_handle_spool_loaded_event: lane not found for spool_index={spool_index}")
             return
 
-        # PHASE 2 REFACTOR: Use AFC native lane.load_state instead of dictionary
-        previous_loaded = bool(getattr(lane, "load_state", False))
+        # Use previous_loaded from event payload (passed before callbacks updated state)
+        # Fall back to lane.load_state for backwards compatibility
+        previous_loaded = kwargs.get("previous_loaded")
+        if previous_loaded is None:
+            previous_loaded = bool(getattr(lane, "load_state", False))
+        else:
+            previous_loaded = bool(previous_loaded)
+        self.logger.debug(f"_handle_spool_loaded_event: lane={lane.name} previous_loaded={previous_loaded} capture_td1_on_insert={self.capture_td1_on_insert}")
 
         eventtime = kwargs.get("eventtime", 0.0)
 
@@ -3731,13 +3797,30 @@ class afcAMS(afcUnit):
         # This eliminates manual state management and ensures proper state transitions
         lane.set_loaded()
 
-        # Schedule TD-1 capture with 3-second delay if td1_when_loaded is enabled
-        # The delay allows AMS auto-load sequence to complete (loads near hub ? retracts ? settles)
+        # Schedule TD-1 capture with 3-second delay if capture_td1_on_insert is enabled
+        # The delay allows AMS auto-load sequence to complete (loads near hub → retracts → settles)
+        # Note: td1_when_loaded is for toolhead loading, capture_td1_on_insert is for lane insertion
+        # Check lane-level td1_device_id first, fall back to unit-level
+        td1_device = getattr(lane, "td1_device_id", None) or getattr(self, "td1_device_id", None)
+
+        # During prep, only capture TD-1 if capture_td1_data is enabled in prep config
+        in_prep = not getattr(self.afc, "prep_done", True)
+        prep_allows_capture = True
+        if in_prep:
+            try:
+                prep_obj = self.printer.lookup_object('AFC_prep', None)
+                if prep_obj is not None:
+                    prep_allows_capture = getattr(prep_obj, "get_td1_data", False)
+            except Exception:
+                prep_allows_capture = False
+
         should_capture = (
             not previous_loaded
-            and getattr(lane, "td1_when_loaded", False)
-            and getattr(lane, "td1_device_id", None)
+            and self.capture_td1_on_insert
+            and td1_device
+            and prep_allows_capture
         )
+        self.logger.debug(f"TD-1 capture decision: previous_loaded={previous_loaded} capture_td1_on_insert={self.capture_td1_on_insert} td1_device={td1_device} in_prep={in_prep} prep_allows_capture={prep_allows_capture} should_capture={should_capture}")
         if should_capture:
             lane_name = lane.name
             try:
