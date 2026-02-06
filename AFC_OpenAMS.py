@@ -1018,17 +1018,23 @@ class afcAMS(afcUnit):
                         other_lane._oams_runout_detected = False
                     self.logger.debug(f"Cleared tool_loaded for {other_lane.name} on same FPS (new lane {lane.name} loaded)")
 
-        # Trigger OAMS state detection to sync FPS state with sensor readings
-        # This ensures FPS state is updated when manually setting lane as loaded
-        # NOTE: Use determine_state() for normal operations, not sync_state_with_afc()
-        # sync_state_with_afc() is only for error recovery (SET_LANE_LOADED, OAMSM_CLEAR_ERRORS)
+        # Sync OAMS MCU current_spool and FPS state when lane is set as loaded
+        # This is critical for SET_LANE_LOADED to work - without setting current_spool,
+        # oams_manager will say "Spool already unloaded" when trying to unload
         if self.oams is not None:
             try:
+                # Set OAMS MCU current_spool to this lane's spool index (0-based)
+                spool_index = getattr(lane, 'index', None)
+                if spool_index is not None:
+                    self.oams.current_spool = spool_index - 1
+                    self.logger.debug(f"Set OAMS current_spool to {spool_index - 1} for {getattr(lane, 'name', None)}")
+
+                # Use sync_state_with_afc for proper state sync (includes error recovery)
                 oams_manager = self.printer.lookup_object("oams_manager", None)
                 if oams_manager is not None:
-                    oams_manager.determine_state()
+                    oams_manager.sync_state_with_afc()
             except Exception as e:
-                self.logger.error(f"Failed to trigger OAMS state detection for {getattr(lane, 'name', None)}: {e}")
+                self.logger.error(f"Failed to sync OAMS state for {getattr(lane, 'name', None)}: {e}")
 
         if not self._lane_matches_extruder(lane):
             return
@@ -1711,7 +1717,7 @@ class afcAMS(afcUnit):
 
         hub_cleared = False
         unload_wait = 5.0
-        initial_delay = 2.0  # Give filament time to start retracting before checking hub
+        initial_delay = 0.0  # Unload immediately once load is confirmed
         for attempt in range(3):  # Increased to 3 attempts
             # Send unload command first to retract spool motor
             try:
@@ -1725,8 +1731,9 @@ class afcAMS(afcUnit):
             except Exception:
                 self.logger.error(f"Failed to enable reverse follower for {cur_lane.name}")
 
-            # Initial delay to let filament start retracting before checking hub
-            self.afc.reactor.pause(self.afc.reactor.monotonic() + initial_delay)
+            # Optional delay before checking hub clear state
+            if initial_delay > 0.0:
+                self.afc.reactor.pause(self.afc.reactor.monotonic() + initial_delay)
 
             # Allow time for spool unload and reverse follower to clear the hub sensor.
             unload_deadline = self.afc.reactor.monotonic() + unload_wait
@@ -1768,7 +1775,7 @@ class afcAMS(afcUnit):
         if hub_cleared:
             self.logger.info(f"TD-1 unload completed for {cur_lane.name}")
         else:
-            self.logger.warning(f"TD-1 unload did not fully clear hub for {cur_lane.name}")
+            self.logger.debug(f"TD-1 unload did not fully clear hub for {cur_lane.name}")
 
     def calibrate_td1(self, cur_lane, dis, tol):
         """
@@ -2185,38 +2192,21 @@ class afcAMS(afcUnit):
             )
             return False, "Hub sensor did not trigger"
 
-        # Hub detected - abort load operation and take manual control
-        # This stops FPS-based loading and lets us feed exact distance to TD-1
-        self.logger.debug(f"Hub detected, aborting load and taking manual control for {cur_lane.name}")
-        try:
-            self.oams.abort_current_action(wait=True, code=0)
-        except Exception:
-            self.logger.error(f"Failed to abort load action for {cur_lane.name}")
-
+        # Hub detected - use OAMS load flow and encoder tracking (no manual follower feed)
         try:
             encoder_before = int(self.oams.encoder_clicks)
         except Exception:
             encoder_before = None
 
         if encoder_before is None:
-            try:
-                self.oams.set_oams_follower(0, 0)
-            except Exception:
-                pass
             self.logger.error(
                 f"Unable to read encoder before TD-1 capture for {cur_lane.name}"
             )
             return False, "Unable to read encoder before capture"
 
-        # Feed filament by td1_bowden_length + 5 clicks to get past TD-1 sensor
-        # Enable follower manually to feed the exact distance
-        target_clicks = max(0, int(cur_lane.td1_bowden_length) + 5)
+        target_clicks = max(0, int(cur_lane.td1_bowden_length))
         compare_time = datetime.now()
         td1_timeout = self.afc.reactor.monotonic() + 30.0
-        td1_detected = False
-        last_clicks_moved = 0
-        last_progress_time = self.afc.reactor.monotonic()
-        td1_min_ready = self.afc.reactor.monotonic() + 0.5
         last_scan_times = getattr(self, "_td1_last_scan_time_capture", None)
         if last_scan_times is None:
             last_scan_times = {}
@@ -2225,15 +2215,12 @@ class afcAMS(afcUnit):
         def _capture_td1_if_fresh() -> bool:
             td1_data = self.afc.moonraker.get_td1_data()
             if not td1_data:
-                self.logger.debug(f"TD-1 capture: no TD-1 data available from moonraker")
                 return False
             if cur_lane.td1_device_id not in td1_data:
-                self.logger.debug(f"TD-1 capture: device {cur_lane.td1_device_id} not in td1_data keys: {list(td1_data.keys())}")
                 return False
             data = td1_data[cur_lane.td1_device_id]
             scan_time = data.get("scan_time")
             if scan_time is None:
-                self.logger.debug(f"TD-1 capture: no scan_time in data for {cur_lane.td1_device_id}")
                 return False
             if scan_time.endswith("+00:00Z"):
                 scan_time = scan_time[:-1]
@@ -2241,63 +2228,38 @@ class afcAMS(afcUnit):
                 scan_time = scan_time[:-1] + "+00:00"
             try:
                 scan_time = datetime.fromisoformat(scan_time).astimezone()
-            except (AttributeError, ValueError) as e:
-                self.logger.debug(f"TD-1 capture: failed to parse scan_time: {e}")
+            except (AttributeError, ValueError):
                 return False
             if scan_time <= compare_time.astimezone():
-                self.logger.debug(f"TD-1 capture: scan_time {scan_time} is not newer than compare_time {compare_time.astimezone()}")
                 return False
             last_scan_time = last_scan_times.get(cur_lane.td1_device_id)
             if last_scan_time is not None and scan_time <= last_scan_time:
-                self.logger.debug(f"TD-1 capture: scan_time {scan_time} is not newer than last_scan_time {last_scan_time}")
                 return False
             if data.get("td") is None or data.get("color") is None:
-                self.logger.debug(f"TD-1 capture: data missing td or color fields: td={data.get('td')} color={data.get('color')}")
                 return False
             cur_lane.td1_data = data
             last_scan_times[cur_lane.td1_device_id] = scan_time
-            self.logger.info(f"{cur_lane.name} TD-1 data captured: td={data.get('td')} color={data.get('color')}")
+            self.logger.info(
+                f"{cur_lane.name} TD-1 data captured: td={data.get('td')} color={data.get('color')}"
+            )
             self.afc.save_vars()
             return True
 
-        self.logger.debug(f"TD-1 capture: feeding {target_clicks} encoder clicks to TD-1 on {cur_lane.name}")
-        try:
-            self.oams.set_oams_follower(1, 1)  # Enable follower forward
-        except Exception:
-            self.logger.error(f"Failed to enable follower for TD-1 capture on {cur_lane.name}")
-            return False, "Failed to enable follower"
+        self.logger.debug(
+            f"TD-1 capture: waiting for encoder to reach {target_clicks} clicks on {cur_lane.name}"
+        )
         while self.afc.reactor.monotonic() < td1_timeout:
             try:
                 encoder_now = int(self.oams.encoder_clicks)
             except Exception:
                 encoder_now = encoder_before
-
             clicks_moved = abs(encoder_now - encoder_before)
-            if clicks_moved != last_clicks_moved:
-                last_clicks_moved = clicks_moved
-                last_progress_time = self.afc.reactor.monotonic()
-            elif (self.afc.reactor.monotonic() - last_progress_time) > 1.5:
-                self.logger.info(
-                    f"TD-1 capture: follower stalled after {clicks_moved} clicks on {cur_lane.name}"
-                )
-                break
             if clicks_moved >= target_clicks:
-                self.logger.debug(f"TD-1 capture: reached {clicks_moved} clicks on {cur_lane.name}")
                 break
-            if self.afc.reactor.monotonic() >= td1_min_ready:
-                if _capture_td1_if_fresh():
-                    td1_detected = True
-                    self.logger.debug(f"TD-1 capture: data detected early for {cur_lane.name}")
-                    break
             self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
 
-        # Stop the load - disable follower
-        try:
-            self.oams.set_oams_follower(0, 0)
-        except Exception:
-            self.logger.error(f"Failed to disable follower after TD-1 capture for {cur_lane.name}")
-
-        # Wait for TD-1 to read data, but exit early if data arrives
+        # Read TD-1 as soon as encoder target is reached
+        td1_detected = _capture_td1_if_fresh()
         if not td1_detected:
             td1_wait_deadline = self.afc.reactor.monotonic() + 3.5
             while self.afc.reactor.monotonic() < td1_wait_deadline:
@@ -2306,9 +2268,36 @@ class afcAMS(afcUnit):
                     break
                 self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
 
-        # Unload filament after successful TD-1 capture
+        # Wait until OAMS reports load complete before unloading
+        load_deadline = self.afc.reactor.monotonic() + 30.0
+        while self.afc.reactor.monotonic() < load_deadline:
+            action_status = getattr(self.oams, "action_status", None)
+            action_status_code = getattr(self.oams, "action_status_code", None)
+            queried_spool = None
+            try:
+                if hasattr(self.oams, "determine_current_spool"):
+                    queried_spool = self.oams.determine_current_spool()
+            except Exception:
+                queried_spool = None
+            current_spool = getattr(self.oams, "current_spool", None)
+            if (
+                action_status is None
+                and action_status_code == 0
+                and (current_spool == spool_index or queried_spool == spool_index)
+            ):
+                if current_spool != spool_index:
+                    self.oams.current_spool = spool_index
+                break
+            self.afc.reactor.pause(self.afc.reactor.monotonic() + 0.1)
+
+
+        # Always unload after capture attempt, regardless of TD-1 read result
         self._unload_after_td1(cur_lane, spool_index, fps_id)
         self._td1_last_capture_time = self.afc.reactor.monotonic()
+
+        if not td1_detected:
+            self.logger.debug(f"TD-1 data not captured for {cur_lane.name}")
+            return False, "TD-1 data not captured (unload completed)"
 
         return True, "TD-1 data captured"
 
