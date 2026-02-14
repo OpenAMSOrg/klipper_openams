@@ -2251,13 +2251,14 @@ class OAMSManager:
             if lane is not None:
                 lane_tool_loaded = bool(getattr(lane, "tool_loaded", False))
                 lane_loaded_to_hub = bool(getattr(lane, "loaded_to_hub", False))
+                lane_load_state = bool(getattr(lane, "load_state", False))
                 lane_extruder = getattr(lane, "extruder_obj", None)
                 extruder_loaded_lane = getattr(lane_extruder, "lane_loaded", None) if lane_extruder else None
-                if (not lane_tool_loaded and not lane_loaded_to_hub and
+                if (not lane_tool_loaded and not lane_loaded_to_hub and not lane_load_state and
                         extruder_loaded_lane != fps_state.current_lane):
                     self.logger.debug(
                         f"Skipping fps_state fallback for {fps_state.current_lane} on {fps_name}: "
-                        "lane has no tool_loaded/loaded_to_hub flags and extruder lane_loaded is "
+                        "lane has no tool_loaded/loaded_to_hub/load_state flags and extruder lane_loaded is "
                         f"{extruder_loaded_lane or 'None'}"
                     )
                     lane = None
@@ -3724,8 +3725,11 @@ class OAMSManager:
                                     f"Completing load for {lane_name}: extruding {post_length:.1f}mm "
                                     f"at {post_speed:.0f}mm/min"
                                 )
+                                gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_post_load")
+                                gcode.run_script_from_command("M83")  # Relative extrusion mode
                                 gcode.run_script_from_command(f"G1 E{post_length:.2f} F{post_speed:.0f}")
                                 gcode.run_script_from_command("M400")
+                                gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_post_load")
                             return True
                         else:
                             # Encoder didn't move enough - re-check after a short delay
@@ -3756,8 +3760,11 @@ class OAMSManager:
                                         f"Completing load for {lane_name}: extruding {post_length:.1f}mm "
                                         f"at {post_speed:.0f}mm/min"
                                     )
+                                    gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_post_load")
+                                    gcode.run_script_from_command("M83")  # Relative extrusion mode
                                     gcode.run_script_from_command(f"G1 E{post_length:.2f} F{post_speed:.0f}")
                                     gcode.run_script_from_command("M400")
+                                    gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_post_load")
                                 return True
 
                             # Encoder didn't move enough - filament not engaged
@@ -3781,8 +3788,11 @@ class OAMSManager:
                                     f"Completing load for {lane_name}: extruding {post_length:.1f}mm "
                                     f"at {post_speed:.0f}mm/min"
                                 )
+                                gcode.run_script_from_command("SAVE_GCODE_STATE NAME=oams_post_load")
+                                gcode.run_script_from_command("M83")  # Relative extrusion mode
                                 gcode.run_script_from_command(f"G1 E{post_length:.2f} F{post_speed:.0f}")
                                 gcode.run_script_from_command("M400")
+                                gcode.run_script_from_command("RESTORE_GCODE_STATE NAME=oams_post_load")
                             return True
                         else:
                             fps_state.engaged_with_extruder = False
@@ -5384,6 +5394,27 @@ class OAMSManager:
                         self.logger.debug(f"Virtual tool sensor update not available for {lane_name}")
         except Exception:
             self.logger.warning(f"Failed to update virtual tool sensor for {lane_name} after load")
+
+        # Force-update loaded_to_hub from hardware hub sensor after successful load.
+        # During engagement retries, set_unloaded() clears loaded_to_hub but the hub_changed
+        # event may not re-fire if the hardware sensor didn't change between polling cycles
+        # (edge-triggered polling misses software-only state changes).
+        try:
+            afc = self._get_afc()
+            if afc is not None:
+                lane_obj = afc.lanes.get(lane_name)
+                if lane_obj is not None:
+                    hub_hes_values = getattr(oam, "hub_hes_value", None)
+                    if hub_hes_values is not None and bay_index < len(hub_hes_values):
+                        hub_sensor_state = bool(hub_hes_values[bay_index])
+                        if lane_obj.loaded_to_hub != hub_sensor_state:
+                            lane_obj.loaded_to_hub = hub_sensor_state
+                            self.logger.debug(
+                                f"Force-updated loaded_to_hub={hub_sensor_state} for {lane_name} "
+                                f"from hardware after successful load"
+                            )
+        except Exception:
+            pass
 
         # Monitors are already running globally, no need to restart them
         if getattr(oam, "dock_load", False):
