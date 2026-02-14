@@ -3295,7 +3295,7 @@ class afcAMS(afcUnit):
             self.logger.error(f"Failed to update prep sensor for lane {lane}")
         # When sensor goes False (empty), only clear tool/hub loaded flags
         # Let AFC's normal flow handle status and cleanup (align with Box Turtle)
-        if not lane_val and allow_clear:
+        if not lane_val:
             lane.tool_loaded = False
             lane.loaded_to_hub = False
 
@@ -3647,6 +3647,11 @@ class afcAMS(afcUnit):
         afc_function = getattr(self.afc, "function", None)
 
         if lane_state:
+            # Filament at toolhead must have passed through hub - ensure hub indicator is correct.
+            # hub_changed events are edge-triggered and can miss transitions when loaded_to_hub
+            # was cleared by software (e.g. set_unloaded during retry cleanup) but hardware
+            # stayed True between polls, so no event fires to re-set it.
+            lane.loaded_to_hub = True
             if afc_function is not None:
                 try:
                     afc_function.unset_lane_loaded()
