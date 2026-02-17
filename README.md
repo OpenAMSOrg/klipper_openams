@@ -1,8 +1,6 @@
-<img width="1024" height="1024" alt="image" src="https://github.com/user-attachments/assets/7b515408-d0b3-437f-b0a4-8c7128d2e922" />
-
-
-
-# OpenAMS for Klipper
+image
+OpenAMS for Klipper
+Version 0.0.3 — Lane-based AFC integration with event-driven monitoring
 
 > **Version 0.0.3** — Lane-based AFC integration with event-driven monitoring
 
@@ -259,151 +257,116 @@ The system uses a lane-based architecture for AFC integration:
 
 Before installing OpenAMS, ensure you have:
 
-1. **Klipper** installed and running
-2. **Moonraker** configured
-3. **MCU's id's** uuid's or serial id for FPS and AMS board
-4. **Optional but recommended:**
-   - Spoolman for filament tracking
-   - Mainsail or Fluidd web interface
-
-## Installation
-
+Klipper installed and running
+Moonraker configured
+MCU's id's uuid's or serial id for FPS and AMS board
+Optional but recommended:
+Spoolman for filament tracking
+Mainsail or Fluidd web interface
+Installation
 Follow the steps below in order to ensure a working AFC + OpenAMS setup. Each stage builds on the previous one.
 
-### Clone This Repository First
-
+Clone This Repository First
 The AFC installer will copy OpenAMS-specific files during setup, so start by cloning this repository:
 
-```bash
 cd ~
 git clone https://github.com/lindnjoe/klipper_openams.git
 cd klipper_openams
-```
-
 Leave the repository in place for the later steps—you'll stage configuration templates from it and then run the OpenAMS installer.
 
-### 1. Install/Update AFC
-
+1. Install/Update AFC
 This step lays down the Armored Turtle AFC framework that OpenAMS builds on. Complete each subsection before moving to the OpenAMS installer.
 
-#### Lane Architecture Primer
+Lane Architecture Primer
+OpenAMS integrates with AFC through lanes instead of the legacy filament group system. Each lane represents:
 
-OpenAMS integrates with AFC through **lanes** instead of the legacy filament group system. Each lane represents:
+One physical spool slot on your OpenAMS unit
+A mapping to a specific hub for filament routing
+Optional LED indicators
+Association with a tool number (T0, T1, T2, T3, etc.)
+Benefits of lane-based configuration:
 
-- One physical spool slot on your OpenAMS unit
-- A mapping to a specific hub for filament routing
-- Optional LED indicators
-- Association with a tool number (T0, T1, T2, T3, etc.)
+More flexible spool-to-tool mappings
+Better integration with AFC's toolchange system
+Easier to configure runout behavior per lane
+Supports multiple hubs and complex routing
+Example: A single OpenAMS with four slots becomes four AFC lanes (lane0–lane3), each independently configurable with its own hub and runout behavior.
 
-**Benefits of lane-based configuration:**
-
-- More flexible spool-to-tool mappings
-- Better integration with AFC's toolchange system
-- Easier to configure runout behavior per lane
-- Supports multiple hubs and complex routing
-
-**Example:** A single OpenAMS with four slots becomes four AFC lanes (`lane0`–`lane3`), each independently configurable with its own hub and runout behavior.
-
-#### Install the AFC Add-On
-
+Install the AFC Add-On
 Clone the Armored Turtle repository (OpenAMS should already be cloned from the previous step):
 
-```bash
 cd ~
 git clone https://github.com/ArmoredTurtle/AFC-Klipper-Add-On.git
-```
+Install the AFC add-on from the multi_extruder branch:
 
-Install the AFC add-on from the `multi_extruder` branch:
-
-```bash
 cd ~/AFC-Klipper-Add-On
 ./install-afc.sh -b multi_extruder
-```
+Important setup notes:
 
-**Important setup notes:**
+Read the AFC documentation: Most of the Armored Turtle setup guide applies directly to OpenAMS. Review it at https://www.armoredturtle.xyz/docs/afc-klipper-add-on/index.html.
 
-1. **Read the AFC documentation:** Most of the Armored Turtle setup guide applies directly to OpenAMS. Review it at <https://www.armoredturtle.xyz/docs/afc-klipper-add-on/index.html>.
-2. **Box Turtle vs OpenAMS:** Some documentation is specific to Box Turtle hardware and will not apply to OpenAMS. When in doubt, leave defaults in place—the OpenAMS-specific config files override Box Turtle defaults.
-3. **Installation prompts:** During the AFC installation, you'll be presented with an interactive menu:
-   - Press **T** to cycle through installation types until you see **OpenAMS**
-   - Select the **OpenAMS** unit type when prompted
-   - Enter an AMS name or use the default (please make sure it starts with AMS) (default: `AMS_1`) 
-   - Configure your preferred options (tip forming, cutters, etc.)
-   - Complete the installation
-   
-   <img width="1086" height="803" alt="AFC installation prompts" src="https://github.com/user-attachments/assets/7b62feea-d566-4be5-9d44-5b79644fc841" />
+Box Turtle vs OpenAMS: Some documentation is specific to Box Turtle hardware and will not apply to OpenAMS. When in doubt, leave defaults in place—the OpenAMS-specific config files override Box Turtle defaults.
 
-4. **Best practice:** Install AFC while your OpenAMS unit is **empty** to avoid interruptions during the system file updates.
+Installation prompts: During the AFC installation, you'll be presented with an interactive menu:
 
-#### Stage AFC Configuration Templates
+Press T to cycle through installation types until you see OpenAMS
+Select the OpenAMS unit type when prompted
+Enter an AMS name or use the default (please make sure it starts with AMS) (default: AMS_1)
+Configure your preferred options (tip forming, cutters, etc.)
+Complete the installation
+AFC installation prompts
+Best practice: Install AFC while your OpenAMS unit is empty to avoid interruptions during the system file updates.
 
+Stage AFC Configuration Templates
 After the AFC installer completes, stage the OpenAMS-specific configuration files from this repository so they are in place before you run the OpenAMS installer:
 
-```bash
 cd ~/klipper_openams
 cp AFC_AMS_1.cfg ~/printer_data/config/AFC/
 cp AFC_Oams.cfg ~/printer_data/config/AFC/
-```
+Replace ~/printer_data with your actual printer data path if different.
 
-Replace `~/printer_data` with your actual printer data path if different.
+Configuration file overview:
 
-**Configuration file overview:**
+File	Purpose	Must edit?
+AFC_AMS_1.cfg	Defines AFC lanes mapped to OpenAMS slots and hubs	Yes – configure lanes and T-number mappings
+AFC_Oams.cfg	OpenAMS hardware configuration (MCU, sensors, FPS)	Yes – set CAN UUIDs and calibration values
+Include the chosen files in your Klipper configuration stack (typically printer.cfg or split include files):
 
-| File | Purpose | Must edit? |
-|------|---------|------------|
-| `AFC_AMS_1.cfg` | Defines AFC lanes mapped to OpenAMS slots and hubs | Yes – configure lanes and T-number mappings |
-| `AFC_Oams.cfg` | OpenAMS hardware configuration (MCU, sensors, FPS) | Yes – set CAN UUIDs and calibration values |
-
-Include the chosen files in your Klipper configuration stack (typically `printer.cfg` or split include files):
-
-```ini
 [include AFC/AFC_Oams.cfg]
-```
+The [oams_manager] and [oams ...] sections shown earlier come from AFC_Oams.cfg, while the lane definitions originate from AFC_AMS_1.cfg. Customize them before running the OpenAMS installer so the service restarts with your hardware details.
 
-The `[oams_manager]` and `[oams ...]` sections shown earlier come from `AFC_Oams.cfg`, while the lane definitions originate from `AFC_AMS_1.cfg`. Customize them before running the OpenAMS installer so the service restarts with your hardware details.
-
-#### AFC Hardware Configuration Checklist
-
+AFC Hardware Configuration Checklist
 With the templates staged, edit the hardware-specific values before moving on:
 
-1. **AFC_Oams.cfg:**
-   - Set your CAN bus UUIDs or serial identifiers for FPS and OAMS MCU boards
-   - Adjust retry settings and sensor thresholds as needed
-   - Configure FPS (Filament Pressure Sensor) pin and settings
-2. **AFC_AMS_1.cfg (lane configuration):**
-   - Map each OpenAMS slot to a tool number (T0–T3)
-   - Verify each lane specifies its `unit` (e.g., `AMS_1:1`) and hub
-   - Set `load_to_hub: False` for OpenAMS lanes (required for AMS units; matches the AFC_AMS_1.cfg template)
-   - Set LED indices if using LED indicators
-   - Review the default lane template from this repo and tailor hub mappings and bowden lengths to your hardware
-3. **AFC_Hardware.cfg:**
-   - Open the hardware template installed by AFC: `nano ~/printer_data/config/AFC/AFC_Hardware.cfg`
-   - In `[AFC_extruder extruder]`, set `pin_tool_start:` to `AMS_extruder` when the Filament Pressure Sensor handles ramming
-   - If you rely on a toolhead filament sensor instead, set `pin_tool_start:` to your actual sensor pin (e.g., `^PC0`)
-   - Verify your toolhead distances and speeds for reliable load/unload (see the AFC documentation toolhead settings page: <https://www.armoredturtle.xyz/docs/afc-klipper-add-on/index.html>):
-     ```ini
-     [AFC_extruder extruder]
-     tool_stn: 92                    # Distance in mm from the toolhead sensor to the nozzle tip
-     tool_stn_unload: 110            # Distance to move in mm while unloading the toolhead
-     tool_sensor_after_extruder: 0   # Extra distance after sensors clear to fully exit gears
-     tool_unload_speed: 25           # Unload speed in mm/s
-     tool_load_speed: 15             # Load speed in mm/s
-     deadband: 1
-     ```
+AFC_Oams.cfg:
+Set your CAN bus UUIDs or serial identifiers for FPS and OAMS MCU boards
+Adjust retry settings and sensor thresholds as needed
+Configure FPS (Filament Pressure Sensor) pin and settings
+AFC_AMS_1.cfg (lane configuration):
+Map each OpenAMS slot to a tool number (T0–T3)
+Verify each lane specifies its unit (e.g., AMS_1:1) and hub
+Set load_to_hub: False for OpenAMS lanes (required for AMS units; matches the AFC_AMS_1.cfg template)
+Set LED indices if using LED indicators
+Review the default lane template from this repo and tailor hub mappings and bowden lengths to your hardware
+AFC_Hardware.cfg:
+Open the hardware template installed by AFC: nano ~/printer_data/config/AFC/AFC_Hardware.cfg
+In [AFC_extruder extruder], set pin_tool_start: to AMS_extruder when the Filament Pressure Sensor handles ramming
+If you rely on a toolhead filament sensor instead, set pin_tool_start: to your actual sensor pin (e.g., ^PC0)
+Verify your toolhead distances and speeds for reliable load/unload (see the AFC documentation toolhead settings page: https://www.armoredturtle.xyz/docs/afc-klipper-add-on/index.html):
+[AFC_extruder extruder]
+tool_stn: 92                    # Distance in mm from the toolhead sensor to the nozzle tip
+tool_stn_unload: 110            # Distance to move in mm while unloading the toolhead
+tool_sensor_after_extruder: 0   # Extra distance after sensors clear to fully exit gears
+tool_unload_speed: 25           # Unload speed in mm/s
+tool_load_speed: 15             # Load speed in mm/s
+deadband: 1
+Only after the AFC installer, template staging, and configuration edits are complete should you proceed to installing OpenAMS. Screenshot 2025-11-09 095729
 
-Only after the AFC installer, template staging, and configuration edits are complete should you proceed to installing OpenAMS.
-<img width="1086" height="803" alt="Screenshot 2025-11-09 095729" src="https://github.com/user-attachments/assets/bd0663ef-6454-4ebb-8489-e7a8bd0faca1" />
-
-
-### 2. Install OpenAMS
-
+2. Install OpenAMS
 If this is your first time installing OpenAMS, use the provided installation script from the repository you cloned earlier:
 
-```bash
 cd ~/klipper_openams
 ./install-openams.sh
-```
-
 The installation script will:
 1. Link OpenAMS Python modules (`src/*.py`) to Klipper's `klippy/extras/` directory
 2. Link utility scripts (`scripts/*.py`) to Klipper's `scripts/` directory
@@ -413,36 +376,36 @@ The installation script will:
 
 #### Switching to This Fork
 
+Link OpenAMS Python modules (src/*.py) to Klipper's klippy/extras/ directory
+Link utility scripts (scripts/*.py) to Klipper's scripts/ directory
+Register the HDC1080 temperature sensor type in Klipper
+Add an [update_manager openams] entry to moonraker.conf for git-based updates
+Restart Klipper and Moonraker services
+Switching to This Fork
 If you already have OpenAMS installed and want to switch to this fork:
 
-```bash
 cd ~/klipper_openams
 git remote add lindnjoe https://github.com/lindnjoe/klipper_openams 2>/dev/null \
   || git remote set-url lindnjoe https://github.com/lindnjoe/klipper_openams
 git fetch lindnjoe master
 git checkout -B lindnjoe-master lindnjoe/master
 ./install-openams.sh
-```
+The git checkout -B command creates a local lindnjoe-master branch that tracks this repository, allowing easy updates with git pull.
 
-The `git checkout -B` command creates a local `lindnjoe-master` branch that tracks this repository, allowing easy updates with `git pull`.
-
-#### Custom Installation Paths
-
+Custom Installation Paths
 If your directory structure differs from the standard layout, configure the installation with additional parameters:
 
-```bash
 ./install-openams.sh [-k <klipper path>] [-s <klipper service name>] [-c <configuration path>]
-```
+Parameters:
 
-**Parameters:**
-- `-k` : Path to Klipper installation (default: `~/klipper`)
-- `-s` : Klipper service name (default: `klipper`)
-- `-c` : Configuration directory path (default: `~/printer_data/config`)
+-k : Path to Klipper installation (default: ~/klipper)
+-s : Klipper service name (default: klipper)
+-c : Configuration directory path (default: ~/printer_data/config)
+Example:
 
-**Example:**
-```bash
 ./install-openams.sh -k /home/pi/klipper -c /home/pi/printer_data/config
-```
+Uninstalling
+To remove the symlinks created by the installer:
 
 #### Uninstalling
 
@@ -457,27 +420,22 @@ This removes the module and script symlinks from Klipper. You will still need to
 
 ### 3. Apply AFC Integration Files
 
+3. Apply AFC Integration Files
 OpenAMS relies on AFC integration helpers that are not bundled with the upstream AFC add-on yet. After completing the installations above, copy the updated integration files from this repository into your AFC add-on checkout:
 
-```bash
 cd ~/klipper_openams
 cp AFC_OpenAMS.py ~/AFC-Klipper-Add-On/extras/
 cp openams_integration.py ~/AFC-Klipper-Add-On/extras/
 # Skip this overwrite if you already customized the staged file in Step 1
 cp AFC_AMS_1.cfg ~/printer_data/config/AFC/
-```
+If you have edits in ~/printer_data/config/AFC/AFC_AMS_1.cfg, either merge them back in after this copy or omit the line above.
 
-If you have edits in `~/printer_data/config/AFC/AFC_AMS_1.cfg`, either merge them back in after this copy or omit the line above.
+Re-run sudo service klipper restart (or your custom service name) to pick up the changes. This manual step will be removed once the AFC add-on ships these files.
 
-Re-run `sudo service klipper restart` (or your custom service name) to pick up the changes. This manual step will be removed once the AFC add-on ships these files.
+Configuration
+OpenAMS Manager Settings
+The [oams_manager] section controls global OpenAMS behavior:
 
-## Configuration
-
-### OpenAMS Manager Settings
-
-The `[oams_manager]` section controls global OpenAMS behavior:
-
-```ini
 [oams_manager]
 # Optional: Distance before toolhead to trigger reload during runout (default: 0.0)
 # Set this to start loading the next filament before the current one fully runs out
@@ -495,21 +453,17 @@ enable_stuck_spool_detection: True
 # Optional: F1S runout debounce duration (seconds)
 # Defaults to AFC debounce_delay if available
 debounce_delay: 0.0
-```
+Configuration Tips:
 
-**Configuration Tips:**
-- **reload_before_toolhead_distance**: Set this to a positive value to load replacement spool sooner. Helpful with longer ptfe lengths and faster printing speeds. May require manual tuning to get just right for your printer.
-- **clog_sensitivity**: Start with `medium`. Increase to `high` if clogs go undetected. Decrease to `low` if false positives occur.
-- **enable_clog_detection / enable_stuck_spool_detection**: Disable only when diagnosing issues or if you need to run without automated pauses.
-- **debounce_delay**: Increase if you see false runouts from noisy F1S sensors.
+reload_before_toolhead_distance: Set this to a positive value to load replacement spool sooner. Helpful with longer ptfe lengths and faster printing speeds. May require manual tuning to get just right for your printer.
+clog_sensitivity: Start with medium. Increase to high if clogs go undetected. Decrease to low if false positives occur.
+enable_clog_detection / enable_stuck_spool_detection: Disable only when diagnosing issues or if you need to run without automated pauses.
+debounce_delay: Increase if you see false runouts from noisy F1S sensors.
+If you need a per-FPS override, set reload_before_toolhead_distance in the [fps ...] section for that sensor.
 
-If you need a per-FPS override, set `reload_before_toolhead_distance` in the `[fps ...]` section for that sensor.
+OAMS Hardware Settings
+For each OAMS unit, configure retry behavior in your OAMS hardware configuration file (typically AFC_Oams.cfg):
 
-### OAMS Hardware Settings
-
-For each OAMS unit, configure retry behavior in your OAMS hardware configuration file (typically `AFC_Oams.cfg`):
-
-```ini
 [mcu oams_mcu1]
 canbus_uuid: <your_unique_OAMS_MCU1_UUID>
 # or: serial: /dev/serial/by-id/...
@@ -607,40 +561,34 @@ extruder: extruder
 
 The OpenAMS system includes automatic retry logic for both load and unload operations to handle temporary failures gracefully:
 
-**Load Retries:**
-- Default: 3 attempts 
-- Monitors encoder movement during loading
-- Automatically unloads and retries if filament gets stuck
-- Only pauses the printer if all retry attempts fail
+Load Retries:
 
-**Unload Retries:**
-- Default: 2 attempts 
-- Monitors encoder movement during unloading
-- Aborts stuck operations and retries automatically
-- Only pauses the printer if all retry attempts fail
+Default: 3 attempts
+Monitors encoder movement during loading
+Automatically unloads and retries if filament gets stuck
+Only pauses the printer if all retry attempts fail
+Unload Retries:
 
+Default: 2 attempts
+Monitors encoder movement during unloading
+Aborts stuck operations and retries automatically
+Only pauses the printer if all retry attempts fail
+Clog Detection Settings
+The clog_sensitivity setting in [oams_manager] controls how aggressive the clog detection is:
 
-### Clog Detection Settings
+Sensitivity	Observation Window	Tolerance	Best For
+low	48mm extrusion	More tolerant	Printers with flow variations, flexible materials
+medium (default)	24mm extrusion	Balanced	General use, most materials
+high	12mm extrusion	More sensitive	Quick clog detection, important prints
+Tuning Tips:
 
-The `clog_sensitivity` setting in `[oams_manager]` controls how aggressive the clog detection is:
+Start with medium sensitivity
+If you get false clog detections (pauses when no clog exists), lower to low
+If clogs aren't detected quickly enough, increase to high
+Consider your material: flexible filaments may need low sensitivity
+Advanced Detection Tunables
+Fine-tune pressure-based detection in [oams_manager] when calibrating new hardware or dialing in tricky materials:
 
-| Sensitivity | Observation Window | Tolerance | Best For |
-|-------------|-------------------|-----------|----------|
-| **low** | 48mm extrusion | More tolerant | Printers with flow variations, flexible materials |
-| **medium** (default) | 24mm extrusion | Balanced | General use, most materials |
-| **high** | 12mm extrusion | More sensitive | Quick clog detection, important prints |
-
-**Tuning Tips:**
-- Start with `medium` sensitivity
-- If you get false clog detections (pauses when no clog exists), lower to `low`
-- If clogs aren't detected quickly enough, increase to `high`
-- Consider your material: flexible filaments may need `low` sensitivity
-
-### Advanced Detection Tunables
-
-Fine-tune pressure-based detection in `[oams_manager]` when calibrating new hardware or dialing in tricky materials:
-
-```ini
 [oams_manager]
 # Delay before stuck spool checks begin after a load starts (default: 8.0s)
 stuck_spool_load_grace: 8.0
@@ -663,53 +611,36 @@ load_fps_stuck_threshold: 0.75
 
 # Pressure drop threshold to confirm engagement during post-load verification (default: 0.6)
 engagement_pressure_threshold: 0.6
+Tuning guidance:
 
-```
-
-**Tuning guidance:**
-- Increase `stuck_spool_load_grace` if sensitive sensors flag issues during the first seconds of a load.
-- Raise `stuck_spool_max_attempts` if you want the manager to retry more before pausing.
-- Raise `stuck_spool_pressure_threshold` or `load_fps_stuck_threshold` if reliable hardware still reports premature “stuck” errors.
-- Lower `clog_pressure_target` or shorten `post_load_pressure_dwell` if high-flow materials routinely trigger clog detection.
-
-## Optional Features
-
-
-### Mainsail AFC Panel
-
+Increase stuck_spool_load_grace if sensitive sensors flag issues during the first seconds of a load.
+Raise stuck_spool_max_attempts if you want the manager to retry more before pausing.
+Raise stuck_spool_pressure_threshold or load_fps_stuck_threshold if reliable hardware still reports premature “stuck” errors.
+Lower clog_pressure_target or shorten post_load_pressure_dwell if high-flow materials routinely trigger clog detection.
+Optional Features
+Mainsail AFC Panel
 Enable the optional Mainsail AFC panel for easy lane management and status monitoring.
 
-**Installation:**
+Installation:
 
-1. Backup your existing Mainsail installation:
-
-```bash
+Backup your existing Mainsail installation:
 cd ~/mainsail
 tar -czf ~/mainsail-backup-$(date +%Y%m%d).tar.gz .
-```
-
-2. Extract the included panel files:
-
-```bash
+Extract the included panel files:
 cd ~/klipper_openams
 unzip -o mainsail.zip -d ~/mainsail/
-```
+Clear your browser cache and reload Mainsail
+Features:
 
-3. Clear your browser cache and reload Mainsail
-
-**Features:**
-- Visual lane status display
-- Quick lane selection
-- Runout configuration interface
-- Spool management integration
-
-## Initial Calibration
-
+Visual lane status display
+Quick lane selection
+Runout configuration interface
+Spool management integration
+Initial Calibration
 After completing the OpenAMS and AFC installation, calibrate each OpenAMS unit to ensure accurate filament detection and optimal performance.
 
-Before calibrating, review the AFC `[AFC]` section and macro order of operation details in the Armored Turtle documentation to configure load/unload flows, cutting, and waste management options (poop, wipe, kick, park, and tip-form). See the AFC configuration guide: <https://www.armoredturtle.xyz/docs/afc-klipper-add-on/configuration/AFC.cfg.html#afc-section>.
+Before calibrating, review the AFC [AFC] section and macro order of operation details in the Armored Turtle documentation to configure load/unload flows, cutting, and waste management options (poop, wipe, kick, park, and tip-form). See the AFC configuration guide: https://www.armoredturtle.xyz/docs/afc-klipper-add-on/configuration/AFC.cfg.html#afc-section.
 
-```# Macro order of operation
 # - Load               |   - Unload
 #   - Load Filament    |    - Cut
 #   - Poop             |    - Park
@@ -789,27 +720,24 @@ form_tip_cmd: AFC
 1. Ensure your AMS unit has at least one spool loaded
 
 2. Open the OpenAMS calibration menu via the Klipper console:
-   ```
-   UNIT_PTFE_CALIBRATION UNIT=AMS_1
-   ```
+UNIT_PTFE_CALIBRATION UNIT=AMS_1
+
 
 3. Use the prompts to run:
-   - **PTFE length calibration** for each loaded lane
-   - **HUB HES calibration** for each loaded lane (or all lanes)
+- **PTFE length calibration** for each loaded lane
+- **HUB HES calibration** for each loaded lane (or all lanes)
 
-   You can also run the commands directly:
-   ```
-   AFC_OAMS_CALIBRATE_PTFE UNIT=AMS_1 SPOOL=<spool_index>
-   
-   AFC_OAMS_CALIBRATE_HUB_HES UNIT=AMS_1 SPOOL=<spool_index>
-   
-   AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT=AMS_1
-   ```
+You can also run the commands directly:
+AFC_OAMS_CALIBRATE_PTFE UNIT=AMS_1 SPOOL=<spool_index>
+
+AFC_OAMS_CALIBRATE_HUB_HES UNIT=AMS_1 SPOOL=<spool_index>
+
+AFC_OAMS_CALIBRATE_HUB_HES_ALL UNIT=AMS_1
+
 
 4. Once calibration completes, restart Klipper to load the new settings:
-   ```
-   FIRMWARE_RESTART
-   ```
+FIRMWARE_RESTART
+
 
 **Repeat this process for each OpenAMS unit** in your system. Proper calibration ensures:
 - Reliable lane detection
@@ -846,14 +774,12 @@ Infinite spooling allows automatic switching between lanes when a spool runs out
 Runout lanes are configured through AFC using the `SET_RUNOUT` command:
 
 **Method 1: Klipper Console (AFC Command)**
-```
 SET_RUNOUT LANE=lane# RUNOUT=lane#
-```
+
 
 Example: Set lane0 to use lane1 as runout backup:
-```
 SET_RUNOUT LANE=lane0 RUNOUT=lane1
-```
+
 
 **Method 2: AFC Panel (Mainsail)**
 1. Navigate to the AFC panel in Mainsail
@@ -863,11 +789,8 @@ SET_RUNOUT LANE=lane0 RUNOUT=lane1
 **Multi-Lane Chains:**
 
 You can create chains of runouts for extended printing by configuring multiple mappings:
-```
-SET_RUNOUT LANE=lane0 RUNOUT=lane1
-SET_RUNOUT LANE=lane1 RUNOUT=lane2
-SET_RUNOUT LANE=lane2 RUNOUT=lane3
-```
+SET_RUNOUT LANE=lane0 RUNOUT=lane1 SET_RUNOUT LANE=lane1 RUNOUT=lane2 SET_RUNOUT LANE=lane2 RUNOUT=lane3
+
 
 **Material Matching:**
 
@@ -891,35 +814,69 @@ If you experience issues with stuck spool detection during load or unload operat
 load_retry_max: 3         # Try 3 times before giving up
 unload_retry_max: 2       # Try 2 times before giving up
 retry_delay: 3.0          # Delay between retry attempts
-```
+Verify retry behavior:
 
-**Verify retry behavior:**
-- Monitor Klipper logs: `tail -f ~/printer_data/logs/klippy.log`
-- Look for messages like "letting retry logic handle it" and "retry X/Y"
-- Retries should happen automatically before pausing
+Monitor Klipper logs: tail -f ~/printer_data/logs/klippy.log
+Look for messages like "letting retry logic handle it" and "retry X/Y"
+Retries should happen automatically before pausing
+Common solutions:
 
-**Common solutions:**
-- **Increase retry counts**: Set `load_retry_max: 5` if filament occasionally needs extra attempts
-- **Check encoder**: Clean the OAMS encoder wheel and verify it rotates freely
-- **Verify filament path**: Ensure PTFE tubes are not kinked or obstructed
+Increase retry counts: Set load_retry_max: 5 if filament occasionally needs extra attempts
+Check encoder: Clean the OAMS encoder wheel and verify it rotates freely
+Verify filament path: Ensure PTFE tubes are not kinked or obstructed
+CAN Bus Issues
+Symptoms:
 
-### CAN Bus Issues
+OpenAMS units not detected
+Intermittent connection losses
+Calibration failures
+Solutions:
 
-**Symptoms:**
-- OpenAMS units not detected
-- Intermittent connection losses
-- Calibration failures
+Verify CAN termination resistors (120Ω at each end of the bus)
+Check CAN bus speed matches across all devices (typically 500000 or 1000000)
+Query CAN devices:
+~/klippy-env/bin/python ~/klipper/scripts/canbus_query.py can0
+Check Klipper logs for CAN timeout errors
+Verify wiring: Ensure CAN_H and CAN_L are not swapped
+CAN Bus Debugging
+The repository includes a real-time CAN bus log viewer (scripts/canbus_logger.py) that decodes OAMS firmware log messages. This is useful for diagnosing hardware-level issues that don't surface in klippy.log.
 
-**Solutions:**
+# After installation the script is linked into ~/klipper/scripts/
+python ~/klipper/scripts/canbus_logger.py can0
+The logger filters CAN frames from the OAMS logging address (0x780), decodes the AMS index and log severity, and displays color-coded output:
 
-1. **Verify CAN termination resistors** (120Ω at each end of the bus)
-2. **Check CAN bus speed** matches across all devices (typically 500000 or 1000000)
-3. **Query CAN devices:**
-   ```bash
-   ~/klippy-env/bin/python ~/klipper/scripts/canbus_query.py can0
-   ```
-4. **Check Klipper logs** for CAN timeout errors
-5. **Verify wiring:** Ensure CAN_H and CAN_L are not swapped
+Color	Level
+Red	FATAL
+Yellow	ERROR
+Green	WARNING
+Blue	INFO
+Gray	DEBUG
+Requirements: the python-can and termcolor packages must be installed in the environment running the script (not required for normal Klipper operation).
+
+Clog Detection False Positives
+If the printer pauses due to false clog detection:
+
+Lower sensitivity:
+
+[oams_manager]
+clog_sensitivity: low
+Check for actual flow issues:
+
+Partial nozzle clogs
+Extruder tension too tight/loose
+Filament diameter variations
+Verify encoder function:
+
+Clean encoder wheel
+Check encoder wiring
+LED Issues
+LEDs not changing color:
+
+Verify LED index configuration in AFC_AMS1.cfg:
+
+[AFC_lane lane0]
+led_index: AFC_indicator:1
+Check LED strip configuration
 
 ### CAN Bus Debugging
 
@@ -944,107 +901,62 @@ The logger filters CAN frames from the OAMS logging address (`0x780`), decodes t
 
 ### Clog Detection False Positives
 
-If the printer pauses due to false clog detection:
+SET_LED LED=AFC_indicator INDEX=1 RED=1.0 GREEN=0 BLUE=0
+Filament Loading Failures
+Filament won't load to toolhead:
 
-1. **Lower sensitivity:**
-   ```ini
-   [oams_manager]
-   clog_sensitivity: low
-   ```
+Check AFC_Hardware.cfg pin configuration:
 
-2. **Check for actual flow issues:**
-   - Partial nozzle clogs
-   - Extruder tension too tight/loose
-   - Filament diameter variations
+[AFC_extruder extruder]
+pin_tool_start: AMS_extruder  # or your sensor pin
+Verify bowden length calibration:
 
-3. **Verify encoder function:**
-   - Clean encoder wheel
-   - Check encoder wiring
- 
-### LED Issues
+Run OpenAMS PTFE calibration for each unit:
+AFC_OAMS_CALIBRATE_PTFE UNIT=AMS_1 SPOOL=<spool_index>
+Check that measured lengths are reasonable
+Adjust afc_bowden_length in hub configuration if needed
+Test individual components:
 
-**LEDs not changing color:**
+Manually extrude filament to verify extruder works
+Check that toolhead sensor triggers correctly
+Verify PTFE tube path is clear
+Increase retry attempts temporarily:
 
-1. **Verify LED index configuration** in `AFC_AMS1.cfg`:
-   ```ini
-   [AFC_lane lane0]
-   led_index: AFC_indicator:1
-   ```
+[oams oams1]
+load_retry_max: 5
+Configuration File Errors
+Klipper won't start after configuration changes:
 
-2. **Check LED strip configuration** 
-3. **Test LEDs directly:**
-   ```
-   SET_LED LED=AFC_indicator INDEX=1 RED=1.0 GREEN=0 BLUE=0
-   ```
+Check klippy.log for specific error messages:
 
-### Filament Loading Failures
+tail -50 ~/printer_data/logs/klippy.log
+Common issues:
 
-**Filament won't load to toolhead:**
+Missing or incorrect CAN UUIDs
+Duplicate section names
+Invalid pin names
+Syntax errors in configuration files
+Test configuration syntax:
 
-1. **Check AFC_Hardware.cfg pin configuration:**
-   ```ini
-   [AFC_extruder extruder]
-   pin_tool_start: AMS_extruder  # or your sensor pin
-   ```
-
-2. **Verify bowden length calibration:**
-   - Run OpenAMS PTFE calibration for each unit:
-     ```
-     AFC_OAMS_CALIBRATE_PTFE UNIT=AMS_1 SPOOL=<spool_index>
-     ```
-   - Check that measured lengths are reasonable
-   - Adjust `afc_bowden_length` in hub configuration if needed
-
-3. **Test individual components:**
-   - Manually extrude filament to verify extruder works
-   - Check that toolhead sensor triggers correctly
-   - Verify PTFE tube path is clear
-
-4. **Increase retry attempts temporarily:**
-   ```ini
-   [oams oams1]
-   load_retry_max: 5
-   ```
-
-### Configuration File Errors
-
-**Klipper won't start after configuration changes:**
-
-1. **Check klippy.log** for specific error messages:
-   ```bash
-   tail -50 ~/printer_data/logs/klippy.log
-   ```
-
-2. **Common issues:**
-   - Missing or incorrect CAN UUIDs
-   - Duplicate section names
-   - Invalid pin names
-   - Syntax errors in configuration files
-
-3. **Test configuration syntax:**
-   ```bash
-   ~/klippy-env/bin/python ~/klipper/klippy/klippy.py ~/printer_data/config/printer.cfg -d ~/printer_data/klipper.dict -l /tmp/test.log
-   ```
-
-### Getting Help
-
+~/klippy-env/bin/python ~/klipper/klippy/klippy.py ~/printer_data/config/printer.cfg -d ~/printer_data/klipper.dict -l /tmp/test.log
+Getting Help
 If you're still experiencing issues:
 
-1. **Check Klipper logs:** `~/printer_data/logs/klippy.log`
-2. **Enable debug logging** for OpenAMS components
-3. **Gather information:**
-   - Klipper version
-   - AFC version
-   - OpenAMS fork commit hash: `git -C ~/klipper_openams rev-parse HEAD`
-   - Full error messages from logs
-   - Configuration files
+Check Klipper logs: ~/printer_data/logs/klippy.log
 
-4. **Ask for help:**
-   - GitHub Issues: https://github.com/lindnjoe/klipper_openams/issues
+Enable debug logging for OpenAMS components
 
+Gather information:
 
-## Credits
+Klipper version
+AFC version
+OpenAMS fork commit hash: git -C ~/klipper_openams rev-parse HEAD
+Full error messages from logs
+Configuration files
+Ask for help:
 
-This project was created by **knight.rad_iant** and **Armored Turtle Team** on Discord.
+GitHub Issues: https://github.com/lindnjoe/klipper_openams/issues
+Credits
+This project was created by knight.rad_iant and Armored Turtle Team on Discord.
 
 Based on the original OpenAMS project with enhancements for AFC integration, retry logic, and clog detection.
