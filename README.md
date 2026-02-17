@@ -4,11 +4,15 @@
 
 # OpenAMS for Klipper
 
+> **Version 0.0.3** — Lane-based AFC integration with event-driven monitoring
+
 A Klipper integration for OpenAMS that enables multi-material printing with automatic filament management, runout detection, and intelligent retry logic.
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Repository Structure](#repository-structure)
+- [Architecture](#architecture)
 - [What's New](#whats-new)
 - [Features](#features)
 - [Prerequisites](#prerequisites)
@@ -25,6 +29,7 @@ A Klipper integration for OpenAMS that enables multi-material printing with auto
 - [Configuration](#configuration)
   - [OpenAMS Manager Settings](#openams-manager-settings)
   - [OAMS Hardware Settings](#oams-hardware-settings)
+  - [FPS Configuration](#fps-configuration)
   - [Retry Behavior](#retry-behavior)
   - [Clog Detection Settings](#clog-detection-settings)
   - [Advanced Detection Tunables](#advanced-detection-tunables)
@@ -33,6 +38,7 @@ A Klipper integration for OpenAMS that enables multi-material printing with auto
 - [Initial Calibration](#initial-calibration)
 - [Infinite Spooling](#infinite-spooling)
 - [Troubleshooting](#troubleshooting)
+  - [CAN Bus Debugging](#can-bus-debugging)
 - [Credits](#credits)
 
 ## Overview
@@ -109,23 +115,130 @@ These configuration blocks are sourced from the repository templates—`AFC_Oams
 - Spoolman integration for filament tracking
 - LED status indicators
 
+## Repository Structure
+
+```
+klipper_openams/
+├── README.md                       # This documentation
+├── LICENSE                         # MIT License
+├── install-openams.sh              # Installation / uninstall script
+├── AFC_OpenAMS.py                  # AFC integration patch (copied to AFC extras)
+├── openams_integration.py          # Shared helpers & event system (copied to AFC extras)
+├── AFC_AMS_1.cfg                   # Lane configuration template
+├── AFC_Oams.cfg                    # OAMS hardware & manager config template
+├── mainsail.zip                    # Optional Mainsail AFC panel
+│
+├── src/                            # Core Klipper modules (linked to klippy/extras)
+│   ├── oams_manager.py             # Central manager / coordinator
+│   ├── oams.py                     # OAMS hardware controller (CAN bus)
+│   ├── fps.py                      # Filament Pressure Sensor driver (ADC)
+│   ├── hdc1080.py                  # HDC1080 temperature & humidity sensor (I2C)
+│   └── openams_moonraker.py        # Moonraker database client for state persistence
+│
+├── scripts/                        # Utility scripts (linked to klipper/scripts)
+│   └── canbus_logger.py            # CAN bus log viewer for firmware debugging
+│
+└── file_templates/                 # Templates consumed by the installer
+    ├── HDC1080.cfg                 # HDC1080 sensor type registration
+    ├── moonraker_update.txt        # Moonraker update manager entry
+    └── openams.service             # Systemd service file
+```
+
+## Architecture
+
+OpenAMS sits between Klipper/AFC and the physical hardware. The diagram below shows how the major modules relate to each other.
+
+```
+┌────────────────────────────────────────────────────────────┐
+│                   Klipper / Moonraker                      │
+└────────────────┬──────────────────────────┬────────────────┘
+                 │                          │
+       ┌─────────────────────┐    ┌──────────────────────┐
+       │   oams_manager.py   │    │ openams_moonraker.py │
+       │  (State machine,    │    │ (Status persistence  │
+       │   retry logic,      │◄──►│  via Moonraker DB)   │
+       │   clog / runout     │    └──────────────────────┘
+       │   detection)        │
+       └───┬────────┬────────┘
+           │        │
+   ┌───────┘        └────────┐
+   ▼                         ▼
+┌──────────┐          ┌──────────┐
+│  oams.py │          │  fps.py  │
+│ (CAN bus │          │ (ADC     │
+│  motor,  │          │  pressure│
+│  encoder,│          │  sensor) │
+│  HES)    │          └──────────┘
+└──────────┘
+       │
+       ▼
+┌──────────────┐
+│  hdc1080.py  │
+│ (I2C temp /  │
+│  humidity)   │
+└──────────────┘
+
+┌────────────────────────────────────────────────────────────┐
+│         AFC Integration Layer (installed into AFC)         │
+│                                                            │
+│  AFC_OpenAMS.py          openams_integration.py            │
+│  (Monkey-patches AFC     (AMSEventBus, AMSHardwareService, │
+│   lanes to call OpenAMS   LaneRegistry, RunoutCoordinator, │
+│   load/unload/runout)     OpenAMSManagerFacade)            │
+└────────────────────────────────────────────────────────────┘
+```
+
+**Module summary:**
+
+| Module | Location | Role |
+|--------|----------|------|
+| `oams_manager.py` | `src/` → `klippy/extras/` | Central coordinator — monitors encoder, FPS pressure, and F1S sensors; drives retry logic, clog detection, stuck spool detection, and runout handling |
+| `oams.py` | `src/` → `klippy/extras/` | Hardware controller — talks to the OAMS mainboard over CAN bus to control BLDC motors, read encoder clicks, and query Hall-Effect Sensors |
+| `fps.py` | `src/` → `klippy/extras/` | Filament Pressure Sensor — ADC-based driver that reads buffer pressure (0.0–1.0) and dispatches callbacks on value changes |
+| `hdc1080.py` | `src/` → `klippy/extras/` | HDC1080 I2C sensor driver — reports enclosure temperature and humidity to Klipper/Moonraker |
+| `openams_moonraker.py` | `src/` → `klippy/extras/` | Lightweight HTTP client that publishes manager status to the Moonraker database for web UI display and state recovery on restart |
+| `AFC_OpenAMS.py` | repo root → `AFC extras/` | Patches AFC lane load/unload/runout paths to route through OpenAMS, adds virtual filament sensors and TD-1 capture |
+| `openams_integration.py` | repo root → `AFC extras/` | Shared event bus, unified sensor polling service, lane registry, runout coordinator, and manager facade used by both AFC and OpenAMS |
+| `canbus_logger.py` | `scripts/` → `klipper/scripts/` | Real-time CAN bus log viewer — decodes OAMS firmware log messages with color-coded severity levels |
+
 ## What's New
 
-**Recent Major Updates:**
+### v0.0.3 — Current Release
 
-### Lane-Based Architecture (Current Version)
-The system has transitioned from filament groups to a lane-based architecture for better AFC integration:
+**Moonraker State Persistence:**
+- New `openams_moonraker.py` client publishes manager status to the Moonraker database
+- Fingerprint-based deduplication avoids redundant writes
+- Automatic retry on transient network failures
+- Status survives Klipper restarts via database read-back
 
-- **AFC Lanes**: Each OpenAMS slot is now configured as an AFC lane with independent settings
-- **Event-Driven Sensors**: Sensor monitoring switched from polling to event-based for better performance
-- **AFC Runout Integration**: Runout handling now integrates directly with AFC's lane system
-- **Hub Mapping**: Each lane is mapped to its own hub for visual indication and broke filament detection scenarios
-- **Detection Tuning**: New `[oams_manager]` options let you adjust pressure thresholds and dwell windows for stuck spool and clog detection
+**Performance Optimizations:**
+- Unified sensor polling through `AMSHardwareService` reduces duplicate MCU communication by ~50%
+- Adaptive polling intervals (2.0 s active / 4.0 s idle) cut CPU overhead by 15–25% when the printer is idle
+- Object caching for frequently accessed Klipper objects (idle_timeout, gcode, toolhead, AFC)
+- State change tracking with intelligent interval switching
 
-**Migration Notes:**
-- If upgrading from an older version, your filament group configuration will need to be converted to AFC lanes
-- Macro calls have changed from `GROUP=T0` to `LANE=lane0` format
-- Runout configuration now uses AFC's runout mapping command (`SET_RUNOUT`) instead of OpenAMS filament groups
+**Enhanced Detection Tunables:**
+- All pressure thresholds and timing windows are now configurable in `[oams_manager]`
+- Per-FPS `reload_before_toolhead_distance` override for mixed-length setups
+- Configurable engagement pressure threshold for post-load verification
+- Increased grace periods and suppression windows to reduce false positives
+
+**Kalico (Danger Klipper) Support:**
+- FPS driver supports `use_kalico: True` for setups running Kalico instead of stock Klipper
+
+### Lane-Based Architecture (Baseline)
+The system uses a lane-based architecture for AFC integration:
+
+- **AFC Lanes**: Each OpenAMS slot is configured as an AFC lane with independent settings
+- **Event-Driven Sensors**: Sensor monitoring uses event-based callbacks instead of constant polling
+- **AFC Runout Integration**: Runout handling integrates directly with AFC's lane system
+- **Hub Mapping**: Each lane maps to its own hub for visual indication and broken filament detection
+- **Detection Tuning**: `[oams_manager]` options for pressure thresholds and dwell windows
+
+**Migration Notes (from pre-lane versions):**
+- Filament group configuration must be converted to AFC lanes
+- Macro calls changed from `GROUP=T0` to `LANE=lane0` format
+- Runout configuration uses AFC's `SET_RUNOUT` command instead of OpenAMS filament groups
 - See the [Install/Update AFC](#1-installupdate-afc) section for detailed configuration examples
 
 ## Features
@@ -133,11 +246,14 @@ The system has transitioned from filament groups to a lane-based architecture fo
 - **Lane-Based Architecture**: Integration with AFC lanes for flexible spool configuration and mapping
 - **Event-Driven Sensors**: Efficient event-based monitoring instead of constant polling for better performance
 - **Automatic Retry Logic**: Configurable retry attempts for both load and unload operations with a configurable delay
+- **Stuck Spool Detection**: Pressure-based detection with configurable thresholds and automatic retry before pausing
 - **Clog Detection**: Three sensitivity levels (low, medium, high) to detect filament clogs during printing
-- **Runout Handling**: Automatic filament runout detection integrated with AFC lane system
+- **Runout Handling**: Automatic filament runout detection integrated with AFC lane system, including cross-extruder runout support
 - **Infinite Spooling**: Seamless lane switching for continuous printing using AFC runout configuration
+- **Moonraker State Persistence**: Manager status published to the Moonraker database for web UI display and restart recovery
 - **LED Status Indicators**: Visual feedback through lane LEDs
 - **HDC1080 Sensor Support**: Temperature and humidity monitoring within the AMS unit
+- **Kalico Compatibility**: FPS driver supports both stock Klipper and Kalico (Danger Klipper)
 
 ## Prerequisites
 
@@ -289,10 +405,11 @@ cd ~/klipper_openams
 ```
 
 The installation script will:
-1. Link OpenAMS Python modules to Klipper's extras directory
-2. Add HDC1080 temperature sensor support
-3. Configure Moonraker update manager
-4. Restart Klipper services
+1. Link OpenAMS Python modules (`src/*.py`) to Klipper's `klippy/extras/` directory
+2. Link utility scripts (`scripts/*.py`) to Klipper's `scripts/` directory
+3. Register the HDC1080 temperature sensor type in Klipper
+4. Add an `[update_manager openams]` entry to `moonraker.conf` for git-based updates
+5. Restart Klipper and Moonraker services
 
 #### Switching to This Fork
 
@@ -326,6 +443,17 @@ If your directory structure differs from the standard layout, configure the inst
 ```bash
 ./install-openams.sh -k /home/pi/klipper -c /home/pi/printer_data/config
 ```
+
+#### Uninstalling
+
+To remove the symlinks created by the installer:
+
+```bash
+cd ~/klipper_openams
+./install-openams.sh -u
+```
+
+This removes the module and script symlinks from Klipper. You will still need to manually remove the `[update_manager openams]` section from `moonraker.conf` and any OpenAMS configuration sections from your Klipper config files.
 
 ### 3. Apply AFC Integration Files
 
@@ -437,6 +565,43 @@ current_kd: 0.0
    - Increase `load_retry_max` if filament occasionally fails to load on first attempt
    - Increase `retry_delay` if your hardware needs more recovery time
   
+
+### FPS Configuration
+
+Each Filament Pressure Sensor is defined in `AFC_Oams.cfg`. The FPS reads an analog voltage via ADC and maps it to a 0.0–1.0 pressure range that the manager uses for clog, stuck spool, and engagement detection.
+
+```ini
+[fps fps1]
+pin: fps:PA2                  # ADC pin on the FPS MCU
+reversed: false               # Flip the 0→1 scale (set true if unloaded reads ~1.0)
+oams: oams1                   # Comma-separated OAMS units this FPS serves
+extruder: extruder            # Associated Klipper extruder
+
+# Optional: per-FPS runout reload margin (mm). Overrides the global
+# reload_before_toolhead_distance from [oams_manager] for this sensor.
+#reload_before_toolhead_distance: 0.0
+
+# Optional: set to true when running Kalico (Danger Klipper) instead of
+# stock Klipper. Changes the ADC setup call to the Kalico variant.
+#use_kalico: False
+```
+
+**Multiple FPS / OAMS units:** duplicate the `[mcu ...]`, `[oams ...]`, and `[fps ...]` sections with unique names and pins:
+
+```ini
+[mcu fps2]
+canbus_uuid: <your_unique_FPS2_UUID>
+
+[oams oams2]
+mcu: oams_mcu2
+# ... same settings as oams1, adjusted for your second unit ...
+
+[fps fps2]
+pin: fps2:PA2
+reversed: false
+oams: oams2
+extruder: extruder
+```
 
 ### Retry Behavior
 
@@ -755,6 +920,27 @@ retry_delay: 3.0          # Delay between retry attempts
    ```
 4. **Check Klipper logs** for CAN timeout errors
 5. **Verify wiring:** Ensure CAN_H and CAN_L are not swapped
+
+### CAN Bus Debugging
+
+The repository includes a real-time CAN bus log viewer (`scripts/canbus_logger.py`) that decodes OAMS firmware log messages. This is useful for diagnosing hardware-level issues that don't surface in `klippy.log`.
+
+```bash
+# After installation the script is linked into ~/klipper/scripts/
+python ~/klipper/scripts/canbus_logger.py can0
+```
+
+The logger filters CAN frames from the OAMS logging address (`0x780`), decodes the AMS index and log severity, and displays color-coded output:
+
+| Color | Level |
+|-------|-------|
+| Red | FATAL |
+| Yellow | ERROR |
+| Green | WARNING |
+| Blue | INFO |
+| Gray | DEBUG |
+
+**Requirements:** the `python-can` and `termcolor` packages must be installed in the environment running the script (not required for normal Klipper operation).
 
 ### Clog Detection False Positives
 
