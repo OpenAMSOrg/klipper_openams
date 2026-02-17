@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
@@ -45,6 +46,44 @@ def normalize_extruder_name(name: Optional[str]) -> Optional[str]:
     return lowered or None
 
 
+class OpenAMSManagerFacade:
+    """Thin compatibility facade for oams_manager interactions."""
+
+    @staticmethod
+    def get_manager(printer):
+        try:
+            return printer.lookup_object("oams_manager", None)
+        except Exception:
+            return None
+
+    @classmethod
+    def load_for_lane(cls, printer, lane_name: str) -> Tuple[bool, str]:
+        manager = cls.get_manager(printer)
+        if manager is None:
+            return False, "OpenAMS manager not available"
+        return manager.load_filament_for_lane(lane_name)
+
+    @classmethod
+    def unload_with_prep_for_fps(cls, printer, fps_name: str) -> Tuple[bool, str]:
+        manager = cls.get_manager(printer)
+        if manager is None:
+            return False, "OpenAMS manager not available"
+        return manager.unload_filament_with_prep_for_fps(fps_name)
+
+    @classmethod
+    def clear_fps_state_for_lane(
+        cls,
+        printer,
+        lane_name: str,
+        *,
+        eventtime: Optional[float] = None,
+    ) -> Tuple[bool, Optional[str], Optional[int]]:
+        manager = cls.get_manager(printer)
+        if manager is None:
+            return False, None, None
+        return manager.clear_fps_state_for_lane(lane_name, eventtime=eventtime)
+
+
 # ============================================================================
 # Event System
 # ============================================================================
@@ -67,7 +106,9 @@ class AMSEventBus:
     
     _instance: Optional['AMSEventBus'] = None
     _lock = threading.RLock()
-    
+    _MAX_HISTORY = 500
+    _HISTORY_TTL = 3600.0
+
     def __init__(self):
         self._subscribers: Dict[str, List[Tuple[Callable, int]]] = {}
         self._event_history: List[Tuple[str, float, Dict[str, Any]]] = []
@@ -118,23 +159,27 @@ class AMSEventBus:
     
     def publish(self, event_type: str, **kwargs) -> int:
         """Publish an event to all subscribers.
-        
+
         Args:
             event_type: Type of event being published
             **kwargs: Event data to pass to subscribers
-            
+
         Returns:
             Number of subscribers that successfully handled the event
         """
-        import time
         eventtime = kwargs.get('eventtime', time.time())
-        
+
         with self._lock:
             # Record event in history
             self._event_history.append((event_type, eventtime, dict(kwargs)))
-            if len(self._event_history) > self._max_history:
-                self._event_history.pop(0)
-            
+            # Evict stale history entries
+            if len(self._event_history) > self._MAX_HISTORY:
+                cutoff = time.monotonic() - self._HISTORY_TTL
+                self._event_history = [e for e in self._event_history if e[1] > cutoff]
+                # Hard cap if TTL eviction wasn't enough
+                if len(self._event_history) > self._MAX_HISTORY:
+                    self._event_history = self._event_history[-self._MAX_HISTORY:]
+
             subscribers = list(self._subscribers.get(event_type, []))
         
         if not subscribers:
@@ -145,9 +190,9 @@ class AMSEventBus:
             try:
                 callback(event_type=event_type, **kwargs)
                 success_count += 1
-            except Exception:
-                self.logger.error("Event handler failed for '%s' (priority=%d)", 
-                                    event_type, priority)
+            except Exception as e:
+                self.logger.error("Event handler failed for '%s' (priority=%d): %s",
+                                    event_type, priority, e)
         
         return success_count
     
@@ -484,6 +529,11 @@ class AMSHardwareService:
             # AFC_logger signature: info(message, console_only=False)
             self.logger.info(message)
         except TypeError:
+            # Log format string error to help debugging, then use fallback
+            try:
+                self.logger.debug(f"Log format error: {message!r} with args=()")
+            except Exception:
+                pass
             # Standard logging signature: info(msg, *args)
             self.logger.info(message)
 
@@ -492,6 +542,11 @@ class AMSHardwareService:
         try:
             self.logger.warning(message)
         except TypeError:
+            # Log format string error to help debugging, then use fallback
+            try:
+                self.logger.debug(f"Log format error: {message!r} with args=()")
+            except Exception:
+                pass
             self.logger.warning(message)
 
     def _log_error(self, message: str) -> None:
@@ -502,7 +557,12 @@ class AMSHardwareService:
                 self.logger.error(message)
             else:
                 self.logger.error(message)
-        except Exception:
+        except TypeError:
+            # Log format string error to help debugging, then use fallback
+            try:
+                self.logger.debug(f"Log format error: {message!r} with args=()")
+            except Exception:
+                pass
             # Fallback to print if all else fails
             print(f"AMSHardwareService: {message}")
 
@@ -644,9 +704,9 @@ class AMSHardwareService:
 
             return eventtime + self._polling_interval
 
-        except Exception:
+        except Exception as e:
             import traceback
-            self._log_error(f"Error in unified polling callback for {self.name}: {traceback.format_exc()}")
+            self._log_error(f"Error in unified polling callback for {self.name}: {e}\n{traceback.format_exc()}")
             return eventtime + self._polling_interval_idle
 
     def poll_status(self) -> Optional[Dict[str, Any]]:
@@ -684,9 +744,9 @@ class AMSHardwareService:
             for callback in callbacks:
                 try:
                     callback(status_copy)
-                except Exception:
+                except Exception as e:
                     import traceback
-                    self._log_error(f"AMS status observer failed for {self.name}: {traceback.format_exc()}")
+                    self._log_error(f"AMS status observer failed for {self.name}: {e}\n{traceback.format_exc()}")
 
     def latest_status(self) -> Dict[str, Any]:
         """Return the most recently cached status snapshot."""
@@ -969,8 +1029,8 @@ class AMSRunoutCoordinator:
         for unit in units:
             try:
                 unit.handle_runout_detected(spool_index, monitor, lane_name=lane_hint)
-            except Exception:
-                unit.logger.error("Failed to propagate OpenAMS runout to AFC unit %s", unit.name)
+            except Exception as e:
+                unit.logger.error("Failed to propagate OpenAMS runout to AFC unit %s: %s", unit.name, e)
 
     @classmethod
     def notify_afc_error(cls, printer, name: str, message: str, *, pause: bool = False) -> None:
@@ -990,11 +1050,11 @@ class AMSRunoutCoordinator:
 
             try:
                 error_obj.AFC_error(message, pause=pause, level=3)
-            except Exception:
+            except Exception as e:
                 logger = getattr(unit, "logger", None)
                 if logger is None:
                     logger = logging.getLogger(__name__)
-                logger.error("Failed to deliver OpenAMS error '%s' to AFC unit %s", message, unit)
+                logger.error("Failed to deliver OpenAMS error '%s' to AFC unit %s: %s", message, unit, e)
 
     @classmethod
     def notify_lane_tool_state(cls, printer, name: str, lane_name: str, *, loaded: bool, spool_index: Optional[int] = None, eventtime: Optional[float] = None) -> bool:
@@ -1017,8 +1077,8 @@ class AMSRunoutCoordinator:
             try:
                 if unit.handle_openams_lane_tool_state(lane_name, loaded, spool_index=spool_index, eventtime=eventtime):
                     handled = True
-            except Exception:
-                unit.logger.error("Failed to update AFC lane %s from OpenAMS tool state", lane_name)
+            except Exception as e:
+                unit.logger.error("Failed to update AFC lane %s from OpenAMS tool state: %s", lane_name, e)
         return handled
 
     @classmethod
@@ -1038,8 +1098,8 @@ class AMSRunoutCoordinator:
                 marker = getattr(unit, "mark_cross_extruder_runout", None)
                 if callable(marker) and marker(lane_name):
                     handled = True
-            except Exception:
-                unit.logger.error("Failed to mark lane %s as cross-extruder runout participant", lane_name)
+            except Exception as e:
+                unit.logger.error("Failed to mark lane %s as cross-extruder runout participant: %s", lane_name, e)
         return handled
 
     @classmethod
