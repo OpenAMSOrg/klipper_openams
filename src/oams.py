@@ -7,6 +7,7 @@
 
 import mcu
 import struct
+from dataclasses import dataclass
 from math import pi
 from typing import Tuple, List, Optional, Dict
 
@@ -41,6 +42,20 @@ class OAMSOpCode:
     SPOOL_ALREADY_IN_BAY = 3
     NO_SPOOL_IN_BAY = 4
     ERROR_KLIPPER_CALL = 5
+
+
+@dataclass
+class RetryState:
+    """Tracks retry state for a single spool load/unload operation."""
+    count: int = 0
+    last_attempt: Optional[float] = None
+    was_retry: bool = False
+
+    def reset(self):
+        """Reset retry state for a fresh operation."""
+        self.count = 0
+        self.last_attempt = None
+        self.was_retry = False
 
 
 class OAMS:
@@ -163,13 +178,10 @@ class OAMS:
         self.extra_retract: float = config.getfloat("extra_retract", -10.0)
 
         # Retry state tracking
-        self._load_retry_count: Dict[int, int] = {}
+        self._load_retry_state: Dict[int, RetryState] = {}
         self._unload_retry_count: int = 0
-        self._last_load_attempt: Dict[int, float] = {}
         self._last_unload_attempt: float = 0.0
         self._last_successful_load: Dict[int, float] = {}
-        # FIX: Track whether the last successful load was after retries
-        self._last_load_was_retry: Dict[int, bool] = {}
 
         # Retry failure statistics for monitoring
         self._load_retry_failures: int = 0
@@ -186,9 +198,9 @@ class OAMS:
                 )
                 service.attach_controller(self)
                 self.hardware_service = service
-            except Exception:
+            except Exception as e:
                 self.logger.error(
-                    "Failed to register OAMS controller with AMSHardwareService"
+                    f"Failed to register OAMS controller with AMSHardwareService: {e}"
                 )
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
@@ -399,12 +411,12 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             f"  Current unload retry count: {self._unload_retry_count}",
         ]
 
-        if self._load_retry_count:
+        if self._load_retry_state:
             msg_lines.append("  Load retry counts:")
 
-            for spool_idx, count in sorted(self._load_retry_count.items()):
+            for spool_idx, retry in sorted(self._load_retry_state.items()):
                 msg_lines.append(
-                    f"    Spool {spool_idx}: {count}/{self.load_retry_max}"
+                    f"    Spool {spool_idx}: {retry.count}/{self.load_retry_max}"
                 )
         else:
             msg_lines.append("  No active load retries")
@@ -415,13 +427,10 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
     cmd_OAMS_RESET_RETRY_COUNTS_help = "Reset retry counters"
 
     def cmd_OAMS_RESET_RETRY_COUNTS(self, gcmd):
-        self._load_retry_count.clear()
+        self._load_retry_state.clear()
         self._unload_retry_count = 0
-        self._last_load_attempt.clear()
         self._last_unload_attempt = 0.0
         self._last_successful_load.clear()
-        # FIX: Also clear the retry flag tracking
-        self._last_load_was_retry.clear()
         gcmd.respond_info(f"OAMS[{self.oams_idx}]: Reset all retry counters")
 
     def _calculate_retry_delay(self, attempt_number: int) -> float:
@@ -430,10 +439,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     def _reset_load_retry_count(self, spool_idx: int) -> None:
         """Clear retry tracking for a specific spool."""
-        self._load_retry_count.pop(spool_idx, None)
-        self._last_load_attempt.pop(spool_idx, None)
-        # FIX: Also clear the retry flag to prevent stale state
-        self._last_load_was_retry.pop(spool_idx, None)
+        self._load_retry_state.pop(spool_idx, None)
 
     def _reset_unload_retry_count(self) -> None:
         """Clear unload retry tracking."""
@@ -448,7 +454,8 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             max_retries: Override for load_retry_max. If provided, uses this value instead
                         of the configured load_retry_max. Allows AFC to control retry count.
         """
-        retry_count = self._load_retry_count.get(spool_idx, 0)
+        retry = self._load_retry_state.setdefault(spool_idx, RetryState())
+        retry_count = retry.count
         attempt_history = []  # Track failure reasons for diagnostic context
 
         # Use AFC's retry config if provided, otherwise fall back to OAMS config
@@ -466,19 +473,16 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
                 )
                 self.reactor.pause(self.reactor.monotonic() + delay)
 
-            self._load_retry_count[spool_idx] = retry_count + 1
-            self._last_load_attempt[spool_idx] = self.reactor.monotonic()
+            retry.count = retry_count + 1
+            retry.last_attempt = self.reactor.monotonic()
 
             success, message = self.load_spool(spool_idx)
 
             if success:
                 # Record successful load timestamp for stuck spool detection
                 self._last_successful_load[spool_idx] = self.reactor.monotonic()
-                # FIX: Track whether this load completed after retries
-                if retry_count > 0:
-                    self._last_load_was_retry[spool_idx] = True
-                else:
-                    self._last_load_was_retry[spool_idx] = False
+                # Track whether this load completed after retries
+                retry.was_retry = retry_count > 0
                 self._reset_load_retry_count(spool_idx)
                 # Try to resolve lane name for better user messaging
                 lane_name = self._resolve_lane_name(spool_idx)
@@ -546,21 +550,22 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     def get_last_load_attempt_time(self, spool_idx: int) -> Optional[float]:
         """Return timestamp of the most recent load attempt for spool."""
-        return self._last_load_attempt.get(spool_idx)
+        retry = self._load_retry_state.get(spool_idx)
+        return retry.last_attempt if retry is not None else None
 
     def get_last_successful_load_time(self, spool_idx: int) -> Optional[float]:
         """Return timestamp of the most recent successful load for spool."""
         return self._last_successful_load.get(spool_idx)
 
-    # FIX: New method to check if last load was after retries
     def last_load_was_retry(self, spool_idx: int) -> bool:
         """
         Check if the last successful load for this spool was after retries.
-        
+
         This is used by the manager to skip post-load pressure checks after retries,
         since pressure may not have stabilized yet and could cause false positives.
         """
-        return self._last_load_was_retry.get(spool_idx, False)
+        retry = self._load_retry_state.get(spool_idx)
+        return retry.was_retry if retry is not None else False
 
     def unload_spool_with_retry(self, max_retries: Optional[int] = None) -> Tuple[bool, str]:
         """Unload spool with automatic retry on failure.
@@ -591,9 +596,9 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
                     gcode.run_script_from_command("G92 E0")
                     gcode.run_script_from_command("G1 E-5.00 F1200")
                     gcode.run_script_from_command("M400")
-                except Exception:
+                except Exception as e:
                     self.logger.warning(
-                        f"OAMS[{self.oams_idx}]: Failed to retract extruder before unload retry"
+                        f"OAMS[{self.oams_idx}]: Failed to retract extruder before unload retry: {e}"
                     )
 
             self._unload_retry_count += 1
