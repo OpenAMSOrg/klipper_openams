@@ -15,8 +15,8 @@ class OAMSStatus:
     """Hardware status codes reported by OAMS firmware."""
     LOADING = 0              # Currently loading filament
     UNLOADING = 1            # Currently unloading filament  
-    FORWARD_FOLLOWING = 2    # Following extruder in forward direction
-    REVERSE_FOLLOWING = 3    # Following extruder in reverse direction
+    FORWARD_FOLLOWING = 2    # Following stepper in forward direction
+    REVERSE_FOLLOWING = 3    # Following stepper in reverse direction
     COASTING = 4             # Coasting without active control
     STOPPED = 5              # Motor stopped, idle state
     CALIBRATING = 6          # Running calibration procedure
@@ -116,9 +116,9 @@ class OAMS:
         self.action_status_value: Optional[int] = None
         
         # Setup MCU communication
-        self.mcu.register_response(self._oams_action_status, "oams_action_status")
-        self.mcu.register_response(self._oams_cmd_stats, "oams_cmd_stats")
-        self.mcu.register_response(self._oams_cmd_current_stats, "oams_cmd_current_status")
+        self.mcu.register_serial_response(self._oams_action_status, "oams_action_status action=%c code=%c value=%u")
+        self.mcu.register_serial_response(self._oams_cmd_stats, "oams_cmd_stats fps_value=%u hub_hes_value_0=%c hub_hes_value_1=%c hub_hes_value_2=%c hub_hes_value_3=%c f1s_hes_value_0=%c f1s_hes_value_1=%c f1s_hes_value_2=%c f1s_hes_value_3=%c encoder_clicks=%u")
+        self.mcu.register_serial_response(self._oams_cmd_current_stats, "oams_cmd_current_status current_value=%u")
         self.mcu.register_config_callback(self._build_config)
         
         # Register commands and event handlers

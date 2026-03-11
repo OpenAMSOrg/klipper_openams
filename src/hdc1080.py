@@ -176,8 +176,11 @@ class HDC1080:
         self.reactor.pause(self.reactor.monotonic() + .0635)
         read = self.i2c.i2c_read([], 2)
         data = bytearray(read['response'])
-        manufacturer_id = (data[0] * 256) + data[1]
-        return manufacturer_id
+        if(len(data) >= 2):
+            manufacturer_id = (data[0] * 256) + data[1]
+            return manufacturer_id
+        else:
+            return None
     
     def read_serial_id(self):
         self.i2c.i2c_write([FSER_REG])
