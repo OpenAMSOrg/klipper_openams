@@ -36,14 +36,15 @@ class FPS:
             self.adc.setup_minmax(self._sample_time, self._sample_count)
         else:
             self.adc.setup_adc_sample(self._sample_time, self._sample_count)
-        self.adc.setup_adc_callback(self._report_time, self._adc_callback)
+        self.adc.setup_adc_callback(self._adc_callback)
         
         self.callbacks = []
         
     def add_callback(self, callback):
         self.callbacks.append(callback)
 
-    def _adc_callback(self, read_time, read_value):
+    def _adc_callback(self, samples):
+        read_time, read_value = samples[-1]
         if self._reversed:
             read_value = 1.0 - read_value
         self.fps_value = read_value

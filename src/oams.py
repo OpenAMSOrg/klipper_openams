@@ -68,9 +68,9 @@ class OAMS:
             "current_target", 0.3, minval=0.1, maxval=0.4
         )
         self.current_spool = None
-        self.mcu.register_response(self._oams_action_status, "oams_action_status")
-        self.mcu.register_response(self._oams_cmd_stats, "oams_cmd_stats")
-        self.mcu.register_response(self._oams_cmd_current_stats, "oams_cmd_current_status")
+        self.mcu.register_serial_response(self._oams_action_status, "oams_action_status action=%c code=%c value=%u")
+        self.mcu.register_serial_response(self._oams_cmd_stats, "oams_cmd_stats fps_value=%u hub_hes_value_0=%c hub_hes_value_1=%c hub_hes_value_2=%c hub_hes_value_3=%c f1s_hes_value_0=%c f1s_hes_value_1=%c f1s_hes_value_2=%c f1s_hes_value_3=%c encoder_clicks=%u")
+        self.mcu.register_serial_response(self._oams_cmd_current_stats, "oams_cmd_current_status current_value=%u")
         self.mcu.register_config_callback(self._build_config)
         self.name = config.get_name()
         self.register_commands(self.name.split()[-1])
