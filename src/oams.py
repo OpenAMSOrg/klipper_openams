@@ -24,6 +24,7 @@ OAMS_OP_CODE_ERROR_BUSY = 2
 OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY  = 3
 OAMS_OP_CODE_NO_SPOOL_IN_BAY = 4
 OAMS_OP_CODE_ERROR_KLIPPER_CALL  = 5
+OAMS_OP_CODE_CANCEL = 6
 
 
 class OAMS:
@@ -147,6 +148,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
                 "oams_cmd_unload_spool"
             )
 
+            try:
+                self.oams_load_spool_cancel_cmd = self.mcu.lookup_command(
+                    "oams_cmd_load_spool_cancel"
+                )
+            except Exception as e:
+                logging.warning("Failed to initialize OAMS load filament cancel command: %s\nMost likely the firmware needs to be updated to support this command.", e)
+    
             self.oams_follower_cmd = self.mcu.lookup_command(
                 "oams_cmd_follower enable=%c direction=%c"
             )
@@ -271,8 +279,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             self.cmd_OAMS_CURRENT_PID_SET_help,
         )
 
-    cmd_OAMS_CURRENT_PID_SET_help = "Set the PID values for the current sensor"
+    def load_spool_cancel(self):
+        if self.oams_load_spool_cancel_cmd is not None:
+            self.oams_load_spool_cancel_cmd.send()
+            return "OAMS load spool operation cancelled"
+        return "OAMS load spool cancel command not available on this firmware"
 
+    cmd_OAMS_CURRENT_PID_SET_help = "Set the PID values for the current sensor"
     def cmd_OAMS_CURRENT_PID_SET(self, gcmd):
         p = gcmd.get_float("P", None)
         i = gcmd.get_float("I", None)
@@ -399,13 +412,15 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             self.reactor.pause(self.reactor.monotonic() + 0.1)
         if self.action_status_code == OAMS_OP_CODE_SUCCESS:
             self.current_spool = spool_idx
-            return True, "Spool loaded successfully"
+            return self.action_status_code, "Spool loaded successfully"
         elif self.action_status_code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
-            return False, "Spool loading stopped by klipper monitor"
+            return self.action_status_code, "Spool loading stopped by klipper monitor"
         elif self.action_status_code == OAMS_OP_CODE_ERROR_BUSY:
-            return False, "OAMS is busy"
+            return self.action_status_code, "OAMS is busy"
+        elif self.action_status_code == OAMS_OP_CODE_CANCEL:
+            return self.action_status_code, "Spool loading cancelled"
         else:
-            return False, "Unknown error from OAMS with code %d" % self.action_status_code
+            return self.action_status_code, "Unknown error from OAMS with code %d" % self.action_status_code
 
     cmd_OAMS_LOAD_SPOOL_help = "Load a new spool of filament"
 

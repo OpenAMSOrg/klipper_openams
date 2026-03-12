@@ -10,6 +10,8 @@ import time
 from functools import partial
 from collections import deque
 
+from oams import OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL
+
 PAUSE_DISTANCE = 60
 ENCODER_SAMPLES = 2
 MIN_ENCODER_DIFF = 1
@@ -238,6 +240,22 @@ class OAMSManager:
             self.cmd_CLEAR_ERRORS,
             desc=self.cmd_CLEAR_ERRORS_help,
         )
+
+        gcode.register_command(
+            "OAMSM_LOAD_FILAMENT_CANCEL",
+            self.cmd_LOAD_FILAMENT_CANCEL,
+            desc=self.cmd_LOAD_FILAMENT_CANCEL_help,
+        )
+
+    
+    cmd_LOAD_FILAMENT_CANCEL_help = "Cancel the current load filament operation"
+    def cmd_LOAD_FILAMENT_CANCEL(self, gcmd):
+
+        if self.current_state.name == "LOADING":
+                oam, bay_index = self.current_state.current_spool
+                gcmd.respond_info(oam.load_spool_cancel())
+        else:
+            gcmd.respond_info("No load filament operation is currently in progress")
     
     cmd_CLEAR_ERRORS_help = "Clear the error state of the OAMS"
     def cmd_CLEAR_ERRORS(self, gcmd):
@@ -334,9 +352,8 @@ class OAMSManager:
                 self.current_state.since = self.reactor.monotonic()
                 self.current_state.current_spool = (oam, bay_index)
                 
-                success, message = oam.load_spool(bay_index)
-                
-                if success:
+                code, message = oam.load_spool(bay_index)
+                if code == OAMS_OP_CODE_SUCCESS or code == OAMS_OP_CODE_CANCEL:
                     self.current_group = group_name
                     self.current_spool = (oam, bay_index)
                     
@@ -348,7 +365,7 @@ class OAMSManager:
                     
                     gcmd.respond_info(message)
                     self.current_group = group_name
-                    return
+                    return           
                 else:
                     gcmd.respond_info(message)
                     return
