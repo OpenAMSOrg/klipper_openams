@@ -10,7 +10,7 @@ import time
 from functools import partial
 from collections import deque
 
-from oams import OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL
+from .oams import OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL
 
 PAUSE_DISTANCE = 60
 ENCODER_SAMPLES = 2
