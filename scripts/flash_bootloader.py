@@ -3,7 +3,6 @@
 Bootloader Update Tool for Mainboard Firmware
 Uses admin CAN channel (0x3f0/0x3f1) to flash bootloader over CAN
 
-JR Lomas <lomas.jr@gmail.com>
 Copyright (C) 2026
 This file may be distributed under the terms of the GNU GPLv3 license.
 """
@@ -40,6 +39,7 @@ ADMIN_RESP_READY = 0x03
 # Constants
 BOOTLOADER_MAX_SIZE = 0x2000  # 8KB
 CHUNK_SIZE = 5  # 5 bytes per CAN message
+FLASH_PAGE_SIZE = 0x800  # 2KB pages on STM32F072
 
 
 def output(msg: str) -> None:
@@ -104,12 +104,26 @@ class BootloaderFlasher:
                     
             offset += 16
     
-    async def _wait_response(self, timeout: float = 2.0) -> bytes:
-        """Wait for admin response"""
-        try:
-            return await asyncio.wait_for(self.response_queue.get(), timeout)
-        except asyncio.TimeoutError:
-            raise TimeoutError("No response from device")
+    async def _wait_response(self, timeout: float = 2.0,
+                              expected_cmd: Optional[int] = None) -> bytes:
+        """Wait for admin response, optionally filtering by command code.
+        
+        When expected_cmd is set, any responses with a different command echo
+        byte (e.g. stale chunk ACKs) are silently discarded.
+        """
+        deadline = asyncio.get_event_loop().time() + timeout
+        while True:
+            remaining = deadline - asyncio.get_event_loop().time()
+            if remaining <= 0:
+                raise TimeoutError("No response from device")
+            try:
+                resp = await asyncio.wait_for(
+                    self.response_queue.get(), min(remaining, timeout))
+            except asyncio.TimeoutError:
+                raise TimeoutError("No response from device")
+            if expected_cmd is None or (len(resp) > 0 and resp[0] == expected_cmd):
+                return resp
+            # else: stale response for a different command — discard and retry
     
     async def start_update(self, size: int) -> None:
         """Send START command with UUID and size in KB"""
@@ -121,7 +135,8 @@ class BootloaderFlasher:
         
         # Wait for response (we'll get chunk size and staging address back)
         try:
-            resp_data = await self._wait_response(timeout=3.0)
+            resp_data = await self._wait_response(
+                timeout=3.0, expected_cmd=ADMIN_CMD_BOOTLOADER_UPDATE_START)
             output("Device ready to receive bootloader data")
         except TimeoutError:
             output("Warning: No response to START, continuing anyway...")
@@ -141,13 +156,6 @@ class BootloaderFlasher:
         
         # Small delay for flow control (prevent socket buffer overflow)
         await asyncio.sleep(0.001)  # 1ms delay
-        
-        # Wait for ack every 64 chunks (320 bytes ~= 1/6 page)
-        if offset % 320 == 0:
-            try:
-                resp_data = await self._wait_response(timeout=0.5)
-            except TimeoutError:
-                pass  # Device may not ACK every chunk
     
     async def verify_bootloader(self, expected_crc: int) -> None:
         """Send VERIFY command with expected CRC32"""
@@ -157,8 +165,19 @@ class BootloaderFlasher:
         await self._send_admin_command(ADMIN_CMD_BOOTLOADER_UPDATE_VERIFY, payload)
         
         try:
-            resp_data = await self._wait_response(timeout=3.0)
-            output("Bootloader verification successful")
+            resp_data = await self._wait_response(
+                timeout=3.0, expected_cmd=ADMIN_CMD_BOOTLOADER_UPDATE_VERIFY)
+            # Response: [CMD_ECHO] [CRC32 (4 bytes)] [verified (1 byte)]
+            if len(resp_data) >= 6 and resp_data[5] == 0x01:
+                device_crc = struct.unpack_from("<I", resp_data, 1)[0]
+                output(f"Bootloader verification successful (device CRC: 0x{device_crc:08x})")
+            elif len(resp_data) >= 6:
+                device_crc = struct.unpack_from("<I", resp_data, 1)[0]
+                raise RuntimeError(
+                    f"Bootloader verification FAILED on device "
+                    f"(expected CRC: 0x{expected_crc:08x}, device CRC: 0x{device_crc:08x})")
+            else:
+                raise RuntimeError(f"Unexpected verify response: {resp_data.hex()}")
         except TimeoutError:
             raise RuntimeError("VERIFY command timed out")
     
@@ -168,8 +187,16 @@ class BootloaderFlasher:
         await self._send_admin_command(ADMIN_CMD_BOOTLOADER_UPDATE_COMMIT)
         
         try:
-            resp_data = await self._wait_response(timeout=10.0)  # Longer timeout for flash operation
-            output("Bootloader successfully flashed!")
+            resp_data = await self._wait_response(
+                timeout=10.0,
+                expected_cmd=ADMIN_CMD_BOOTLOADER_UPDATE_COMMIT)  # Longer timeout for flash operation
+            # Response: [CMD_ECHO] [success (1 byte)]
+            if len(resp_data) >= 2 and resp_data[1] == 0x01:
+                output("Bootloader successfully flashed!")
+            elif len(resp_data) >= 2:
+                raise RuntimeError("COMMIT rejected by device (verification may have failed)")
+            else:
+                raise RuntimeError(f"Unexpected commit response: {resp_data.hex()}")
         except TimeoutError:
             raise RuntimeError("COMMIT command timed out")
     
@@ -210,15 +237,31 @@ class BootloaderFlasher:
             total_chunks = (len(bootloader_data) + CHUNK_SIZE - 1) // CHUNK_SIZE
             output(f"Sending {total_chunks} chunks ({len(bootloader_data)} bytes)...")
             
+            next_page_boundary = FLASH_PAGE_SIZE
             for i in range(0, len(bootloader_data), CHUNK_SIZE):
                 chunk = bootloader_data[i:i+CHUNK_SIZE]
-                offset = i
-                await self.send_chunk(offset, chunk)
+                await self.send_chunk(i, chunk)
                 
                 # Progress indicator
-                if offset % 500 == 0:
-                    progress = (offset / len(bootloader_data)) * 100
-                    output(f"Progress: {progress:.1f}% ({offset}/{len(bootloader_data)} bytes)")
+                if i % 500 == 0:
+                    progress = (i / len(bootloader_data)) * 100
+                    output(f"Progress: {progress:.1f}% ({i}/{len(bootloader_data)} bytes)")
+                
+                # Flow control: wait for page-write ACK when a page
+                # boundary is crossed. The firmware ACKs only after
+                # completing a flash page write, so we must pause here
+                # to avoid overflowing the STM32 CAN RX FIFO while the
+                # CPU is stalled programming flash.
+                chunk_end = min(i + CHUNK_SIZE, len(bootloader_data))
+                if chunk_end >= next_page_boundary:
+                    try:
+                        await self._wait_response(
+                            timeout=5.0,
+                            expected_cmd=ADMIN_CMD_BOOTLOADER_UPDATE_CHUNK)
+                    except TimeoutError:
+                        raise RuntimeError(
+                            f"Page write ACK timed out at byte {chunk_end}")
+                    next_page_boundary += FLASH_PAGE_SIZE
             
             output(f"All data sent ({len(bootloader_data)} bytes)")
             
