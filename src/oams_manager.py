@@ -378,6 +378,7 @@ class OAMSManager:
                     self.reactor.pause(self.reactor.monotonic() + 0.1)
 
                 code, message = oam.finish_load_spool(bay_index)
+                logging.info("OAMS[%d] Load Spool Result: code=%d message=%s" % (oam.oams_idx, code, message))
 
                 if code == OAMS_OP_CODE_SUCCESS or code == OAMS_OP_CODE_CANCEL:
                     self.current_group = group_name
