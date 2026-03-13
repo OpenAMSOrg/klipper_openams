@@ -422,6 +422,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         elif self.action_status_code == OAMS_OP_CODE_ERROR_BUSY:
             return self.action_status_code, "OAMS is busy"
         elif self.action_status_code == OAMS_OP_CODE_CANCEL:
+            self.current_spool = spool_idx
             return self.action_status_code, "Spool loading cancelled"
         else:
             return self.action_status_code, "Unknown error from OAMS with code %d" % self.action_status_code
