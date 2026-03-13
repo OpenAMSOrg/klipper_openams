@@ -55,11 +55,21 @@ class OAMSManager:
         
         self.reload_before_toolhead_distance = config.getfloat("reload_before_toolhead_distance", 0.0)
 
+        self._load_cancel_requested = False
+
         self.webhooks = self.printer.lookup_object('webhooks')
         self.webhooks.register_endpoint("openams/status", self._webhook_status)
+        self.webhooks.register_endpoint("openams/cancel_load", self._webhook_cancel_load)
         
         self.register_commands()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
+
+    def _webhook_cancel_load(self, request):
+        if self.current_state.name == "LOADING":
+            self._load_cancel_requested = True
+            request.send({"result": "cancel requested"})
+        else:
+            request.send({"result": "no load in progress"})
 
     def _webhook_status(self, request):
         status = {"ready" : self.ready, "current_group" : self.current_group}
@@ -351,22 +361,40 @@ class OAMSManager:
                 self.current_state.encoder = oam.encoder_clicks
                 self.current_state.since = self.reactor.monotonic()
                 self.current_state.current_spool = (oam, bay_index)
-                
-                code, message = oam.load_spool(bay_index)
+                self._load_cancel_requested = False
+
+                oam.start_load_spool(bay_index)
+
+                # Poll until firmware responds; webhook can set _load_cancel_requested
+                # from a reactor timer callback, which runs during reactor.pause()
+                while oam.action_status is not None:
+                    if self._load_cancel_requested:
+                        self._load_cancel_requested = False
+                        oam.load_spool_cancel()
+                        # Wait for firmware to acknowledge the cancel
+                        while oam.action_status is not None:
+                            self.reactor.pause(self.reactor.monotonic() + 0.1)
+                        break
+                    self.reactor.pause(self.reactor.monotonic() + 0.1)
+
+                code, message = oam.finish_load_spool(bay_index)
+
                 if code == OAMS_OP_CODE_SUCCESS or code == OAMS_OP_CODE_CANCEL:
                     self.current_group = group_name
                     self.current_spool = (oam, bay_index)
-                    
+
                     self.current_state.name = "LOADED"
                     self.current_state.since = self.reactor.monotonic()
                     self.current_state.current_spool = self.current_spool
                     self.current_state.following = False
                     self.current_state.direction = 1
-                    
+
                     gcmd.respond_info(message)
                     self.current_group = group_name
-                    return           
+                    return
                 else:
+                    self.current_state.name = "UNLOADED"
+                    self.current_state.current_spool = None
                     gcmd.respond_info(message)
                     return
         gcmd.respond_info(f"No spool available for group {group_name}")

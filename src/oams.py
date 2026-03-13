@@ -405,14 +405,18 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         else:
             gcmd.error("Calibration of PTFE length failed")
 
-    def load_spool(self, spool_idx):
+    def start_load_spool(self, spool_idx):
+        """Send load command to firmware and return immediately.
+        Poll action_status until None, then call finish_load_spool() for the result."""
         self.action_status = OAMS_STATUS_LOADING
+        self.action_status_code = None
         self.oams_load_spool_cmd.send([spool_idx])
-        while self.action_status is not None:
-            self.reactor.pause(self.reactor.monotonic() + 0.1)
+
+    def finish_load_spool(self, spool_idx):
+        """Interpret action_status_code after action_status has become None."""
         if self.action_status_code == OAMS_OP_CODE_SUCCESS:
             self.current_spool = spool_idx
-            return self.action_status_code, "Spool loaded successfully"
+            return OAMS_OP_CODE_SUCCESS, "Spool loaded successfully"
         elif self.action_status_code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
             return self.action_status_code, "Spool loading stopped by klipper monitor"
         elif self.action_status_code == OAMS_OP_CODE_ERROR_BUSY:
@@ -421,6 +425,13 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             return self.action_status_code, "Spool loading cancelled"
         else:
             return self.action_status_code, "Unknown error from OAMS with code %d" % self.action_status_code
+
+    def load_spool(self, spool_idx):
+        """Blocking convenience wrapper used by cmd_OAMS_LOAD_SPOOL (no cancel needed)."""
+        self.start_load_spool(spool_idx)
+        while self.action_status is not None:
+            self.reactor.pause(self.reactor.monotonic() + 0.1)
+        return self.finish_load_spool(spool_idx)
 
     cmd_OAMS_LOAD_SPOOL_help = "Load a new spool of filament"
 
