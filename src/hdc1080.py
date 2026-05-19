@@ -43,8 +43,14 @@ class HDC1080:
             config, default_addr=HDC1080_I2C_ADDR, default_speed=100000)
         self.report_time = config.getint('HDC1080_report_time',5,minval=5)
         self.temp = self.min_temp = self.max_temp = self.humidity = 0.
+        self.simulated_supported_sensor_mainsail = config.getboolean('simulate_supported_sensor_mainsail', True)
+        # This is a hack to make the sensor show up as an AHT3X in Mainsail, which is supported natively, instead of an HDC1080, which is not. This allows the sensor to be used without needing to add support for it in Mainsail, and also allows the use of the native AHT3X card in Mainsail, which has a nice UI for showing the temperature and humidity. The downside is that it will show up as an AHT3X in Mainsail, which is not accurate, but it's a small price to pay for the convenience.
+        if self.simulated_supported_sensor_mainsail:
+            self.printer.add_object("aht3x " + self.name, self)
+        else:
+            self.printer.add_object("hdc1080 " + self.name, self)
+        
         self.sample_timer = self.reactor.register_timer(self._sample_hdc1080)
-        self.printer.add_object("hdc1080 " + self.name, self)
         self.printer.register_event_handler("klippy:connect",
                                             self.handle_connect)
         self.temp_resolution = config.getint('temp_resolution',14,minval=11,maxval=14)

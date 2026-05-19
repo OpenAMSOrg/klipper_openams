@@ -26,8 +26,9 @@ while getopts "k:s:c:uh" arg; do
 done
 
 # Find SRCDIR from the pathname of this script
-SRCDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )"/src/ && pwd )"
-SCRIPTSDIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )"/scripts/ && pwd )"
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+SRCDIR="$SCRIPT_DIR/src"
+SCRIPTSDIR="$SCRIPT_DIR/scripts"
 
 # Verify Klipper has been installed
 check_klipper()
@@ -55,7 +56,7 @@ check_folders()
     echo "Moonraker configuration found at $MOONRAKER_CONFIG_DIR"
 }
 
-# Link extension to Klipper
+# Link OpenAMS extension modules to Klipper
 link_extension()
 {
     echo -n "Linking OpenAMS extension to Klipper... "
@@ -65,16 +66,17 @@ link_extension()
     echo "[OK]"
 }
 
+# Link OpenAMS helper scripts to Klipper
 link_scripts()
 {
     echo -n "Linking OpenAMS scripts to Klipper... "
-    for file in "${SRCDIR}"/scripts/*.py; do
-        ln -sf "${file}" "${KLIPPER_PATH}/scripts/"
+    for file in "${SCRIPTSDIR}"/*.py; do
+        ln -sf "${file}" "${KLIPPER_PATH}/scripts/$(basename "$file")"
     done
     echo "[OK]"
 }
 
-# Restart moonraker
+# Restart Moonraker service
 restart_moonraker()
 {
     echo -n "Restarting Moonraker... "
@@ -82,23 +84,147 @@ restart_moonraker()
     echo "[OK]"
 }
 
-# Add updater for OpenAMS to moonraker.conf
+# Add OpenAMS update manager section to moonraker.conf
 add_updater()
 {
     echo -e -n "Adding update manager to moonraker.conf... "
 
-    update_section=$(grep -c '\[update_manager openams\]' ${MOONRAKER_CONFIG_DIR}/moonraker.conf || true)
-    if [ "${update_section}" -eq 0 ]; then
-        echo -e "\n" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
-        while read -r line; do
-            echo -e "${line}" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
-        done < "$PWD/file_templates/moonraker_update.txt"
-        echo -e "\n" >> ${MOONRAKER_CONFIG_DIR}/moonraker.conf
-        echo "[OK]"
-        restart_moonraker
-    else
-        echo -e "[update_manager openams] already exists in moonraker.conf [SKIPPED]"
+    if grep -q '\[update_manager openams\]' "${MOONRAKER_CONFIG_DIR}/moonraker.conf"; then
+        echo "[update_manager openams] already exists in moonraker.conf [SKIPPED]"
+        return
     fi
+
+    {
+        echo ""
+        cat "${SCRIPT_DIR}/file_templates/moonraker_update.txt"
+        echo ""
+    } >> "${MOONRAKER_CONFIG_DIR}/moonraker.conf"
+
+    echo "[OK]"
+    restart_moonraker
+}
+
+# Install OpenAMS config files into the Moonraker configuration directory
+install_config()
+{
+    echo -n "Installing OpenAMS config files... "
+
+    if [ ! -f "${MOONRAKER_CONFIG_DIR}/oams.cfg" ]; then
+        cp "${SCRIPT_DIR}/oams_sample.cfg" "${MOONRAKER_CONFIG_DIR}/oams.cfg"
+        echo -n "oams.cfg installed... "
+    else
+        echo -n "oams.cfg already exists [SKIPPED]... "
+    fi
+
+    if [ ! -f "${MOONRAKER_CONFIG_DIR}/oams_macros.cfg" ]; then
+        cp "${SCRIPT_DIR}/oams_macros.cfg" "${MOONRAKER_CONFIG_DIR}/oams_macros.cfg"
+        echo -n "oams_macros.cfg installed... "
+    else
+        echo -n "oams_macros.cfg already exists [SKIPPED]... "
+    fi
+
+    echo "[OK]"
+}
+
+# Add OpenAMS config include to printer.cfg
+add_printer_includes()
+{
+    echo -n "Adding OpenAMS include to printer.cfg... "
+    local printer_cfg="${MOONRAKER_CONFIG_DIR}/printer.cfg"
+    local tmp_cfg
+
+    if [ ! -f "$printer_cfg" ]; then
+        echo "[SKIPPED] printer.cfg not found."
+        return
+    fi
+
+    if grep -q '^\[include[[:space:]]*oams\.cfg\]$' "$printer_cfg"; then
+        echo "oams.cfg already included [SKIPPED]"
+        return
+    fi
+
+    tmp_cfg="$(mktemp)"
+
+    if grep -q '^\[printer\]$' "$printer_cfg"; then
+        awk '
+        !inserted && /^\[printer\]$/ {
+            print "[include oams.cfg]"
+            print ""
+            inserted=1
+        }
+        { print }
+        ' "$printer_cfg" > "$tmp_cfg"
+    else
+        {
+            echo "[include oams.cfg]"
+            echo ""
+            cat "$printer_cfg"
+        } > "$tmp_cfg"
+    fi
+
+    mv "$tmp_cfg" "$printer_cfg"
+    echo "[OK]"
+}
+
+# Remove OpenAMS config include from printer.cfg without deleting nearby config
+remove_printer_includes()
+{
+    echo -n "Removing OpenAMS includes from printer.cfg... "
+    local printer_cfg="${MOONRAKER_CONFIG_DIR}/printer.cfg"
+    local tmp_cfg
+
+    if [ ! -f "$printer_cfg" ]; then
+        echo "[SKIPPED] printer.cfg not found."
+        return
+    fi
+
+    tmp_cfg="$(mktemp)"
+
+    awk '
+    BEGIN { skip_blank=0 }
+    /^\[include[[:space:]]*oams\.cfg\]$/ {
+        skip_blank=1
+        next
+    }
+    skip_blank && /^$/ {
+        skip_blank=0
+        next
+    }
+    {
+        skip_blank=0
+        print
+    }
+    ' "$printer_cfg" > "$tmp_cfg"
+
+    mv "$tmp_cfg" "$printer_cfg"
+    echo "[OK]"
+}
+
+# Remove OpenAMS update manager section from moonraker.conf
+remove_updater()
+{
+    echo -n "Removing OpenAMS update manager from moonraker.conf... "
+    local moonraker_cfg="${MOONRAKER_CONFIG_DIR}/moonraker.conf"
+    local tmp_cfg
+
+    if [ ! -f "$moonraker_cfg" ]; then
+        echo "[SKIPPED] moonraker.conf not found."
+        return
+    fi
+
+    tmp_cfg="$(mktemp)"
+
+    awk '
+    BEGIN { skip=0 }
+    /^\[update_manager openams\]$/ { skip=1; next }
+    /^\[/ { if (skip) skip=0 }
+    !skip { print }
+    ' "$moonraker_cfg" > "$tmp_cfg"
+
+    mv "$tmp_cfg" "$moonraker_cfg"
+
+    echo "[OK]"
+    restart_moonraker
 }
 
 
@@ -128,16 +254,24 @@ uninstall()
     if [ -f "${KLIPPER_PATH}/klippy/extras/oams.py" ]; then
         echo -n "Uninstalling OpenAMS... "
         for file in "${SRCDIR}"/*.py; do
-            unlink "${KLIPPER_PATH}/klippy/extras/$(basename $file)"
+            rm -f "${KLIPPER_PATH}/klippy/extras/$(basename "$file")"
         done
         for file in "${SCRIPTSDIR}"/*.py; do
-            unlink "${KLIPPER_PATH}/scripts/$(basename $file)"
+            rm -f "${KLIPPER_PATH}/scripts/$(basename "$file")"
         done
         echo "[OK]"
-        echo "You can now remove the [update_manager openams] section in your moonraker.conf and delete this directory. Also remove all OpenAMS configurations from your Klipper configuration."
+        read -p "Remove oams.cfg and oams_macros.cfg from ${MOONRAKER_CONFIG_DIR}? [y/N] " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            rm -f "${MOONRAKER_CONFIG_DIR}/oams.cfg"
+            rm -f "${MOONRAKER_CONFIG_DIR}/oams_macros.cfg"
+            echo "Config files removed."
+        else
+            echo "Config files kept."
+        fi
     else
         echo "oams.py not found in \"${KLIPPER_PATH}/klippy/extras/\". Is it installed?"
         echo "[FAILED]"
+        return 1
     fi
 }
 
@@ -155,11 +289,15 @@ verify_ready
 check_klipper
 check_folders
 stop_klipper
-if [ ! $UNINSTALL ]; then
+if [[ -z "${UNINSTALL:-}" ]]; then
     link_extension
     link_scripts
     add_updater
+    install_config
+    add_printer_includes
 else
     uninstall
+    remove_printer_includes
+    remove_updater
 fi
 start_klipper
