@@ -444,10 +444,12 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             raise gcmd.error("SPOOL index is required")
         if spool_idx < 0 or spool_idx > 3:
             raise gcmd.error("Invalid SPOOL index")
-        
-        success, message = self.load_spool(spool_idx)
-        
-        if success:
+
+        code, message = self.load_spool(spool_idx)
+
+        # load_spool() returns an OAMS op code (not a boolean); SUCCESS is 0,
+        # so it must be compared explicitly rather than tested for truthiness.
+        if code == OAMS_OP_CODE_SUCCESS or code == OAMS_OP_CODE_CANCEL:
             gcmd.respond_info(message)
         else:
             gcmd.error(message)
@@ -470,10 +472,29 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
     cmd_OAMS_UNLOAD_SPOOL_help = "Unload a spool of filament"
 
     def cmd_OAMS_UNLOAD_SPOOL(self, gcmd):
+        # Guard: only unload the spool that is actually loaded. Without this,
+        # issuing an unload while nothing (or a different spool) is loaded would
+        # send the firmware into a rewind/follower state that never completes,
+        # leaving the follower running indefinitely.
+        requested = gcmd.get_int("SPOOL", None)
+        if self.current_spool is None:
+            # Make sure we are not leaving the follower rewinding.
+            self.set_oams_follower(0, 0)
+            gcmd.respond_info(
+                "No spool is currently loaded on this OAMS; nothing to unload "
+                "(follower stopped)")
+            return
+        if requested is not None and requested != self.current_spool:
+            raise gcmd.error(
+                "Refusing to unload: spool %d is loaded on this OAMS, not %d"
+                % (self.current_spool, requested))
         success, message = self.unload_spool()
         if success:
             gcmd.respond_info(message)
         else:
+            # The unload did not complete cleanly; stop the follower so it does
+            # not keep rewinding the spool.
+            self.set_oams_follower(0, 0)
             gcmd.error(message)
 
     def set_oams_follower(self, enable, direction):

@@ -94,6 +94,15 @@ class OAMSManager:
         else:
             self.current_spool = None
             self.current_state = OAMSState("UNLOADED", self.reactor.monotonic() , None)
+            # Nothing is loaded, so no follower should be running. The firmware
+            # keeps a follower active across a host restart, so an aborted
+            # unload could leave one rewinding forever ("restart didn't help").
+            # Make sure every follower is stopped when we are unloaded.
+            for _, oam in self.oams.items():
+                try:
+                    oam.set_oams_follower(0, 0)
+                except Exception as e:
+                    logging.warning("OAMS: Could not stop follower on %s: %s", oam.name, e)
         
     def handle_ready(self):
         self.determine_state()
@@ -138,8 +147,13 @@ class OAMSManager:
                     logging.info("OAMS: Loading next spool in the filament group.")
                     for (oam, bay_index) in self.filament_groups[self.current_group].bays:
                         if oam.is_bay_ready(bay_index):
-                            success, message = oam.load_spool(bay_index)
-                            if success:
+                            # load_spool() returns an OAMS op code (not a boolean).
+                            # OAMS_OP_CODE_SUCCESS is 0, so a successful load would
+                            # read as falsy if tested for truthiness -- causing the
+                            # next spool in the group to be treated as a failed load
+                            # and the print to be paused even though loading worked.
+                            code, message = oam.load_spool(bay_index)
+                            if code == OAMS_OP_CODE_SUCCESS:
                                 logging.info(f"OAMS: Successfully loaded spool in bay {bay_index} of OAM {oam.name}")
                                 self.current_spool = (oam, bay_index)
                                 self.runout_position = None
@@ -335,13 +349,24 @@ class OAMSManager:
                     self.current_state.following = False
                     self.current_state.direction = 0
                     self.current_state.since = self.reactor.monotonic()
-                    
+
                     self.current_group = None
                     self.current_spool = None
                     return
                 else:
+                    # Unload did not complete cleanly. Stop the follower so it
+                    # does not keep rewinding the spool indefinitely.
+                    oam.set_oams_follower(0, 0)
+                    self.current_state.following = False
                     gcmd.respond_info(message)
                     return
+        # Nothing was loaded. SAFE_UNLOAD_FILAMENT enables the follower in the
+        # rewind direction *before* calling this command, so if we simply return
+        # here the follower would keep rewinding forever. Disable it on every
+        # OAMS to guarantee the rewind stops.
+        for _, oam in self.oams.items():
+            oam.set_oams_follower(0, 0)
+        self.current_state.following = False
         gcmd.respond_info("No spool is loaded in any of the OAMS")
         self.current_group = None
         return
