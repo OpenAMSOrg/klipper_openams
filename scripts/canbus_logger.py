@@ -1,6 +1,6 @@
 # Tool to log CAN bus logging protocol from OAMS
 #
-# Copyright (C) 2024-2025  JR Lomas <lomas.jr@gmail.com>
+# Copyright (C) 2024-2026  JR Lomas <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 

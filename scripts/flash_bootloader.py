@@ -3,7 +3,7 @@
 Bootloader Update Tool for Mainboard Firmware
 Uses admin CAN channel (0x3f0/0x3f1) to flash bootloader over CAN
 
-Copyright (C) 2026
+Copyright JR Lomas (C) 2026
 This file may be distributed under the terms of the GNU GPLv3 license.
 """
 import sys

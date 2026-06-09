@@ -1,5 +1,5 @@
 # Driver for the Texas Instruments HDC1080 temperature and humidity sensor
-# Copyright (C) 2024 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
+# Copyright (C) 2024-2026 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
@@ -85,9 +85,12 @@ class HDC1080:
         return self.report_time
     
     def _init_device(self):
-        # Reset the device
-        data = [CONF_REG, 1 << 4, 0x00]
+        # Software-reset the device. The reset bit is bit 15 (CONFIG_RESET_BIT),
+        # i.e. 0x80 in the high config byte -- not 1<<4, which would instead set
+        # an unrelated mode bit and never reset.
+        data = [CONF_REG, CONFIG_RESET_BIT >> 8, 0x00]
         self.i2c.i2c_write(data)
+        self.reactor.pause(self.reactor.monotonic() + .015)
         manufacturer_id = self.read_manufacturer_id()
         device_id = self.read_device_id()
         serial_id = self.read_serial_id()
@@ -111,47 +114,46 @@ class HDC1080:
         
         self.init_sent = True
         
-    def _read_temp(self, celsius=True):
-        """ Read the temperature
-
-        Keyword arguments:
-        celsius -- If the data is kept as celsius after reading (default False)
-        """
-        # write to the pointer register, changing it to the temperature register
+    def _read_temp(self):
+        """Read the temperature in degrees Celsius, or None on an I2C error."""
         try:
+            # Point the register pointer at the temperature register and read it.
             self.i2c.i2c_write([TEMP_REG])
             self.reactor.pause(self.reactor.monotonic() + .0635)
             read = self.i2c.i2c_read([], 2)
             data = bytearray(read['response'])
             temp = (data[0] * 256) + data[1]
-            cTemp = (temp / 65536.0) * 165.0 - 40
-            return cTemp
-        except:
-            return 0.0
-        
+            return (temp / 65536.0) * 165.0 - 40
+        except Exception:
+            logging.exception("hdc1080: temperature read failed")
+            return None
+
     def _read_humi(self):
+        """Read the relative humidity in percent, or None on an I2C error."""
         try:
             self.i2c.i2c_write([HUMI_REG])
             self.reactor.pause(self.reactor.monotonic() + .0635)
             read = self.i2c.i2c_read([], 2)
             data = bytearray(read['response'])
             humidity = (data[0] * 256) + data[1]
-            percentHumidity = (humidity / 65536.0) * 100.0
-            return percentHumidity
-        except:
-            return 0.0
+            return (humidity / 65536.0) * 100.0
+        except Exception:
+            logging.exception("hdc1080: humidity read failed")
+            return None
 
     def _make_measurements(self):
         if not self.init_sent:
             logging.info("hdc1080: init not sent")
             return False
-        
-        self.temp = self._read_temp() + self.temp_offset
+        # On a transient read error keep the last good value rather than
+        # fabricating 0.0, which could spuriously trip a configured min_temp.
+        temp = self._read_temp()
+        if temp is not None:
+            self.temp = temp + self.temp_offset
         self.reactor.pause(self.reactor.monotonic() + .015)
-        self.humidity = self._read_humi() + self.humidity_offset
-        
-        #logging.info("hdc1080: temp: %s, humi: %s", self.temp, self.humidity)
-
+        humidity = self._read_humi()
+        if humidity is not None:
+            self.humidity = humidity + self.humidity_offset
         return True
 
     def _sample_hdc1080(self, eventtime):
