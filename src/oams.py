@@ -361,11 +361,22 @@ class OAMS:
             return "OAMS is busy"
         return "Spool %sing failed (code %s)" % (verb, code)
 
-    cmd_OAMS_LOAD_SPOOL_help = "Load a spool of filament on this OAMS (low level)"
+    cmd_OAMS_LOAD_SPOOL_help = "Load a specific bay on this OAMS"
 
     def cmd_OAMS_LOAD_SPOOL(self, gcmd):
-        spool_idx = gcmd.get_int("SPOOL", minval=0, maxval=3)
-        self.start_load_spool(spool_idx)
+        bay = gcmd.get_int("SPOOL", minval=0, maxval=3)
+        if self.runtime is not None:
+            # Route through the store so it is the single source of truth (and
+            # the bay gets runout protection if it belongs to a group).
+            result = self.runtime.request(
+                self.fps_name, S.LoadBay(self.fps_name, (self.oams_idx, bay))).wait()
+            if result.ok or result.code == OAMS_OP_CODE_CANCEL:
+                gcmd.respond_info(result.message)
+            else:
+                raise gcmd.error(result.message)
+            return
+        # Standalone fallback (no manager bound): bounded blocking.
+        self.start_load_spool(bay)
         self._wait_for_action()
         code = self.action_status_code
         if code in (OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL):
@@ -373,10 +384,28 @@ class OAMS:
         else:
             raise gcmd.error(self._result_message(code, "load"))
 
-    cmd_OAMS_UNLOAD_SPOOL_help = "Unload the loaded spool on this OAMS (low level)"
+    cmd_OAMS_UNLOAD_SPOOL_help = "Unload the spool loaded on this OAMS"
 
     def cmd_OAMS_UNLOAD_SPOOL(self, gcmd):
         requested = gcmd.get_int("SPOOL", None)
+        if self.runtime is not None:
+            lane = self.runtime.get_state().lanes.get(self.fps_name)
+            unit = lane.unit if lane is not None else None
+            if unit is None or unit[0] != self.oams_idx:
+                self.set_oams_follower(0, FOLLOWER_REVERSE)
+                gcmd.respond_info("No spool loaded on this OAMS; nothing to"
+                                  " unload (follower stopped)")
+                return
+            if requested is not None and requested != unit[1]:
+                raise gcmd.error("Refusing to unload: spool %d is loaded on this"
+                                 " OAMS, not %d" % (unit[1], requested))
+            result = self.runtime.request(self.fps_name, S.Unload(self.fps_name)).wait()
+            if result.ok:
+                gcmd.respond_info(result.message)
+            else:
+                raise gcmd.error(result.message)  # store already stopped follower
+            return
+        # Standalone fallback (no manager bound).
         if self.current_spool is None:
             self.set_oams_follower(0, FOLLOWER_REVERSE)
             gcmd.respond_info("No spool is currently loaded on this OAMS; nothing"

@@ -104,6 +104,32 @@ class LoadTests(unittest.TestCase):
         self.assertFalse(has(fx, S.SetFollower))  # nothing to rewind on a load
 
 
+class LoadBayTests(unittest.TestCase):
+    def test_load_bay_starts_and_resolves_group(self):
+        sys0 = system(S.LaneState(op=S.OP_UNLOADED))
+        sys1, fx = S.reduce(sys0, S.LoadBay(FPS, BAY_B), world(), now=0.0)
+        lane = lane_of(sys1)
+        self.assertEqual(lane.op, S.OP_LOADING)
+        self.assertEqual(lane.unit, BAY_B)
+        self.assertEqual(lane.group, GROUP)              # resolved from group_bays
+        self.assertEqual(find(fx, S.StartLoad)[0].unit, BAY_B)
+
+    def test_load_bay_completion(self):
+        sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_B, group=GROUP))
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS),
+                            world(), now=1.0)
+        self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
+        self.assertEqual(lane_of(sys1).unit, BAY_B)
+
+    def test_load_bay_rejected_when_busy(self):
+        sys0 = system(S.LaneState(op=S.OP_LOADED, unit=BAY_A, group=GROUP))
+        sys1, fx = S.reduce(sys0, S.LoadBay(FPS, BAY_B), world(), now=0.0)
+        self.assertEqual(lane_of(sys1).op, S.OP_LOADED)   # unchanged
+        self.assertEqual(lane_of(sys1).unit, BAY_A)
+        self.assertFalse(has(fx, S.StartLoad))
+        self.assertFalse(find(fx, S.Settle)[0].result.ok)
+
+
 class UnloadTests(unittest.TestCase):
     def test_unload_starts(self):
         sys0 = system(S.LaneState(op=S.OP_LOADED, unit=BAY_A, group=GROUP))

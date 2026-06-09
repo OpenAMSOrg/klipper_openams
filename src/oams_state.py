@@ -110,6 +110,14 @@ class Load:
     group: str = ""
 
 @dataclass(frozen=True)
+class LoadBay:
+    # Low-level: load a specific (oams_idx, bay) directly (OAMS_LOAD_SPOOL),
+    # bypassing group selection. The group, if the bay belongs to one, is
+    # resolved so runout protection still applies.
+    fps: str = ""
+    unit: Tuple[int, int] = (0, 0)
+
+@dataclass(frozen=True)
 class Unload:
     fps: str = ""
 
@@ -237,6 +245,14 @@ def _resync_lane(lw, now):
     return LaneState(op=OP_UNLOADED, since=now)
 
 
+def _group_of(lw, unit):
+    """The group on this lane that contains `unit`, or None."""
+    for group, bays in lw.group_bays.items():
+        if unit in bays:
+            return group
+    return None
+
+
 def _reduce_lane(lane, action, lw, now, fps):
     op = lane.op
 
@@ -254,6 +270,17 @@ def _reduce_lane(lane, action, lw, now, fps):
                 return nl, [StartLoad(unit), ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
         return lane, [Settle(fps, OpResult(False, None,
                       "no ready spool in group %s" % action.group))]
+
+    if isinstance(action, LoadBay):
+        if op != OP_UNLOADED:
+            return lane, [Settle(fps, OpResult(False, None,
+                          "lane busy (%s)" % op))]
+        unit = action.unit
+        nl = replace(lane, op=OP_LOADING, group=_group_of(lw, unit), unit=unit,
+                     runout=RUNOUT_IDLE, pause_origin=None, coast_origin=None,
+                     reload_target=None, op_deadline=now + OAMS_ACTION_TIMEOUT,
+                     since=now, message=None)
+        return nl, [StartLoad(unit), ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
 
     if isinstance(action, Unload):
         if op != OP_LOADED or lane.unit is None:
