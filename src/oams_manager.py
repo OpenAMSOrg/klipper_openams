@@ -1,63 +1,19 @@
-# OpenAMS Manager
+# OpenAMS Manager — the system adapter
 #
 # Copyright (C) 2025-2026 JR Lomas <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# The manager is the thin Klipper-facing layer of the system. It builds the FPS
+# lane topology from config, owns the runtime (the store + effect executor),
+# exposes the OAMSM_* gcode commands and webhooks, and drives the monitor tick.
+# All decision logic lives in the pure reducer (oams_state.py); all side effects
+# run in the runtime (oams_runtime.py).
 
 import logging
-from collections import deque
 
-from .oams import (
-    OAMS_OP_CODE_SUCCESS,
-    OAMS_OP_CODE_ERROR_UNSPECIFIED,
-    OAMS_ACTION_TIMEOUT,
-    POLL_INTERVAL,
-    FOLLOWER_FORWARD,
-    FOLLOWER_REVERSE,
-)
-
-# How often the monitor timer wakes up.
-MONITOR_INTERVAL = 1.0
-
-# Distance (mm of extrusion) to keep feeding after a hub runout is detected,
-# before letting the follower coast so the tail clears the hub.
-PAUSE_DISTANCE = 60.0
-# The configured PTFE path length is divided by this factor to decide when
-# enough of the old filament has been consumed to start loading the next spool.
-# It bakes in the ratio between the firmware "clicks" path length and the
-# extruder mm travelled, plus a safety margin so the new tip arrives just before
-# the toolhead runs dry.
-FILAMENT_PATH_LENGTH_FACTOR = 1.14
-
-# Stall detection while loading/unloading.
-ENCODER_SAMPLES = 2
-MIN_ENCODER_DIFF = 1
-MONITOR_LOADING_SPEED_AFTER = 2.0    # seconds before sampling begins
-MONITOR_UNLOADING_SPEED_AFTER = 2.0  # seconds before sampling begins
-
-# Top-level operating states.
-STATE_UNLOADED = "UNLOADED"
-STATE_LOADED = "LOADED"
-STATE_LOADING = "LOADING"
-STATE_UNLOADING = "UNLOADING"
-STATE_PAUSED = "PAUSED"
-
-# Runout sub-state machine (only relevant while STATE_LOADED and printing).
-RUNOUT_IDLE = "idle"
-RUNOUT_PAUSING = "pausing"      # feeding PAUSE_DISTANCE before coasting
-RUNOUT_COASTING = "coasting"    # follower coasting, consuming the old tail
-RUNOUT_LOADING = "loading"      # next spool load in flight (non-blocking)
-
-
-class OAMSState:
-    """Lean snapshot of what the manager is doing right now."""
-    def __init__(self):
-        self.name = STATE_UNLOADED
-        self.since = 0.0
-        # The (oam, bay_index) tuple the current operation concerns, or None.
-        self.current_unit = None
-        self.following = False
-        self.direction = FOLLOWER_FORWARD
+from . import oams_state as S
+from .oams_runtime import Runtime
 
 
 class OAMSManager:
@@ -65,321 +21,184 @@ class OAMSManager:
         self.config = config
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
+        self.reload_before = config.getfloat("reload_before_toolhead_distance", 0.0)
 
-        self.filament_groups = {}
-        self.oams = {}
-        self._initialize_oams()
-        self._initialize_filament_groups()
+        self._build_topology()
 
-        # "What is loaded" is tracked in exactly one place at the manager level:
-        # current_group (logical group name) + current_unit ((oam, bay) tuple).
-        # The authoritative ground truth on startup/clear is always the hub HES
-        # hardware sensor (see determine_current_loaded_group).
-        self.current_group = None
-        self.current_unit = None
-        self.current_state = OAMSState()
-
-        self.reload_before_toolhead_distance = config.getfloat(
-            "reload_before_toolhead_distance", 0.0)
-
-        # Stall-detection samples; reset at the start of each load/unload.
-        self.encoder_samples = deque(maxlen=ENCODER_SAMPLES)
-
-        # Single monitor timer (registered in start_monitors); never leaks.
-        self.monitor_timer = None
-        self._reset_runout()
-
-        # Cached object references (resolved at klippy:ready).
-        self.extruder = None
         self.idle_timeout = None
-
-        self._load_cancel_requested = False
+        self.monitor_timer = None
         self.ready = False
 
-        self.fps = self.printer.lookup_object("fps")
-        self.webhooks = self.printer.lookup_object("webhooks")
-        self.webhooks.register_endpoint("openams/status", self._webhook_status)
-        self.webhooks.register_endpoint("openams/cancel_load",
-                                        self._webhook_cancel_load)
+        # The store + effect executor. Each OAMS is bound so its firmware replies
+        # become OpCompleted actions on its lane.
+        self.runtime = Runtime(self.printer, list(self.fpss.keys()),
+                               self.build_world, self.oam_by_idx.get)
+        for oam in self.oams.values():
+            oam.bind_runtime(self.runtime, oam.fps_name)
+
+        webhooks = self.printer.lookup_object("webhooks")
+        webhooks.register_endpoint("openams/status", self._webhook_status)
+        webhooks.register_endpoint("openams/cancel_load", self._webhook_cancel_load)
 
         self.register_commands()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
-    # ------------------------------------------------------------ bootstrap
+    # --------------------------------------------------------------- topology
 
-    def _initialize_oams(self):
+    def _build_topology(self):
+        # FPS lanes, keyed by short name.
+        self.fpss = {}
+        for _, fps in self.printer.lookup_objects(module="fps"):
+            self.fpss[fps.fps_name] = fps
+        if not self.fpss:
+            raise self.config.error(
+                "No [fps] section found; OpenAMS requires at least one FPS.")
+        sole_fps = next(iter(self.fpss)) if len(self.fpss) == 1 else None
+
+        # OAMS units + lane assignment.
+        self.oams = {}
+        self.oam_by_idx = {}
+        self.lane_oams = {name: [] for name in self.fpss}
         for name, oam in self.printer.lookup_objects(module="oams"):
             self.oams[name] = oam
+            fps_name = oam.fps_name or sole_fps
+            if fps_name is None:
+                raise self.config.error(
+                    "%s must set 'fps:' when multiple [fps] are defined" % name)
+            if fps_name not in self.fpss:
+                raise self.config.error(
+                    "%s references unknown fps '%s'" % (name, fps_name))
+            oam.fps_name = fps_name
+            self.lane_oams[fps_name].append(oam)
+            self.oam_by_idx[oam.oams_idx] = oam
 
-    def _initialize_filament_groups(self):
+        # Filament groups -> lane + per-lane (oams_idx, bay) lists. A group's bays
+        # must all live on one FPS lane (invariant G1).
+        self.filament_groups = {}
+        self.group_lane = {}
+        self.groups_by_lane = {name: {} for name in self.fpss}
         seen = set()
         for name, group in self.printer.lookup_objects(module="filament_group"):
-            group_name = name.split()[-1]
-            if group_name in seen:
+            gname = name.split()[-1]
+            if gname in seen:
                 raise self.config.error(
-                    "Duplicate filament_group '%s' found. Filament group names"
-                    " must be unique." % group_name)
-            seen.add(group_name)
-            logging.info("OAMS: adding group %s", group_name)
-            self.filament_groups[group_name] = group
-
-    def handle_ready(self):
-        self.extruder = self.printer.lookup_object("extruder")
-        self.idle_timeout = self.printer.lookup_object("idle_timeout")
-        self.determine_state()
-        self.start_monitors()
-        self.ready = True
-
-    # --------------------------------------------------------------- status
-
-    def get_status(self, eventtime):
-        return {"current_group": self.current_group}
-
-    def _webhook_status(self, request):
-        status = {
-            "ready": self.ready,
-            "current_group": self.current_group,
-            "units": len(self.oams),
-            "fps_value": self.fps.get_value(),
-            "filament_groups": {},
-        }
-        for group_name, group in self.filament_groups.items():
-            status["filament_groups"][group_name] = {
-                "bays": len(group.bays),
-                "spools": ["oams%d-%d" % (oam.oams_idx, bay)
-                           for (oam, bay) in group.bays],
-            }
-        request.send({"status": {"openams": status}})
-
-    def _webhook_cancel_load(self, request):
-        if self.current_state.name == STATE_LOADING:
-            self._load_cancel_requested = True
-            request.send({"result": "cancel requested"})
-        else:
-            request.send({"result": "no load in progress"})
-
-    # ---------------------------------------------------- shared state helpers
-
-    def _enter_state(self, name, unit):
-        self.current_state.name = name
-        self.current_state.since = self.reactor.monotonic()
-        self.current_state.current_unit = unit
-        # Fresh stall-detection window for the new operation.
-        self.encoder_samples.clear()
-
-    def _reset_runout(self):
-        self.runout_phase = RUNOUT_IDLE
-        self._runout_pause_origin = None
-        self._runout_coast_origin = None
-        self._reload_oam = None
-        self._reload_bay = None
-        self._reload_deadline = None
-
-    def _clear_loaded_state(self):
-        self.current_group = None
-        self.current_unit = None
-
-    def determine_current_loaded_group(self):
-        for group_name, group in self.filament_groups.items():
+                    "Duplicate filament_group '%s'; names must be unique." % gname)
+            seen.add(gname)
+            self.filament_groups[gname] = group
+            lane = None
+            bays = []
             for (oam, bay) in group.bays:
-                if oam.is_bay_loaded(bay):
-                    return group_name, oam, bay
-        return None, None, None
+                oam_fps = oam.fps_name
+                if lane is None:
+                    lane = oam_fps
+                elif lane != oam_fps:
+                    raise self.config.error(
+                        "filament_group '%s' spans multiple FPS lanes (%s and %s);"
+                        " a group's bays must share one FPS" % (gname, lane, oam_fps))
+                bays.append((oam.oams_idx, bay))
+            if lane is not None:
+                self.group_lane[gname] = lane
+                self.groups_by_lane[lane][gname] = tuple(bays)
+            logging.info("OAMS: group %s on lane %s -> %s", gname, lane, bays)
 
-    def determine_state(self):
-        """Resync manager state from the hub HES hardware (the source of truth)."""
-        self._reset_runout()
-        group_name, oam, bay = self.determine_current_loaded_group()
-        if oam is not None:
-            self.current_group = group_name
-            self.current_unit = (oam, bay)
-            self._enter_state(STATE_LOADED, self.current_unit)
-        else:
-            self._clear_loaded_state()
-            self._enter_state(STATE_UNLOADED, None)
-            # Nothing is loaded, so no follower should run. The firmware keeps a
-            # follower active across a host restart, so an aborted unload could
-            # otherwise leave one rewinding forever ("restart didn't help").
-            self._stop_all_followers()
+    # ------------------------------------------------------------- world build
 
-    def is_printer_loaded(self):
-        return self._loaded_oam() is not None
-
-    def _loaded_oam(self):
-        for _, oam in self.oams.items():
-            if oam.current_spool is not None:
-                return oam
-        return None
-
-    def _stop_all_followers(self):
-        for _, oam in self.oams.items():
-            try:
-                oam.set_oams_follower(0, FOLLOWER_REVERSE)
-            except Exception:
-                logging.exception("OAMS: could not stop follower on %s", oam.name)
-
-    def _is_printing(self, eventtime):
+    def _is_printing(self, now):
         if self.idle_timeout is None:
             return False
-        return self.idle_timeout.get_status(eventtime)["state"] == "Printing"
+        return self.idle_timeout.get_status(now)["state"] == "Printing"
 
-    def _pause_print(self, reason):
-        logging.info("OAMS: pausing print: %s", reason)
-        try:
-            gcode = self.printer.lookup_object("gcode")
-            gcode.run_script("M118 OAMS: %s" % reason)
-            gcode.run_script("M117 OAMS paused")
-            gcode.run_script("PAUSE")
-        except Exception:
-            # Never let a failing PAUSE escape a reactor timer callback.
-            logging.exception("OAMS: failed to issue PAUSE")
+    def build_world(self, now):
+        printing = self._is_printing(now)
+        lanes = {}
+        for fps_name, fps in self.fpss.items():
+            loaded, ready, path_len = {}, {}, {}
+            for oam in self.lane_oams[fps_name]:
+                for bay in range(4):
+                    key = (oam.oams_idx, bay)
+                    loaded[key] = bool(oam.hub_hes_value[bay])
+                    ready[key] = bool(oam.f1s_hes_value[bay])
+                path_len[oam.oams_idx] = oam.filament_path_length
+            epos = fps.extruder.last_position if fps.extruder is not None else 0.0
+            lanes[fps_name] = S.LaneWorld(
+                extruder_pos=epos, printing=printing, loaded=loaded, ready=ready,
+                group_bays=self.groups_by_lane.get(fps_name, {}),
+                path_len=path_len, reload_before=self.reload_before)
+        return S.World(lanes=lanes)
 
-    # ------------------------------------------------------------- monitors
+    # ----------------------------------------------------------------- ready
 
-    def start_monitors(self):
-        self.stop_monitors()
+    def handle_ready(self):
+        self.idle_timeout = self.printer.lookup_object("idle_timeout")
+        # Resync every lane from the hub HES hardware (the source of truth).
+        self.runtime.dispatch(S.ClearErrors())
+        self.start_monitor()
+        self.ready = True
+
+    def start_monitor(self):
+        self.stop_monitor()
         self.monitor_timer = self.reactor.register_timer(
             self._monitor, self.reactor.NOW)
         logging.info("OAMS: monitor started")
 
-    def stop_monitors(self):
+    def stop_monitor(self):
         if self.monitor_timer is not None:
             self.reactor.unregister_timer(self.monitor_timer)
             self.monitor_timer = None
 
     def _monitor(self, eventtime):
-        # One always-on timer drives all monitoring. It never returns NEVER, so
-        # it is never re-registered and cannot leak or fork into parallel chains.
         try:
-            name = self.current_state.name
-            if name == STATE_UNLOADING:
-                self._check_speed(eventtime, MONITOR_UNLOADING_SPEED_AFTER,
-                                  "unloading")
-            elif name == STATE_LOADING:
-                self._check_speed(eventtime, MONITOR_LOADING_SPEED_AFTER,
-                                  "loading")
-            elif name == STATE_LOADED:
-                self._service_runout(eventtime)
+            self.runtime.tick()
         except Exception:
             logging.exception("OAMS: monitor tick failed")
-        return eventtime + MONITOR_INTERVAL
+        return eventtime + S.MONITOR_INTERVAL
 
-    def _check_speed(self, eventtime, after, what):
-        unit = self.current_state.current_unit
-        if unit is None:
-            return
-        if self.reactor.monotonic() - self.current_state.since <= after:
-            return
-        oam, bay = unit
-        self.encoder_samples.append(oam.encoder_clicks)
-        if len(self.encoder_samples) < ENCODER_SAMPLES:
-            return
-        diff = abs(self.encoder_samples[-1] - self.encoder_samples[0])
-        logging.info("OAMS[%d] %s monitor: encoder diff %d",
-                     oam.oams_idx, what, diff)
-        if diff < MIN_ENCODER_DIFF:
-            oam.set_led_error(bay, 1)
-            self._pause_print("%s speed too low" % what)
-            self.current_state.name = STATE_PAUSED
+    # --------------------------------------------------------------- status
 
-    # ----------------------------------------------------- runout/auto-reload
+    def _lane_status(self, lane):
+        return {"op": lane.op, "group": lane.group, "unit": lane.unit,
+                "runout": lane.runout, "following": lane.following,
+                "since": lane.since, "message": lane.message}
 
-    def _service_runout(self, eventtime):
-        phase = self.runout_phase
+    def get_status(self, eventtime):
+        state = self.runtime.get_state()
+        lanes = {fps: self._lane_status(lane) for fps, lane in state.lanes.items()}
+        # Back-compat: current_group is the group on the first loaded lane.
+        current_group = None
+        for lane in state.lanes.values():
+            if lane.op == S.OP_LOADED and lane.group:
+                current_group = lane.group
+                break
+        return {"current_group": current_group, "lanes": lanes}
 
-        if phase == RUNOUT_IDLE:
-            if (self._is_printing(eventtime) and self.current_unit is not None
-                    and not self._unit_loaded(self.current_unit)):
-                logging.info("OAMS: runout detected on group %s; feeding %.0fmm"
-                             " before coasting", self.current_group, PAUSE_DISTANCE)
-                self._runout_pause_origin = self.extruder.last_position
-                self.runout_phase = RUNOUT_PAUSING
-            return
+    def _webhook_status(self, request):
+        state = self.runtime.get_state()
+        status = {"ready": self.ready, "units": len(self.oams),
+                  "fps": {}, "lanes": {}, "filament_groups": {}}
+        for fps_name, fps in self.fpss.items():
+            status["fps"][fps_name] = {"value": fps.get_value(),
+                                       "extruder": fps.extruder_name}
+        for fps_name, lane in state.lanes.items():
+            status["lanes"][fps_name] = self._lane_status(lane)
+        for gname, group in self.filament_groups.items():
+            status["filament_groups"][gname] = {
+                "lane": self.group_lane.get(gname),
+                "bays": ["oams%d-%d" % (oam.oams_idx, bay)
+                         for (oam, bay) in group.bays]}
+        request.send({"status": {"openams": status}})
 
-        # All later phases need a loaded unit; bail safely if it vanished (e.g. a
-        # manual unload happened mid-runout).
-        if self.current_unit is None:
-            self._reset_runout()
-            return
+    def _webhook_cancel_load(self, request):
+        state = self.runtime.get_state()
+        loading = [fps for fps, lane in state.lanes.items()
+                   if lane.op == S.OP_LOADING]
+        if loading:
+            for fps in loading:
+                self.runtime.dispatch(S.Cancel(fps))
+            request.send({"result": "cancel requested"})
+        else:
+            request.send({"result": "no load in progress"})
 
-        if phase == RUNOUT_PAUSING:
-            travelled = self.extruder.last_position - self._runout_pause_origin
-            if travelled >= PAUSE_DISTANCE:
-                logging.info("OAMS: pause complete, coasting the follower")
-                self.current_unit[0].set_oams_follower(0, FOLLOWER_FORWARD)
-                self._runout_coast_origin = self.extruder.last_position
-                self.runout_phase = RUNOUT_COASTING
-
-        elif phase == RUNOUT_COASTING:
-            path_length = self.current_unit[0].filament_path_length
-            if path_length <= 0:
-                # ptfe_length is uncalibrated, so the handoff distance is
-                # unknown. Pause for the user rather than loading at the wrong
-                # time. Run OAMS_CALIBRATE_PTFE_LENGTH to enable auto-reload.
-                self._pause_print(
-                    "ptfe_length is not calibrated (0); cannot auto-load the"
-                    " next spool. Run OAMS_CALIBRATE_PTFE_LENGTH.")
-                self._clear_loaded_state()
-                self._reset_runout()
-                return
-            consumed = self.extruder.last_position - self._runout_coast_origin
-            path_limit = path_length / FILAMENT_PATH_LENGTH_FACTOR
-            if (consumed + PAUSE_DISTANCE + self.reload_before_toolhead_distance
-                    > path_limit):
-                self._begin_reload(eventtime)
-
-        elif phase == RUNOUT_LOADING:
-            self._service_reload(eventtime)
-
-    def _unit_loaded(self, unit):
-        oam, bay = unit
-        return oam.is_bay_loaded(bay)
-
-    def _begin_reload(self, eventtime):
-        group = self.filament_groups.get(self.current_group)
-        ranout = self.current_unit
-        if group is not None:
-            for (oam, bay) in group.bays:
-                if (oam, bay) == ranout:
-                    continue  # never try to reload the spool that just ran out
-                if oam.is_bay_ready(bay):
-                    logging.info("OAMS: loading next spool oams%d bay %d",
-                                 oam.oams_idx, bay)
-                    oam.start_load_spool(bay)
-                    self._reload_oam = oam
-                    self._reload_bay = bay
-                    self._reload_deadline = eventtime + OAMS_ACTION_TIMEOUT
-                    self.runout_phase = RUNOUT_LOADING
-                    return
-        self._pause_print("filament runout on group %s and no spare spool"
-                          " available" % self.current_group)
-        self._clear_loaded_state()
-        self._reset_runout()
-
-    def _service_reload(self, eventtime):
-        oam, bay = self._reload_oam, self._reload_bay
-        if oam.action_status is None:
-            code, message = oam.finish_load_spool(bay)
-            if code == OAMS_OP_CODE_SUCCESS:
-                logging.info("OAMS: next spool loaded oams%d bay %d",
-                             oam.oams_idx, bay)
-                self.current_unit = (oam, bay)
-                self.current_state.current_unit = self.current_unit
-                self._reset_runout()  # back to LOADED/idle
-            else:
-                self._pause_print("failed to load next spool: %s" % message)
-                self._clear_loaded_state()
-                self._reset_runout()
-        elif eventtime >= self._reload_deadline:
-            logging.warning("OAMS: timed out loading next spool")
-            # Release the firmware op so the OAMS is not stuck "loading".
-            oam.action_status = None
-            oam.action_status_code = OAMS_OP_CODE_ERROR_UNSPECIFIED
-            self._pause_print("timed out loading next spool")
-            self._clear_loaded_state()
-            self._reset_runout()
-
-    # -------------------------------------------------------------- commands
+    # --------------------------------------------------------------- commands
 
     def register_commands(self):
         gcode = self.printer.lookup_object("gcode")
@@ -398,119 +217,105 @@ class OAMSManager:
         ):
             gcode.register_command(name, handler, desc=desc)
 
+    def _resolve_fps(self, gcmd, prefer_op=None):
+        """Resolve which FPS lane a command targets. Optional FPS= parameter;
+        defaults to the sole lane, or (when ambiguous) the single lane currently
+        in prefer_op. Returns the fps name, or None after responding to gcmd."""
+        name = gcmd.get("FPS", None)
+        if name is not None:
+            if name not in self.fpss:
+                raise gcmd.error("Unknown FPS '%s'" % name)
+            return name
+        if len(self.fpss) == 1:
+            return next(iter(self.fpss))
+        if prefer_op is not None:
+            state = self.runtime.get_state()
+            match = [fps for fps, lane in state.lanes.items()
+                     if lane.op == prefer_op]
+            if len(match) == 1:
+                return match[0]
+        gcmd.respond_info("Multiple FPS present; specify FPS=<name>")
+        return None
+
     cmd_CLEAR_ERRORS_help = "Clear the error state of the OAMS"
 
     def cmd_CLEAR_ERRORS(self, gcmd):
-        self.stop_monitors()
-        self.encoder_samples.clear()
-        for _, oam in self.oams.items():
+        self.stop_monitor()
+        for oam in self.oams.values():
             oam.clear_errors()
-        self.determine_state()
-        self.start_monitors()
+        self.runtime.dispatch(S.ClearErrors())
+        self.start_monitor()
 
-    cmd_CURRENT_LOADED_GROUP_help = "Get the current loaded group"
+    cmd_CURRENT_LOADED_GROUP_help = "Report the currently loaded group(s)"
 
     def cmd_CURRENT_LOADED_GROUP(self, gcmd):
-        group_name, _, _ = self.determine_current_loaded_group()
-        gcmd.respond_info(group_name if group_name is not None
-                          else "No group is currently loaded")
+        state = self.runtime.get_state()
+        loaded = {fps: lane.group for fps, lane in state.lanes.items()
+                  if lane.op == S.OP_LOADED and lane.group}
+        if not loaded:
+            gcmd.respond_info("No group is currently loaded")
+        elif len(loaded) == 1:
+            gcmd.respond_info(next(iter(loaded.values())))
+        else:
+            gcmd.respond_info(", ".join("%s=%s" % (f, g)
+                                        for f, g in loaded.items()))
 
-    cmd_FOLLOWER_help = "Enable the follower on whichever OAMS is loaded"
+    cmd_FOLLOWER_help = "Enable the follower on whichever OAMS is loaded on a lane"
 
     def cmd_FOLLOWER(self, gcmd):
         enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
         direction = gcmd.get_int("DIRECTION", minval=0, maxval=1)
-        oam = self._loaded_oam()
-        if oam is None:
-            gcmd.respond_info("No spool is currently loaded")
+        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADED)
+        if fps is None:
             return
-        oam.set_oams_follower(enable, direction)
-        self.current_state.following = bool(enable)
-        self.current_state.direction = direction
+        lane = self.runtime.get_state().lanes[fps]
+        if lane.unit is None:
+            gcmd.respond_info("No spool is currently loaded on lane %s" % fps)
+            return
+        oam = self.oam_by_idx.get(lane.unit[0])
+        if oam is not None:
+            oam.set_oams_follower(enable, direction)
 
-    cmd_LOAD_FILAMENT_CANCEL_help = "Cancel the current load filament operation"
+    cmd_LOAD_FILAMENT_CANCEL_help = "Cancel the in-flight load on a lane"
 
     def cmd_LOAD_FILAMENT_CANCEL(self, gcmd):
-        unit = self.current_state.current_unit
-        if self.current_state.name == STATE_LOADING and unit is not None:
-            gcmd.respond_info(unit[0].load_spool_cancel())
+        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADING)
+        if fps is None:
+            return
+        lane = self.runtime.get_state().lanes[fps]
+        if lane.op == S.OP_LOADING:
+            self.runtime.dispatch(S.Cancel(fps))
+            gcmd.respond_info("Load cancel requested on lane %s" % fps)
         else:
-            gcmd.respond_info("No load filament operation is currently in progress")
+            gcmd.respond_info("No load filament operation is in progress")
 
-    cmd_UNLOAD_FILAMENT_help = "Unload a spool from any of the OAMS if any is loaded"
+    cmd_UNLOAD_FILAMENT_help = "Unload the spool loaded on a lane"
 
     def cmd_UNLOAD_FILAMENT(self, gcmd):
-        self._reset_runout()
-        oam = self._loaded_oam()
-        if oam is None:
-            # SAFE_UNLOAD_FILAMENT enables the follower in the rewind direction
-            # before calling this command; stop it so it cannot keep rewinding.
-            self._stop_all_followers()
-            self._clear_loaded_state()
-            self._enter_state(STATE_UNLOADED, None)
-            gcmd.respond_info("No spool is loaded in any of the OAMS")
+        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADED)
+        if fps is None:
             return
-        self._enter_state(STATE_UNLOADING, (oam, oam.current_spool))
-        code, message = oam.unload_spool()
-        if code == OAMS_OP_CODE_SUCCESS:
-            self._clear_loaded_state()
-            self._enter_state(STATE_UNLOADED, None)
-        else:
-            # Unload did not complete; stop the follower so it cannot keep
-            # rewinding, and keep reporting the spool as still loaded.
-            oam.set_oams_follower(0, FOLLOWER_REVERSE)
-            self._enter_state(STATE_LOADED, (oam, oam.current_spool))
-            gcmd.respond_info(message)
+        lane = self.runtime.get_state().lanes[fps]
+        if lane.op != S.OP_LOADED:
+            # SAFE_UNLOAD_FILAMENT enables the follower (rewind) before calling
+            # us; if nothing is loaded, stop it so it cannot keep rewinding.
+            for oam in self.lane_oams[fps]:
+                oam.set_oams_follower(0, S.FOLLOWER_REVERSE)
+            gcmd.respond_info("No spool is loaded on lane %s (follower stopped)"
+                              % fps)
+            return
+        result = self.runtime.request(fps, S.Unload(fps)).wait()
+        gcmd.respond_info(result.message)
 
-    cmd_LOAD_FILAMENT_help = "Load a spool from a specific group"
+    cmd_LOAD_FILAMENT_help = "Load a spool from a group (lane inferred from group)"
 
     def cmd_LOAD_FILAMENT(self, gcmd):
-        self._reset_runout()
-        if self.is_printer_loaded():
-            gcmd.respond_info("Printer is already loaded with a spool")
-            return
-        group_name = gcmd.get("GROUP")
-        group = self.filament_groups.get(group_name)
-        if group is None:
-            raise gcmd.error("Group %s does not exist" % group_name)
-        for (oam, bay) in group.bays:
-            if not oam.is_bay_ready(bay):
-                continue
-            self._enter_state(STATE_LOADING, (oam, bay))
-            self._load_cancel_requested = False
-            oam.start_load_spool(bay)
-            self._wait_for_load_or_cancel(oam)
-            code, message = oam.finish_load_spool(bay)
-            logging.info("OAMS[%d] load result: code=%s msg=%s",
-                         oam.oams_idx, code, message)
-            if code == OAMS_OP_CODE_SUCCESS:
-                self.current_group = group_name
-                self.current_unit = (oam, bay)
-                self._enter_state(STATE_LOADED, self.current_unit)
-                gcmd.respond_info(message)
-            else:
-                # CANCEL or error: nothing is seated, so do not record a load.
-                self._clear_loaded_state()
-                self._enter_state(STATE_UNLOADED, None)
-                gcmd.respond_info(message)
-            return
-        gcmd.respond_info("No spool available for group %s" % group_name)
-
-    def _wait_for_load_or_cancel(self, oam):
-        """Block until the load completes, a cancel is requested (via the
-        webhook), or the timeout fires. The webhook callback runs from a reactor
-        timer during reactor.pause(), so the flag is observed between polls."""
-        endtime = self.reactor.monotonic() + OAMS_ACTION_TIMEOUT
-        while oam.action_status is not None:
-            now = self.reactor.monotonic()
-            if now >= endtime:
-                oam.action_status = None
-                oam.action_status_code = OAMS_OP_CODE_ERROR_UNSPECIFIED
-                break
-            if self._load_cancel_requested:
-                self._load_cancel_requested = False
-                oam.load_spool_cancel()
-            self.reactor.pause(now + POLL_INTERVAL)
+        group = gcmd.get("GROUP")
+        fps = self.group_lane.get(group)
+        if fps is None:
+            raise gcmd.error("Group %s does not exist" % group)
+        result = self.runtime.request(fps, S.Load(fps, group)).wait()
+        gcmd.respond_info(result.message)
 
 
 def load_config(config):

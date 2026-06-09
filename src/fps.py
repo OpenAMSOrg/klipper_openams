@@ -1,16 +1,23 @@
-# Filament Buffer Pressure Sensor
+# Filament Buffer Pressure Sensor (FPS) — one feed-path lane
 #
 # Copyright (C) 2023-2026 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# An FPS is the pressure sensor + buffer that joins a lane's OAMS units to one
+# toolhead extruder. The pressure value is produced by the FPS hardware and read
+# here via the FPS MCU's ADC (host-side view; the OAMS firmware also reads the
+# same analog signal locally to run its hub-motor control). Multiple FPS may be
+# defined (one per toolhead) using named sections [fps <name>]; a single unnamed
+# [fps] also works for the common one-lane case.
 
 
 class FPS:
     def __init__(self, config):
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
-        self.name = config.get_name().split()[-1]
-        self.printer.add_object(self.name, self)
+        self.name = config.get_name()              # "fps" or "fps <name>"
+        self.fps_name = self.name.split()[-1]      # short lane key
 
         # state
         self.fps_value = 0.0
@@ -26,10 +33,13 @@ class FPS:
         self._sf_max_speed = config.getfloat('max_speed', 300.0)
         self._accel = config.getfloat('accel', 0.0)
         self._set_point = config.getfloat('set_point', 0.5)
-        # Accepted for compatibility with Kalico-based setups. Both mainline
-        # Klipper and Kalico expose the same MCU_adc.setup_adc_sample API, so it
-        # no longer changes behaviour; retained so existing configs don't error.
+        # Accepted for compatibility; mainline Klipper and Kalico share the same
+        # MCU_adc.setup_adc_sample API so this no longer changes behaviour.
         self._use_kalico = config.getboolean('use_kalico', False)
+
+        # The toolhead extruder this lane feeds (resolved at ready).
+        self.extruder_name = config.get('extruder', 'extruder')
+        self.extruder = None
 
         self.ppins = self.printer.lookup_object('pins')
         self.adc = self.ppins.setup_pin('adc', self._pin)
@@ -38,6 +48,11 @@ class FPS:
                                   sample_time=self._sample_time,
                                   sample_count=self._sample_count)
         self.adc.setup_adc_callback(self._adc_callback)
+
+        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+
+    def _handle_ready(self):
+        self.extruder = self.printer.lookup_object(self.extruder_name)
 
     def add_callback(self, callback):
         self.callbacks.append(callback)
@@ -59,4 +74,10 @@ class FPS:
 
 
 def load_config(config):
+    # Unnamed [fps] (single-lane setups).
+    return FPS(config)
+
+
+def load_config_prefix(config):
+    # Named [fps <name>] (multi-lane / IDEX / multi-tool setups).
     return FPS(config)

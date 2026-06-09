@@ -1,14 +1,35 @@
-# OpenAMS Mainboard
+# OpenAMS Mainboard (hardware driver)
 #
 # Copyright (C) 2025-2026 JR Lomas <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# OAMS is a thin hardware driver for one OpenAMS mainboard: it sends firmware
+# commands, mirrors telemetry, and reports operation completion. All system-level
+# orchestration (what is loaded, runout, follower policy) lives in the store
+# (oams_state.py) driven by the runtime (oams_runtime.py). When bound to a
+# runtime, every firmware action-status reply is turned into an OpCompleted
+# action; otherwise the blocking helpers below provide a standalone fallback for
+# the low-level OAMS_* commands.
 
 import logging
 import struct
 from math import pi
 
 import mcu
+
+from . import oams_state as S
+from .oams_state import (
+    OAMS_OP_CODE_SUCCESS,
+    OAMS_OP_CODE_ERROR_UNSPECIFIED,
+    OAMS_OP_CODE_ERROR_BUSY,
+    OAMS_OP_CODE_ERROR_KLIPPER_CALL,
+    OAMS_OP_CODE_CANCEL,
+    FOLLOWER_REVERSE,
+    FOLLOWER_FORWARD,
+    POLL_INTERVAL,
+    OAMS_ACTION_TIMEOUT,
+)
 
 # Firmware "action" identifiers reported by oams_action_status.
 OAMS_STATUS_LOADING = 0
@@ -20,77 +41,53 @@ OAMS_STATUS_STOPPED = 5
 OAMS_STATUS_CALIBRATING = 6
 OAMS_STATUS_ERROR = 7
 
-# Firmware operation result codes. NOTE: SUCCESS is 0 (falsy) -- always compare
-# result codes with "== OAMS_OP_CODE_SUCCESS", never with "if code:".
-OAMS_OP_CODE_SUCCESS = 0
-OAMS_OP_CODE_ERROR_UNSPECIFIED = 1
-OAMS_OP_CODE_ERROR_BUSY = 2
-OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY = 3
-OAMS_OP_CODE_NO_SPOOL_IN_BAY = 4
-OAMS_OP_CODE_ERROR_KLIPPER_CALL = 5
-OAMS_OP_CODE_CANCEL = 6
-
-# How often the blocking waiters re-check completion, and the upper bound on how
-# long they will wait before giving up. The timeout is a safety net: without it a
-# dropped/garbled firmware response would wedge the operation (and the print)
-# forever.
-POLL_INTERVAL = 0.1
-OAMS_ACTION_TIMEOUT = 120.0
-
-# Follower direction codes (firmware convention).
-FOLLOWER_REVERSE = 0
-FOLLOWER_FORWARD = 1
-
 
 class OAMS:
     def __init__(self, config):
         self.printer = config.get_printer()
-        # Full config-section name (e.g. "oams oams1"); needed for configfile.set.
-        self.name = config.get_name()
+        self.name = config.get_name()              # full section, e.g. "oams oams1"
         self.reactor = self.printer.get_reactor()
         self.mcu = mcu.get_printer_mcu(self.printer, config.get("mcu", "mcu"))
+
+        # FPS lane this unit belongs to (short name). Optional: the manager
+        # defaults it to the sole lane when only one FPS exists.
+        self.fps_name = config.get("fps", None)
 
         self.fps_upper_threshold = config.getfloat("fps_upper_threshold")
         self.fps_lower_threshold = config.getfloat("fps_lower_threshold")
         self.fps_is_reversed = config.getboolean("fps_is_reversed")
 
-        self.f1s_hes_on = [
-            float(x.strip()) for x in config.get("f1s_hes_on").split(",")
-        ]
+        self.f1s_hes_on = [float(x.strip())
+                           for x in config.get("f1s_hes_on").split(",")]
         self.f1s_hes_is_above = config.getboolean("f1s_hes_is_above")
-        self.hub_hes_on = [
-            float(x.strip()) for x in config.get("hub_hes_on").split(",")
-        ]
+        self.hub_hes_on = [float(x.strip())
+                           for x in config.get("hub_hes_on").split(",")]
         self.hub_hes_is_above = config.getboolean("hub_hes_is_above")
-        # PTFE path length in firmware clicks. 0 is allowed: a fresh machine must
-        # boot uncalibrated so OAMS_CALIBRATE_PTFE_LENGTH can be run. The runout
-        # auto-reload guards against an uncalibrated (<= 0) length rather than
-        # rejecting it here (see OAMSManager._service_runout).
+        # 0 is allowed so a fresh machine can boot and run
+        # OAMS_CALIBRATE_PTFE_LENGTH; the runout logic guards an uncalibrated
+        # (<= 0) length rather than rejecting it here.
         self.filament_path_length = config.getfloat("ptfe_length")
         self.oams_idx = config.getint("oams_idx")
 
         self.kd = config.getfloat("kd", 0.0)
         self.ki = config.getfloat("ki", 0.0)
         self.kp = config.getfloat("kp", 6.0)
-
         self.current_kp = config.getfloat("current_kp", 0.375)
         self.current_ki = config.getfloat("current_ki", 0.0)
         self.current_kd = config.getfloat("current_kd", 0.0)
-
         self.fps_target = config.getfloat(
             "fps_target", 0.5, minval=0.0, maxval=1.0,
-            above=self.fps_lower_threshold, below=self.fps_upper_threshold,
-        )
+            above=self.fps_lower_threshold, below=self.fps_upper_threshold)
         self.current_target = config.getfloat(
-            "current_target", 0.3, minval=0.1, maxval=0.4
-        )
+            "current_target", 0.3, minval=0.1, maxval=0.4)
 
         # Index of the spool currently loaded through the hub (0..3), or None.
+        # This is the driver's own firmware mirror, kept in step with the
+        # commands this unit issues (see _apply_action_status).
         self.current_spool = None
+        self._pending_bay = None
 
-        # Firmware command handles, resolved at klippy:connect. Pre-set to None so
-        # a missing/older-firmware command degrades gracefully instead of raising
-        # AttributeError the first time it is referenced.
+        # Firmware command handles (resolved at klippy:connect; None until then).
         self.oams_load_spool_cmd = None
         self.oams_unload_spool_cmd = None
         self.oams_load_spool_cancel_cmd = None
@@ -108,19 +105,18 @@ class OAMS:
         self.f1s_hes_value = [0, 0, 0, 0]
         self.hub_hes_value = [0, 0, 0, 0]
 
-        # Completion signalling for blocking operations (load/unload/calibrate).
-        #
-        # Threading model: firmware messages are dispatched on the serial reader
-        # thread. The high-rate sensor handler updates whole-list references
-        # atomically (safe to read from the reactor thread). The action-status
-        # handler instead marshals onto the reactor thread via
-        # register_async_callback, so action_status / _code / _value are only ever
-        # written on the reactor thread -- the same thread the waiters poll on --
-        # which removes the read/write race entirely. action_status is always
-        # published last so a waiter that observes "done" sees a settled code.
+        # Completion signalling. Only written on the reactor thread: the serial
+        # reader thread marshals every action-status message onto the reactor via
+        # register_async_callback (see _action_status_received), and the sentinel
+        # action_status is published last so a waiter sees a settled code.
         self.action_status = None
         self.action_status_code = None
         self.action_status_value = None
+
+        # Set by the manager via bind_runtime(); turns firmware replies into store
+        # actions. None when running the low-level commands standalone.
+        self.runtime = None
+        self.on_action_complete = None
 
         self.mcu.register_serial_response(
             self._action_status_received,
@@ -138,6 +134,15 @@ class OAMS:
 
         self.register_commands()
         self.printer.register_event_handler("klippy:connect", self.handle_connect)
+
+    # ------------------------------------------------------- runtime binding
+
+    def bind_runtime(self, runtime, fps_name):
+        """Called by the manager so firmware replies feed the store."""
+        self.runtime = runtime
+        self.fps_name = fps_name
+        self.on_action_complete = (
+            lambda code, value: runtime.dispatch(S.OpCompleted(fps_name, code, value)))
 
     # ------------------------------------------------------------------ status
 
@@ -172,11 +177,9 @@ class OAMS:
                    self.i_value))
 
     def get_webhook_status(self):
-        f1s = self.f1s_hes_value
-        hub = self.hub_hes_value
+        f1s, hub = self.f1s_hes_value, self.hub_hes_value
         return {
-            "current_spool": self.current_spool,
-            "fps_value": self.fps_value,
+            "current_spool": self.current_spool, "fps_value": self.fps_value,
             "f1s_hes_value_0": f1s[0], "f1s_hes_value_1": f1s[1],
             "f1s_hes_value_2": f1s[2], "f1s_hes_value_3": f1s[3],
             "hub_hes_value_0": hub[0], "hub_hes_value_1": hub[1],
@@ -197,9 +200,8 @@ class OAMS:
                 self.oams_load_spool_cancel_cmd = self.mcu.lookup_command(
                     "oams_cmd_load_spool_cancel")
             except Exception as e:
-                logging.warning(
-                    "OAMS: load-spool-cancel command unavailable (update"
-                    " firmware to enable cancellation): %s", e)
+                logging.warning("OAMS: load-spool-cancel command unavailable"
+                                " (update firmware): %s", e)
             self.oams_follower_cmd = self.mcu.lookup_command(
                 "oams_cmd_follower enable=%c direction=%c")
             self.oams_calibrate_ptfe_length_cmd = self.mcu.lookup_command(
@@ -247,33 +249,29 @@ class OAMS:
              self.cmd_OAMS_LOAD_SPOOL_help),
             ("OAMS_UNLOAD_SPOOL", self.cmd_OAMS_UNLOAD_SPOOL,
              self.cmd_OAMS_UNLOAD_SPOOL_help),
-            ("OAMS_FOLLOWER", self.cmd_OAMS_FOLLOWER,
-             self.cmd_OAMS_FOLLOWER_help),
+            ("OAMS_FOLLOWER", self.cmd_OAMS_FOLLOWER, self.cmd_OAMS_FOLLOWER_help),
             ("OAMS_CALIBRATE_PTFE_LENGTH", self.cmd_OAMS_CALIBRATE_PTFE_LENGTH,
              self.cmd_OAMS_CALIBRATE_PTFE_LENGTH_help),
             ("OAMS_CALIBRATE_HUB_HES", self.cmd_OAMS_CALIBRATE_HUB_HES,
              self.cmd_OAMS_CALIBRATE_HUB_HES_help),
             ("OAMS_PID_AUTOTUNE", self.cmd_OAMS_PID_AUTOTUNE,
              self.cmd_OAMS_PID_AUTOTUNE_help),
-            ("OAMS_PID_SET", self.cmd_OAMS_PID_SET,
-             self.cmd_OAMS_PID_SET_help),
+            ("OAMS_PID_SET", self.cmd_OAMS_PID_SET, self.cmd_OAMS_PID_SET_help),
             ("OAMS_CURRENT_PID_SET", self.cmd_OAMS_CURRENT_PID_SET,
              self.cmd_OAMS_CURRENT_PID_SET_help),
         ):
             gcode.register_mux_command(name, "OAMS", oams_id, handler, desc=desc)
 
-    # ------------------------------------------------------- completion waiter
+    # ------------------------------------------------ standalone blocking wait
 
     def _wait_for_action(self, timeout=OAMS_ACTION_TIMEOUT):
-        """Block the calling reactor greenlet until the in-flight firmware
-        action completes, or until `timeout` seconds elapse. On timeout a failure
-        code is synthesized so callers never hang on a lost/garbled response."""
+        """Bounded wait used by the low-level OAMS_* commands when no runtime is
+        driving completion. Times out instead of hanging on a lost reply."""
         endtime = self.reactor.monotonic() + timeout
         while self.action_status is not None:
             if self.reactor.monotonic() >= endtime:
-                logging.warning(
-                    "OAMS[%s]: timed out waiting for firmware action status",
-                    self.oams_idx)
+                logging.warning("OAMS[%s]: timed out waiting for firmware status",
+                                self.oams_idx)
                 self.action_status_code = OAMS_OP_CODE_ERROR_UNSPECIFIED
                 self.action_status = None
                 break
@@ -281,26 +279,22 @@ class OAMS:
 
     # --------------------------------------------------------------- PID setup
 
-    cmd_OAMS_CURRENT_PID_SET_help = "Set the PID values for the current sensor"
+    cmd_OAMS_CURRENT_PID_SET_help = "Set the PID values for the rewind current sensor"
 
     def cmd_OAMS_CURRENT_PID_SET(self, gcmd):
-        p = gcmd.get_float("P")
-        i = gcmd.get_float("I")
-        d = gcmd.get_float("D")
+        p, i, d = gcmd.get_float("P"), gcmd.get_float("I"), gcmd.get_float("D")
         t = gcmd.get_float("TARGET", self.current_target)
         self.oams_pid_cmd.send([self.float_to_u32(p), self.float_to_u32(i),
                                 self.float_to_u32(d), self.float_to_u32(t)])
         self.current_kp, self.current_ki, self.current_kd = p, i, d
         self.current_target = t
-        gcmd.respond_info(
-            "Current PID values set to P=%f I=%f D=%f TARGET=%f" % (p, i, d, t))
+        gcmd.respond_info("Current PID values set to P=%f I=%f D=%f TARGET=%f"
+                          % (p, i, d, t))
 
-    cmd_OAMS_PID_SET_help = "Set the PID values for the OAMS"
+    cmd_OAMS_PID_SET_help = "Set the PID values for the OAMS hub motor"
 
     def cmd_OAMS_PID_SET(self, gcmd):
-        p = gcmd.get_float("P")
-        i = gcmd.get_float("I")
-        d = gcmd.get_float("D")
+        p, i, d = gcmd.get_float("P"), gcmd.get_float("I"), gcmd.get_float("D")
         t = gcmd.get_float("TARGET", self.fps_target)
         self.oams_pid_cmd.send([self.float_to_u32(p), self.float_to_u32(i),
                                 self.float_to_u32(d), self.float_to_u32(t)])
@@ -314,7 +308,6 @@ class OAMS:
     def cmd_OAMS_PID_AUTOTUNE(self, gcmd):
         target_flow = gcmd.get_float("TARGET_FLOW")
         target_temp = gcmd.get_float("TARGET_TEMP")
-        # Convert the requested volumetric flow into a 30 second G1 E move.
         extrusion_speed_per_min = 60 * target_flow / (pi * (1.75 / 2) ** 2)
         extrusion_length = extrusion_speed_per_min / 60 * 30
         gcode = self.printer.lookup_object("gcode")
@@ -322,75 +315,27 @@ class OAMS:
         gcode.run_script_from_command(
             "G1 E%f F%f" % (extrusion_length, extrusion_speed_per_min))
 
-    # ------------------------------------------------------------ calibration
-
-    cmd_OAMS_CALIBRATE_HUB_HES_help = "Calibrate the range of a single hub HES"
-
-    def cmd_OAMS_CALIBRATE_HUB_HES(self, gcmd):
-        spool_idx = gcmd.get_int("SPOOL", minval=0, maxval=3)
-        self.action_status_code = None
-        self.action_status_value = None
-        self.action_status = OAMS_STATUS_CALIBRATING
-        self.oams_calibrate_hub_hes_cmd.send([spool_idx])
-        self._wait_for_action()
-        if self.action_status_code != OAMS_OP_CODE_SUCCESS:
-            raise gcmd.error("Calibration of HES %d failed" % spool_idx)
-        value = self.u32_to_float(self.action_status_value)
-        self.hub_hes_on[spool_idx] = value
-        configfile = self.printer.lookup_object("configfile")
-        configfile.set(self.name, "hub_hes_on", ",".join(map(str, self.hub_hes_on)))
-        gcmd.respond_info(
-            "Calibrated HES %d to %f threshold. Run SAVE_CONFIG (or update"
-            " hub_hes_on) to persist it." % (spool_idx, value))
-
-    cmd_OAMS_CALIBRATE_PTFE_LENGTH_help = "Calibrate the length of the PTFE tube"
-
-    def cmd_OAMS_CALIBRATE_PTFE_LENGTH(self, gcmd):
-        spool = gcmd.get_int("SPOOL", minval=0, maxval=3)
-        self.action_status_code = None
-        self.action_status_value = None
-        self.action_status = OAMS_STATUS_CALIBRATING
-        self.oams_calibrate_ptfe_length_cmd.send([spool])
-        self._wait_for_action()
-        if self.action_status_code != OAMS_OP_CODE_SUCCESS:
-            raise gcmd.error("Calibration of PTFE length failed")
-        configfile = self.printer.lookup_object("configfile")
-        configfile.set(self.name, "ptfe_length", "%d" % (self.action_status_value,))
-        gcmd.respond_info(
-            "Calibrated PTFE length to %d. Run SAVE_CONFIG (or update"
-            " ptfe_length) to persist it." % (self.action_status_value,))
-
-    # ------------------------------------------------------------ load / unload
+    # ----------------------------------------------------- firmware op senders
 
     def start_load_spool(self, spool_idx):
-        """Send the load command and return immediately. Poll action_status
-        until None, then call finish_load_spool() for the result."""
+        self._pending_bay = spool_idx
         self.action_status_code = None
         self.action_status = OAMS_STATUS_LOADING
         self.oams_load_spool_cmd.send([spool_idx])
 
-    def finish_load_spool(self, spool_idx):
-        """Interpret action_status_code once action_status has become None.
-        Returns (op_code, message)."""
-        code = self.action_status_code
-        if code == OAMS_OP_CODE_SUCCESS:
-            self.current_spool = spool_idx
-            return code, "Spool loaded successfully"
-        if code == OAMS_OP_CODE_CANCEL:
-            # Loading was aborted partway; filament is NOT seated. Deliberately
-            # leave current_spool unset so the spool is never treated as loaded.
-            return code, "Spool loading cancelled"
-        if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
-            return code, "Spool loading stopped by klipper monitor"
-        if code == OAMS_OP_CODE_ERROR_BUSY:
-            return code, "OAMS is busy"
-        return code, "Spool loading failed (code %s)" % (code,)
+    def start_unload_spool(self):
+        self.action_status_code = None
+        self.action_status = OAMS_STATUS_UNLOADING
+        self.oams_unload_spool_cmd.send()
 
-    def load_spool(self, spool_idx):
-        """Blocking load. Returns (op_code, message)."""
-        self.start_load_spool(spool_idx)
-        self._wait_for_action()
-        return self.finish_load_spool(spool_idx)
+    def start_calibrate(self, kind, bay):
+        self.action_status_code = None
+        self.action_status_value = None
+        self.action_status = OAMS_STATUS_CALIBRATING
+        if kind == "hub_hes":
+            self.oams_calibrate_hub_hes_cmd.send([bay])
+        else:
+            self.oams_calibrate_ptfe_length_cmd.send([bay])
 
     def load_spool_cancel(self):
         if self.oams_load_spool_cancel_cmd is None:
@@ -398,74 +343,58 @@ class OAMS:
         self.oams_load_spool_cancel_cmd.send()
         return "OAMS load spool operation cancelled"
 
-    def start_unload_spool(self):
-        self.action_status_code = None
-        self.action_status = OAMS_STATUS_UNLOADING
-        self.oams_unload_spool_cmd.send()
-
-    def finish_unload_spool(self):
-        """Interpret action_status_code after an unload. Returns (op_code, msg)."""
-        code = self.action_status_code
-        if code == OAMS_OP_CODE_SUCCESS:
-            self.current_spool = None
-            return code, "Spool unloaded successfully"
-        if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
-            return code, "Spool unloading stopped by klipper monitor"
-        if code == OAMS_OP_CODE_ERROR_BUSY:
-            return code, "OAMS is busy"
-        return code, "Spool unloading failed (code %s)" % (code,)
-
-    def unload_spool(self):
-        """Blocking unload. Returns (op_code, message)."""
-        self.start_unload_spool()
-        self._wait_for_action()
-        return self.finish_unload_spool()
-
-    cmd_OAMS_LOAD_SPOOL_help = "Load a new spool of filament"
-
-    def cmd_OAMS_LOAD_SPOOL(self, gcmd):
-        spool_idx = gcmd.get_int("SPOOL", minval=0, maxval=3)
-        code, message = self.load_spool(spool_idx)
-        if code in (OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL):
-            gcmd.respond_info(message)
-        else:
-            raise gcmd.error(message)
-
-    cmd_OAMS_UNLOAD_SPOOL_help = "Unload a spool of filament"
-
-    def cmd_OAMS_UNLOAD_SPOOL(self, gcmd):
-        # Only unload the spool that is actually loaded. Issuing an unload while
-        # nothing (or a different spool) is loaded would drive the firmware into
-        # a rewind/follower state that never completes, leaving the follower
-        # running indefinitely.
-        requested = gcmd.get_int("SPOOL", None)
-        if self.current_spool is None:
-            self.set_oams_follower(0, FOLLOWER_REVERSE)
-            gcmd.respond_info(
-                "No spool is currently loaded on this OAMS; nothing to unload"
-                " (follower stopped)")
-            return
-        if requested is not None and requested != self.current_spool:
-            raise gcmd.error(
-                "Refusing to unload: spool %d is loaded on this OAMS, not %d"
-                % (self.current_spool, requested))
-        code, message = self.unload_spool()
-        if code == OAMS_OP_CODE_SUCCESS:
-            gcmd.respond_info(message)
-        else:
-            # The unload did not complete cleanly; stop the follower so it does
-            # not keep rewinding the spool.
-            self.set_oams_follower(0, FOLLOWER_REVERSE)
-            raise gcmd.error(message)
-
-    # ------------------------------------------------------------- follower
-
     def set_oams_follower(self, enable, direction):
         if self.oams_follower_cmd is None:
             return
         self.oams_follower_cmd.send([enable, direction])
 
-    cmd_OAMS_FOLLOWER_help = "Enable or disable follower and set its direction"
+    # --------------------------------------------- low-level OAMS_* commands
+
+    def _result_message(self, code, verb):
+        if code == OAMS_OP_CODE_SUCCESS:
+            return "Spool %sed successfully" % verb
+        if code == OAMS_OP_CODE_CANCEL:
+            return "Spool %sing cancelled" % verb
+        if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
+            return "Spool %sing stopped by klipper monitor" % verb
+        if code == OAMS_OP_CODE_ERROR_BUSY:
+            return "OAMS is busy"
+        return "Spool %sing failed (code %s)" % (verb, code)
+
+    cmd_OAMS_LOAD_SPOOL_help = "Load a spool of filament on this OAMS (low level)"
+
+    def cmd_OAMS_LOAD_SPOOL(self, gcmd):
+        spool_idx = gcmd.get_int("SPOOL", minval=0, maxval=3)
+        self.start_load_spool(spool_idx)
+        self._wait_for_action()
+        code = self.action_status_code
+        if code in (OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL):
+            gcmd.respond_info(self._result_message(code, "load"))
+        else:
+            raise gcmd.error(self._result_message(code, "load"))
+
+    cmd_OAMS_UNLOAD_SPOOL_help = "Unload the loaded spool on this OAMS (low level)"
+
+    def cmd_OAMS_UNLOAD_SPOOL(self, gcmd):
+        requested = gcmd.get_int("SPOOL", None)
+        if self.current_spool is None:
+            self.set_oams_follower(0, FOLLOWER_REVERSE)
+            gcmd.respond_info("No spool is currently loaded on this OAMS; nothing"
+                              " to unload (follower stopped)")
+            return
+        if requested is not None and requested != self.current_spool:
+            raise gcmd.error("Refusing to unload: spool %d is loaded on this"
+                             " OAMS, not %d" % (self.current_spool, requested))
+        self.start_unload_spool()
+        self._wait_for_action()
+        code = self.action_status_code
+        if code == OAMS_OP_CODE_SUCCESS:
+            gcmd.respond_info(self._result_message(code, "unload"))
+        else:
+            self.set_oams_follower(0, FOLLOWER_REVERSE)
+            raise gcmd.error(self._result_message(code, "unload"))
+
+    cmd_OAMS_FOLLOWER_help = "Enable or disable the follower and set its direction"
 
     def cmd_OAMS_FOLLOWER(self, gcmd):
         enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
@@ -478,12 +407,51 @@ class OAMS:
         else:
             gcmd.respond_info("Follower enabled in reverse direction")
 
+    # ------------------------------------------------- calibration (async/store)
+
+    def _calibrate(self, kind, bay):
+        if self.runtime is not None:
+            result = self.runtime.request(
+                self.fps_name, S.Calibrate(self.fps_name, self.oams_idx, bay, kind)
+            ).wait()
+            return result.ok, result.value
+        # Standalone fallback (no manager): bounded blocking.
+        self.start_calibrate(kind, bay)
+        self._wait_for_action()
+        ok = self.action_status_code == OAMS_OP_CODE_SUCCESS
+        return ok, self.action_status_value
+
+    cmd_OAMS_CALIBRATE_HUB_HES_help = "Calibrate the range of a single hub HES"
+
+    def cmd_OAMS_CALIBRATE_HUB_HES(self, gcmd):
+        bay = gcmd.get_int("SPOOL", minval=0, maxval=3)
+        ok, value = self._calibrate("hub_hes", bay)
+        if not ok:
+            raise gcmd.error("Calibration of HES %d failed" % bay)
+        threshold = self.u32_to_float(value)
+        self.hub_hes_on[bay] = threshold
+        configfile = self.printer.lookup_object("configfile")
+        configfile.set(self.name, "hub_hes_on", ",".join(map(str, self.hub_hes_on)))
+        gcmd.respond_info("Calibrated HES %d to %f threshold. Run SAVE_CONFIG (or"
+                          " update hub_hes_on) to persist it." % (bay, threshold))
+
+    cmd_OAMS_CALIBRATE_PTFE_LENGTH_help = "Calibrate the length of the PTFE tube"
+
+    def cmd_OAMS_CALIBRATE_PTFE_LENGTH(self, gcmd):
+        bay = gcmd.get_int("SPOOL", minval=0, maxval=3)
+        ok, value = self._calibrate("ptfe", bay)
+        if not ok:
+            raise gcmd.error("Calibration of PTFE length failed")
+        configfile = self.printer.lookup_object("configfile")
+        configfile.set(self.name, "ptfe_length", "%d" % (value,))
+        gcmd.respond_info("Calibrated PTFE length to %d. Run SAVE_CONFIG (or"
+                          " update ptfe_length) to persist it." % (value,))
+
     # ----------------------------------------------------- firmware callbacks
 
     def _oams_cmd_stats(self, params):
-        # Runs on the serial reader thread. Publish each array as a fresh list so
-        # readers on the reactor thread always see a consistent snapshot via a
-        # single (atomic) reference swap rather than a half-updated list.
+        # Serial reader thread. Publish each array as a fresh list (atomic ref
+        # swap) so reactor-thread readers always see a consistent snapshot.
         self.fps_value = self.u32_to_float(params["fps_value"])
         self.f1s_hes_value = [params["f1s_hes_value_0"], params["f1s_hes_value_1"],
                               params["f1s_hes_value_2"], params["f1s_hes_value_3"]]
@@ -495,8 +463,8 @@ class OAMS:
         self.i_value = self.u32_to_float(params["current_value"])
 
     def _action_status_received(self, params):
-        # Runs on the serial reader thread. Marshal onto the reactor thread so the
-        # completion bookkeeping (and the waiters polling it) stay single-threaded.
+        # Serial reader thread -> marshal onto the reactor thread so the
+        # completion bookkeeping (and any waiter) stays single-threaded.
         self.reactor.register_async_callback(
             lambda et, params=params: self._apply_action_status(params))
 
@@ -509,16 +477,19 @@ class OAMS:
         elif action in (OAMS_STATUS_LOADING, OAMS_STATUS_UNLOADING,
                         OAMS_STATUS_ERROR) or code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
             self.action_status_code = code
+            # Keep the firmware mirror of current_spool in step with our commands.
+            if action == OAMS_STATUS_LOADING and code == OAMS_OP_CODE_SUCCESS:
+                self.current_spool = self._pending_bay
+            elif action == OAMS_STATUS_UNLOADING and code == OAMS_OP_CODE_SUCCESS:
+                self.current_spool = None
         else:
-            # Defensive default: an unrecognized action/code combination still
-            # releases any waiter, so a stray or garbled message can never wedge
-            # an operation forever.
-            logging.error(
-                "OAMS[%s]: unexpected action status code=%d action=%d",
-                self.oams_idx, code, action)
+            logging.error("OAMS[%s]: unexpected action status code=%d action=%d",
+                          self.oams_idx, code, action)
             self.action_status_code = OAMS_OP_CODE_ERROR_UNSPECIFIED
-        # Publish the completion sentinel last (see threading note in __init__).
+        # Publish the completion sentinel last, then notify the store (if bound).
         self.action_status = None
+        if self.on_action_complete is not None:
+            self.on_action_complete(self.action_status_code, self.action_status_value)
 
     # -------------------------------------------------------------- utilities
 
@@ -532,22 +503,19 @@ class OAMS:
         self.mcu.add_config_cmd(
             "config_oams_buffer upper=%u lower=%u is_reversed=%u"
             % (self.float_to_u32(self.fps_upper_threshold),
-               self.float_to_u32(self.fps_lower_threshold),
-               self.fps_is_reversed))
+               self.float_to_u32(self.fps_lower_threshold), self.fps_is_reversed))
         self.mcu.add_config_cmd(
             "config_oams_f1s_hes on1=%u on2=%u on3=%u on4=%u is_above=%u"
             % (self.float_to_u32(self.f1s_hes_on[0]),
                self.float_to_u32(self.f1s_hes_on[1]),
                self.float_to_u32(self.f1s_hes_on[2]),
-               self.float_to_u32(self.f1s_hes_on[3]),
-               self.f1s_hes_is_above))
+               self.float_to_u32(self.f1s_hes_on[3]), self.f1s_hes_is_above))
         self.mcu.add_config_cmd(
             "config_oams_hub_hes on1=%u on2=%u on3=%u on4=%u is_above=%u"
             % (self.float_to_u32(self.hub_hes_on[0]),
                self.float_to_u32(self.hub_hes_on[1]),
                self.float_to_u32(self.hub_hes_on[2]),
-               self.float_to_u32(self.hub_hes_on[3]),
-               self.hub_hes_is_above))
+               self.float_to_u32(self.hub_hes_on[3]), self.hub_hes_is_above))
         self.mcu.add_config_cmd(
             "config_oams_pid kp=%u ki=%u kd=%u target=%u"
             % (self.float_to_u32(self.kp), self.float_to_u32(self.ki),

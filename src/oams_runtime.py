@@ -1,0 +1,170 @@
+# OpenAMS — runtime (store + effect executor + completion/timeout plumbing)
+#
+# Copyright (C) 2025-2026 JR Lomas <lomas.jr@gmail.com>
+#
+# This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# The runtime is the ONLY place that performs side effects and touches the
+# reactor/gcode. It holds the immutable SystemState, runs the pure reducer from
+# oams_state.py on every action, and executes the returned effects. All dispatch
+# happens on the reactor thread (the OAMS driver marshals firmware replies there
+# via register_async_callback), so the store needs no locks.
+
+import logging
+from collections import deque
+
+from . import oams_state as S
+
+# Stall detection (encoder-didn't-move) while a load/unload op is in flight.
+STALL_SAMPLES = 2
+MIN_ENCODER_DIFF = 1
+STALL_AFTER = 2.0   # seconds after op start before sampling begins
+
+
+class Runtime:
+    def __init__(self, printer, fps_names, build_world, resolve_oam):
+        self.printer = printer
+        self.reactor = printer.get_reactor()
+        self.build_world = build_world      # callable(now) -> S.World
+        self.resolve_oam = resolve_oam      # callable(oams_idx) -> oam | None
+        self.system = S.initial_system(fps_names)
+        self._pending = {}                  # fps -> ReactorCompletion
+        self._deadlines = {}                # fps -> reactor timer handle
+        self._stall = {}                    # fps -> deque(maxlen=STALL_SAMPLES)
+
+    # -------------------------------------------------------------- dispatch
+
+    def get_state(self):
+        return self.system
+
+    def dispatch(self, action):
+        now = self.reactor.monotonic()
+        world = self.build_world(now)
+        prev = self.system
+        try:
+            self.system, effects = S.reduce(prev, action, world, now)
+        except Exception:
+            logging.exception("OAMS: reducer failed on %s", type(action).__name__)
+            return self.system
+        self._log_transitions(prev, self.system, action)
+        for e in effects:
+            try:
+                self._apply(e)
+            except Exception:
+                logging.exception("OAMS: effect %s failed", type(e).__name__)
+        return self.system
+
+    def request(self, fps, action):
+        """Start an op and return a ReactorCompletion the caller can wait() on.
+        The completion is settled by a later OpCompleted/Timeout (or immediately
+        if the reducer rejects the request)."""
+        completion = self.reactor.completion()
+        self._pending[fps] = completion
+        self.dispatch(action)
+        return completion
+
+    def tick(self):
+        """Called once per monitor interval from the manager's reactor timer."""
+        self.dispatch(S.Tick())
+        self._check_stalls()
+
+    def _log_transitions(self, prev, cur, action):
+        for fps, lane in cur.lanes.items():
+            pl = prev.lanes.get(fps)
+            if pl is None or pl.op != lane.op or pl.runout != lane.runout:
+                logging.info("OAMS[%s] %s/%s --%s--> %s/%s%s", fps,
+                             None if pl is None else pl.op,
+                             None if pl is None else pl.runout,
+                             type(action).__name__, lane.op, lane.runout,
+                             "" if not lane.message else " (%s)" % lane.message)
+
+    # --------------------------------------------------------------- effects
+
+    def _apply(self, e):
+        if isinstance(e, S.StartLoad):
+            oam = self.resolve_oam(e.unit[0])
+            if oam is not None:
+                oam.start_load_spool(e.unit[1])
+        elif isinstance(e, S.StartUnload):
+            oam = self.resolve_oam(e.unit[0])
+            if oam is not None:
+                oam.start_unload_spool()
+        elif isinstance(e, S.StartCalibrate):
+            oam = self.resolve_oam(e.unit[0])
+            if oam is not None:
+                oam.start_calibrate(e.kind, e.unit[1])
+        elif isinstance(e, S.CancelLoad):
+            oam = self.resolve_oam(e.unit[0])
+            if oam is not None:
+                oam.load_spool_cancel()
+        elif isinstance(e, S.SetFollower):
+            oam = self.resolve_oam(e.unit[0])
+            if oam is not None:
+                oam.set_oams_follower(e.enable, e.direction)
+        elif isinstance(e, S.Led):
+            oam = self.resolve_oam(e.unit[0])
+            if oam is not None:
+                oam.set_led_error(e.unit[1], e.on)
+        elif isinstance(e, S.Pause):
+            self._pause(e.reason)
+        elif isinstance(e, S.ArmDeadline):
+            self._arm_deadline(e.fps, e.seconds)
+        elif isinstance(e, S.CancelDeadline):
+            self._cancel_deadline(e.fps)
+        elif isinstance(e, S.Settle):
+            self._settle(e.fps, e.result)
+
+    def _pause(self, reason):
+        try:
+            gcode = self.printer.lookup_object("gcode")
+            gcode.run_script("M118 OAMS: %s" % reason)
+            gcode.run_script("M117 OAMS paused")
+            gcode.run_script("PAUSE")
+        except Exception:
+            logging.exception("OAMS: failed to issue PAUSE")
+
+    def _arm_deadline(self, fps, seconds):
+        self._cancel_deadline(fps)
+
+        def fire(eventtime, fps=fps):
+            self.dispatch(S.Timeout(fps))
+            return self.reactor.NEVER
+
+        self._deadlines[fps] = self.reactor.register_timer(
+            fire, self.reactor.monotonic() + seconds)
+
+    def _cancel_deadline(self, fps):
+        timer = self._deadlines.pop(fps, None)
+        if timer is not None:
+            self.reactor.unregister_timer(timer)
+
+    def _settle(self, fps, result):
+        completion = self._pending.pop(fps, None)
+        if completion is not None and not completion.test():
+            completion.complete(result)
+
+    # ---------------------------------------------------------- stall detect
+
+    def _check_stalls(self):
+        now = self.reactor.monotonic()
+        for fps, lane in self.system.lanes.items():
+            if lane.op not in (S.OP_LOADING, S.OP_UNLOADING) or lane.unit is None:
+                self._stall.pop(fps, None)
+                continue
+            if now - lane.since <= STALL_AFTER:
+                self._stall.pop(fps, None)   # reset window at op start
+                continue
+            oam = self.resolve_oam(lane.unit[0])
+            if oam is None:
+                continue
+            samples = self._stall.setdefault(fps, deque(maxlen=STALL_SAMPLES))
+            samples.append(oam.encoder_clicks)
+            if len(samples) < STALL_SAMPLES:
+                continue
+            if abs(samples[-1] - samples[0]) < MIN_ENCODER_DIFF:
+                logging.info("OAMS[%s]: %s stall detected", fps, lane.op)
+                oam.set_led_error(lane.unit[1], 1)
+                self._pause("%s speed too low" % lane.op.lower())
+                self._stall.pop(fps, None)
+                # Fail the op (settles any waiter) via the unified timeout path.
+                self.dispatch(S.Timeout(fps))
