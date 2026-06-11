@@ -36,7 +36,9 @@ HUMI_RES = {14: HUMI_RES_14, 11: HUMI_RES_11,8:  HUMI_RES_8}
 
 # Consecutive failed measurement cycles tolerated before the sensor is declared
 # dead. Holding the last good reading hides a transient I2C glitch, but a sensor
-# that stays silent must not keep reporting a frozen value as fresh forever.
+# that stays silent must not keep reporting a frozen value as fresh forever:
+# past this threshold the readings drop to 0.0, so a user-configured min_temp
+# (if any) trips, without unilaterally shutting down over a telemetry sensor.
 MAX_CONSECUTIVE_FAILURES = 6
 
 class HDC1080:
@@ -164,19 +166,22 @@ class HDC1080:
             self.humidity = humidity + self.humidity_offset
         if temp is None or humidity is None:
             self.consecutive_failures += 1
+            if self.consecutive_failures == MAX_CONSECUTIVE_FAILURES:
+                logging.error(
+                    "hdc1080 %s: sensor not responding (%d consecutive failed"
+                    " reads); reporting 0.0 until it recovers",
+                    self.name, self.consecutive_failures)
         else:
+            if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                logging.info("hdc1080 %s: sensor recovered", self.name)
             self.consecutive_failures = 0
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            self.temp = self.humidity = 0.0
         return True
 
     def _sample_hdc1080(self, eventtime):
         if not self._make_measurements():
             self.temp = self.humidity = .0
-            return self.reactor.NEVER
-
-        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
-            self.printer.invoke_shutdown(
-                "HDC1080 %s: sensor not responding (%d consecutive failed"
-                " reads)" % (self.name, self.consecutive_failures))
             return self.reactor.NEVER
 
         if self.temp < self.min_temp or self.temp > self.max_temp:

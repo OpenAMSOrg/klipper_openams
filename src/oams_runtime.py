@@ -41,15 +41,21 @@ class Runtime:
         prev = self.system
         try:
             now = self.reactor.monotonic()
-            world = self.build_world(now)
+            # Only build the hardware snapshot for actions that read it: a
+            # transient world-build failure must not be able to kill the
+            # reduction of an unrelated completion, and completions/timeouts
+            # fire far more often than world-consuming actions.
+            world = (self.build_world(now)
+                     if isinstance(action, S.WORLD_ACTIONS) else S.World())
             self.system, effects = S.reduce(prev, action, world, now)
         except Exception:
             logging.exception("OAMS: reducer failed on %s", type(action).__name__)
-            # Never leave a gcode waiter blocked on a dispatch that died: fail
-            # the pending op on the action's lane, if any.
-            fps = getattr(action, "fps", None)
-            if fps is not None:
-                self._settle(fps, S.OpResult(False, None,
+            # Never leave a gcode waiter blocked on the op-starting dispatch it
+            # is waiting for. Crashes on OTHER actions (Cancel, a completion,
+            # a tick) must NOT fail an unrelated op in flight — its own
+            # completion or deadline will settle it.
+            if isinstance(action, (S.Load, S.LoadBay, S.Unload, S.Calibrate)):
+                self._settle(action.fps, S.OpResult(False, None,
                              "internal error (see klippy.log)"))
             return self.system
         self._log_transitions(prev, self.system, action)

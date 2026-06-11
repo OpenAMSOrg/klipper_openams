@@ -239,6 +239,15 @@ class OAMSManager:
             raise gcmd.error("Multiple FPS present; specify FPS=<name>")
         return None
 
+    def _stop_followers(self, fps_names):
+        """Stop followers on the given lanes, both in the store (so
+        LaneState.following stays truthful) and on every unit of the lane (to
+        cover followers enabled directly on idle units)."""
+        for fps in fps_names:
+            self.runtime.dispatch(S.Follow(fps, 0, S.FOLLOWER_REVERSE))
+            for oam in self.lane_oams[fps]:
+                oam.set_oams_follower(0, S.FOLLOWER_REVERSE)
+
     cmd_CLEAR_ERRORS_help = "Clear the error state of the OAMS"
 
     def cmd_CLEAR_ERRORS(self, gcmd):
@@ -267,9 +276,19 @@ class OAMSManager:
     def cmd_FOLLOWER(self, gcmd):
         enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
         direction = gcmd.get_int("DIRECTION", minval=0, maxval=1)
-        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADED)
+        # Starting a follower needs an unambiguous lane (raise rather than
+        # guess); stopping is always safe to broadcast, and stop commands run
+        # in cleanup/error macros that must not abort.
+        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADED,
+                                required=bool(enable))
+        if fps is None:
+            self._stop_followers(self.fpss)
+            gcmd.respond_info("Followers stopped on all lanes")
+            return
         lane = self.runtime.get_state().lanes[fps]
         if lane.unit is None:
+            if not enable:
+                self._stop_followers([fps])
             gcmd.respond_info("No spool is currently loaded on lane %s" % fps)
             return
         # Through the store so LaneState.following/direction stay truthful.
@@ -278,9 +297,10 @@ class OAMSManager:
     cmd_LOAD_FILAMENT_CANCEL_help = "Cancel the in-flight load on a lane"
 
     def cmd_LOAD_FILAMENT_CANCEL(self, gcmd):
-        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADING)
-        lane = self.runtime.get_state().lanes[fps]
-        if lane.op == S.OP_LOADING:
+        # Cancel runs from cleanup/error macros; never abort them. With no
+        # FPS= and no unambiguous loading lane there is nothing to cancel.
+        fps = self._resolve_fps(gcmd, prefer_op=S.OP_LOADING, required=False)
+        if fps is not None and self.runtime.get_state().lanes[fps].op == S.OP_LOADING:
             self.runtime.dispatch(S.Cancel(fps))
             gcmd.respond_info("Load cancel requested on lane %s" % fps)
         else:
@@ -296,25 +316,33 @@ class OAMSManager:
         if fps is None:
             state = self.runtime.get_state()
             if any(lane.op == S.OP_LOADED for lane in state.lanes.values()):
+                # Can't guess which loaded lane to unload — but before
+                # aborting, stop any lane the store knows is rewinding
+                # (a forward follower on a printing lane is left alone).
+                rewinding = [f for f, lane in state.lanes.items()
+                             if lane.following
+                             and lane.direction == S.FOLLOWER_REVERSE]
+                self._stop_followers(rewinding)
                 raise gcmd.error(
                     "Multiple FPS have a spool loaded; specify FPS=<name>")
             # Multiple FPS, no FPS= given and nothing loaded anywhere: there is
             # no lane to unload, but a follower may still be rewinding. Stop
             # them all rather than leaving one running.
-            for lane_oams in self.lane_oams.values():
-                for oam in lane_oams:
-                    oam.set_oams_follower(0, S.FOLLOWER_REVERSE)
+            self._stop_followers(self.fpss)
             gcmd.respond_info("No spool is loaded on any lane (followers"
                               " stopped); specify FPS=<name> to target a lane")
             return
         lane = self.runtime.get_state().lanes[fps]
         if lane.op != S.OP_LOADED:
-            for oam in self.lane_oams[fps]:
-                oam.set_oams_follower(0, S.FOLLOWER_REVERSE)
+            self._stop_followers([fps])
             gcmd.respond_info("No spool is loaded on lane %s (follower stopped)"
                               % fps)
             return
         result = self.runtime.request(fps, S.Unload(fps)).wait()
+        if not result.ok:
+            # Raise so SAFE_UNLOAD-style macros stop instead of carrying on
+            # with a spool still (partially) loaded.
+            raise gcmd.error(result.message)
         gcmd.respond_info(result.message)
 
     cmd_LOAD_FILAMENT_help = "Load a spool from a group (lane inferred from group)"
@@ -325,7 +353,12 @@ class OAMSManager:
         if fps is None:
             raise gcmd.error("Group %s does not exist" % group)
         result = self.runtime.request(fps, S.Load(fps, group)).wait()
-        gcmd.respond_info(result.message)
+        if result.ok or result.code == S.OAMS_OP_CODE_CANCEL:
+            gcmd.respond_info(result.message)
+        else:
+            # Raise so toolchange macros stop instead of printing without
+            # filament loaded.
+            raise gcmd.error(result.message)
 
 
 def load_config(config):

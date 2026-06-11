@@ -143,9 +143,10 @@ class OpCompleted:
     fps: str = ""
     code: int = OAMS_OP_CODE_SUCCESS
     value: Optional[int] = None
-    # Echo of the op_gen the driver was started with; None means "unknown"
-    # (standalone/legacy paths) and is accepted. A mismatch marks the reply as
-    # stale or from another unit on the lane, and it is ignored.
+    # Echo of the op_gen the driver was started with. The reducer only accepts
+    # a completion whose gen matches the lane's op_gen exactly: every op the
+    # store starts carries an int gen, so gen=None (an unsolicited firmware
+    # status from a unit with no op in flight) never completes anything.
     gen: Optional[int] = None
 
 @dataclass(frozen=True)
@@ -163,6 +164,13 @@ class Follow:
 @dataclass(frozen=True)
 class ClearErrors:
     pass
+
+
+# Actions whose reduction reads the hardware snapshot. The runtime only builds
+# a World for these; everything else (completions, timeouts, follower toggles)
+# is decided from LaneState alone. Keep this in sync with the reducer: a branch
+# that starts reading `lw` for a new action type must be added here.
+WORLD_ACTIONS = (Load, LoadBay, Tick, ClearErrors)
 
 
 # ===================================================================== effects
@@ -277,66 +285,75 @@ def _hub_occupied(lw):
     return any(lw.loaded.values())
 
 
+def _load_guard(lane, lw, fps):
+    """Shared pre-load safety checks for Load and LoadBay. Returns the Settle
+    effects rejecting the request, or None when loading may start."""
+    if lane.op != OP_UNLOADED:
+        return [Settle(fps, OpResult(False, None, "lane busy (%s)" % lane.op))]
+    if _hub_occupied(lw):
+        return [Settle(fps, OpResult(False, None,
+                "filament still detected in a hub on this lane;"
+                " unload it first"))]
+    return None
+
+
+def _begin_op(lane, now, fps, effect_for_gen, **fields):
+    """Single chokepoint for starting a firmware op: bumps the lane's op_gen,
+    stamps the deadline, and arms the runtime timer, so the gen/deadline
+    invariant cannot be forgotten at an individual call site."""
+    gen = lane.op_gen + 1
+    nl = replace(lane, op_gen=gen, op_deadline=now + OAMS_ACTION_TIMEOUT,
+                 since=now, **fields)
+    return nl, [effect_for_gen(gen), ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+
+
 def _reduce_lane(lane, action, lw, now, fps):
     op = lane.op
 
     if isinstance(action, Load):
-        if op != OP_UNLOADED:
-            return lane, [Settle(fps, OpResult(False, None,
-                          "lane busy (%s)" % op))]
-        if _hub_occupied(lw):
-            return lane, [Settle(fps, OpResult(False, None,
-                          "filament still detected in a hub on this lane;"
-                          " unload it first"))]
+        rejected = _load_guard(lane, lw, fps)
+        if rejected is not None:
+            return lane, rejected
         for unit in lw.group_bays.get(action.group, ()):
             if lw.ready.get(unit):
-                gen = lane.op_gen + 1
-                nl = replace(lane, op=OP_LOADING, group=action.group, unit=unit,
-                             runout=RUNOUT_IDLE, pause_origin=None,
-                             coast_origin=None, reload_target=None,
-                             op_deadline=now + OAMS_ACTION_TIMEOUT,
-                             op_gen=gen, since=now, message=None)
-                return nl, [StartLoad(unit, fps, gen),
-                            ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+                return _begin_op(
+                    lane, now, fps,
+                    lambda gen, unit=unit: StartLoad(unit, fps, gen),
+                    op=OP_LOADING, group=action.group, unit=unit,
+                    runout=RUNOUT_IDLE, pause_origin=None, coast_origin=None,
+                    reload_target=None, message=None)
         return lane, [Settle(fps, OpResult(False, None,
                       "no ready spool in group %s" % action.group))]
 
     if isinstance(action, LoadBay):
-        if op != OP_UNLOADED:
-            return lane, [Settle(fps, OpResult(False, None,
-                          "lane busy (%s)" % op))]
-        if _hub_occupied(lw):
-            return lane, [Settle(fps, OpResult(False, None,
-                          "filament still detected in a hub on this lane;"
-                          " unload it first"))]
+        rejected = _load_guard(lane, lw, fps)
+        if rejected is not None:
+            return lane, rejected
         unit = action.unit
-        gen = lane.op_gen + 1
-        nl = replace(lane, op=OP_LOADING, group=_group_of(lw, unit), unit=unit,
-                     runout=RUNOUT_IDLE, pause_origin=None, coast_origin=None,
-                     reload_target=None, op_deadline=now + OAMS_ACTION_TIMEOUT,
-                     op_gen=gen, since=now, message=None)
-        return nl, [StartLoad(unit, fps, gen), ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+        return _begin_op(
+            lane, now, fps, lambda gen: StartLoad(unit, fps, gen),
+            op=OP_LOADING, group=_group_of(lw, unit), unit=unit,
+            runout=RUNOUT_IDLE, pause_origin=None, coast_origin=None,
+            reload_target=None, message=None)
 
     if isinstance(action, Unload):
         if op != OP_LOADED or lane.unit is None:
             return lane, [Settle(fps, OpResult(False, None, "nothing loaded"))]
-        gen = lane.op_gen + 1
-        nl = replace(lane, op=OP_UNLOADING, runout=RUNOUT_IDLE,
-                     pause_origin=None, coast_origin=None, reload_target=None,
-                     op_deadline=now + OAMS_ACTION_TIMEOUT, op_gen=gen, since=now)
-        return nl, [StartUnload(lane.unit, fps, gen),
-                    ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+        unit = lane.unit
+        return _begin_op(
+            lane, now, fps, lambda gen: StartUnload(unit, fps, gen),
+            op=OP_UNLOADING, runout=RUNOUT_IDLE, pause_origin=None,
+            coast_origin=None, reload_target=None)
 
     if isinstance(action, Calibrate):
         if op in (OP_LOADING, OP_UNLOADING, OP_CALIBRATING):
             return lane, [Settle(fps, OpResult(False, None,
                           "busy, cannot calibrate now"))]
         unit = (action.oams_idx, action.bay)
-        gen = lane.op_gen + 1
-        nl = replace(lane, op=OP_CALIBRATING, prior_op=op,
-                     op_deadline=now + OAMS_ACTION_TIMEOUT, op_gen=gen, since=now)
-        return nl, [StartCalibrate(unit, action.kind, fps, gen),
-                    ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+        return _begin_op(
+            lane, now, fps,
+            lambda gen: StartCalibrate(unit, action.kind, fps, gen),
+            op=OP_CALIBRATING, prior_op=op)
 
     if isinstance(action, Cancel):
         if op == OP_LOADING and lane.unit is not None:
@@ -351,9 +368,10 @@ def _reduce_lane(lane, action, lw, now, fps):
         return nl, [SetFollower(lane.unit, action.enable, action.direction)]
 
     if isinstance(action, OpCompleted):
-        if action.gen is not None and action.gen != lane.op_gen:
-            # Stale reply (late after a timeout) or a reply from another OAMS
-            # unit on this lane — it does not belong to the op in flight.
+        if action.gen != lane.op_gen:
+            # Stale reply (late after a timeout), a reply from another OAMS
+            # unit on this lane, or an unsolicited status (gen=None) — it does
+            # not belong to the op in flight.
             return lane, []
         return _complete(lane, action.code, action.value, now, fps)
 
@@ -409,11 +427,17 @@ def _complete(lane, code, value, now, fps, timed_out=False):
                         Settle(fps, OpResult(True, code, "Spool loaded successfully"))]
         if code == OAMS_OP_CODE_CANCEL:
             nl = replace(lane, op=OP_UNLOADED, group=None, unit=None,
-                         op_deadline=None, message="cancelled")
-            return nl, [CancelDeadline(fps),
-                        Settle(fps, OpResult(False, code, "Spool loading cancelled"))]
+                         following=False, op_deadline=None, message="cancelled")
+            effects = [CancelDeadline(fps)]
+            if lane.following and lane.unit is not None:
+                # A follower enabled mid-load would otherwise outlive the lane's
+                # knowledge of its unit and become unstoppable via the store.
+                effects.append(SetFollower(lane.unit, 0, lane.direction))
+            effects.append(Settle(fps, OpResult(False, code,
+                                                "Spool loading cancelled")))
+            return nl, effects
         nl = replace(lane, op=OP_UNLOADED, group=None, unit=None,
-                     op_deadline=None, message="load failed")
+                     following=False, op_deadline=None, message="load failed")
         msg = ("timed out loading spool" if timed_out
                else "Spool loading failed (code %s)" % (code,))
         effects = [CancelDeadline(fps)]
@@ -421,6 +445,8 @@ def _complete(lane, code, value, now, fps, timed_out=False):
             # The firmware op is still running; tell it to stop feeding rather
             # than abandoning it mid-load.
             effects.append(CancelLoad(lane.unit))
+        if lane.following and lane.unit is not None:
+            effects.append(SetFollower(lane.unit, 0, lane.direction))
         effects.append(Settle(fps, OpResult(False, code, msg)))
         return nl, effects
 
@@ -492,12 +518,10 @@ def _runout_tick(lane, lw, now, fps):
                 if unit == lane.unit:
                     continue  # never reload the bay that just ran out
                 if lw.ready.get(unit):
-                    gen = lane.op_gen + 1
-                    nl = replace(lane, runout=RUNOUT_LOADING, reload_target=unit,
-                                 op_deadline=now + OAMS_ACTION_TIMEOUT,
-                                 op_gen=gen)
-                    return nl, [StartLoad(unit, fps, gen),
-                                ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+                    return _begin_op(
+                        lane, now, fps,
+                        lambda gen, unit=unit: StartLoad(unit, fps, gen),
+                        runout=RUNOUT_LOADING, reload_target=unit)
             nl = replace(lane, op=OP_UNLOADED, group=None, unit=None,
                          runout=RUNOUT_IDLE, pause_origin=None,
                          coast_origin=None, message="no spare spool")

@@ -164,6 +164,23 @@ class DispatchSafetyTests(unittest.TestCase):
         self.assertFalse(completion.wait().ok)
         self.assertEqual(runtime.get_state().lanes[FPS].op, S.OP_UNLOADED)
 
+    def test_world_only_built_for_world_actions(self):
+        # A transient world-build failure must not be able to kill the
+        # reduction of a completion, so completions must not build the world.
+        calls = []
+
+        def counting_world(now):
+            calls.append(now)
+            return S.World(lanes={FPS: S.LaneWorld()})
+
+        runtime, reactor, oam, events = make_runtime(build_world=counting_world)
+        runtime.request(FPS, S.LoadBay(FPS, UNIT))
+        self.assertEqual(len(calls), 1)                   # LoadBay reads it
+        gen = oam.calls[-1][2]
+        runtime.dispatch(S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, gen=gen))
+        self.assertEqual(len(calls), 1)                   # OpCompleted does not
+        self.assertEqual(runtime.get_state().lanes[FPS].op, S.OP_LOADED)
+
     def test_superseded_request_settles_previous_waiter(self):
         runtime, reactor, oam, events = make_runtime()
         first = runtime.request(FPS, S.LoadBay(FPS, UNIT))

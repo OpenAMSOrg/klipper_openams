@@ -14,6 +14,7 @@
 
 import logging
 import struct
+from collections import deque
 from math import pi
 
 import mcu
@@ -86,9 +87,12 @@ class OAMS:
         # commands this unit issues (see _apply_action_status).
         self.current_spool = None
         self._pending_bay = None
-        # op_gen the store stamped on the op this unit last started; echoed back
-        # in OpCompleted so the reducer can reject stale or cross-unit replies.
-        self._op_gen = None
+        # FIFO of op_gen values for ops started on this unit whose completion
+        # has not arrived yet. The firmware answers ops in order and does not
+        # echo any correlation id, so pairing replies with the OLDEST pending
+        # gen (rather than re-reading a mutable "last gen" slot) keeps a late
+        # reply from a timed-out op from being attributed to its retry.
+        self._gen_queue = deque()
 
         # Firmware command handles (resolved at klippy:connect; None until then).
         self.oams_load_spool_cmd = None
@@ -227,6 +231,9 @@ class OAMS:
     def clear_errors(self):
         for i in range(4):
             self.set_led_error(i, 0)
+        # CLEAR_ERRORS is the resync point: any replies still owed for
+        # abandoned ops are no longer wanted.
+        self._gen_queue.clear()
         self.current_spool = self.determine_current_spool()
 
     def set_led_error(self, idx, value):
@@ -336,14 +343,14 @@ class OAMS:
     def start_load_spool(self, spool_idx, gen=None):
         cmd = self._require_cmd(self.oams_load_spool_cmd, "load command")
         self._pending_bay = spool_idx
-        self._op_gen = gen
+        self._gen_queue.append(gen)
         self.action_status_code = None
         self.action_status = OAMS_STATUS_LOADING
         cmd.send([spool_idx])
 
     def start_unload_spool(self, gen=None):
         cmd = self._require_cmd(self.oams_unload_spool_cmd, "unload command")
-        self._op_gen = gen
+        self._gen_queue.append(gen)
         self.action_status_code = None
         self.action_status = OAMS_STATUS_UNLOADING
         cmd.send()
@@ -355,7 +362,7 @@ class OAMS:
         else:
             cmd = self._require_cmd(self.oams_calibrate_ptfe_length_cmd,
                                     "PTFE calibrate command")
-        self._op_gen = gen
+        self._gen_queue.append(gen)
         self.action_status_code = None
         self.action_status_value = None
         self.action_status = OAMS_STATUS_CALIBRATING
@@ -555,12 +562,15 @@ class OAMS:
                          " action=%d code=%d", self.oams_idx, action, code)
             return
         # Publish the completion sentinel last, then notify the store (if
-        # bound), echoing the op generation this unit was started with so the
-        # reducer can reject stale or cross-unit replies.
+        # bound), pairing the reply with the oldest pending op generation so
+        # the reducer can reject stale or cross-unit replies. An unsolicited
+        # completion-class status (empty queue) carries gen=None, which the
+        # reducer never accepts.
         self.action_status = None
+        gen = self._gen_queue.popleft() if self._gen_queue else None
         if self.on_action_complete is not None:
             self.on_action_complete(self.action_status_code,
-                                    self.action_status_value, self._op_gen)
+                                    self.action_status_value, gen)
 
     # -------------------------------------------------------------- utilities
 

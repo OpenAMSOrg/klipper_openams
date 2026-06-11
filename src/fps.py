@@ -31,7 +31,9 @@ class FPS:
         self._sf_max_speed = config.getfloat('max_speed', 300.0)
         self._accel = config.getfloat('accel', 0.0)
         self._set_point = config.getfloat('set_point', 0.5)
-        self._use_kalico = config.getboolean('use_kalico', False)
+        # Accepted for config compatibility; the ADC API is now detected from
+        # the running Klipper/Kalico instead of trusting this flag.
+        config.getboolean('use_kalico', False)
 
         # The toolhead extruder this lane feeds (resolved at connect).
         self.extruder_name = config.get('extruder', 'extruder')
@@ -39,14 +41,7 @@ class FPS:
 
         self.ppins = self.printer.lookup_object('pins')
         self.adc = self.ppins.setup_pin('adc', self._pin)
-        if self._use_kalico:
-            # Kalico keeps the pre-2024 mainline MCU_adc API:
-            #   setup_minmax(sample_time, sample_count, ...)
-            #   setup_adc_callback(report_time, callback)  # scalar value
-            self.adc.setup_minmax(self._sample_time, self._sample_count)
-            self.adc.setup_adc_callback(self._report_time,
-                                        self._adc_callback_scalar)
-        else:
+        if hasattr(self.adc, 'setup_adc_sample'):
             # Current mainline Klipper API:
             #   setup_adc_sample(report_time, sample_time, sample_count)
             #   setup_adc_callback(callback)  # list of (time, value) samples
@@ -54,6 +49,13 @@ class FPS:
                                       sample_time=self._sample_time,
                                       sample_count=self._sample_count)
             self.adc.setup_adc_callback(self._adc_callback)
+        else:
+            # Kalico / pre-2024 mainline MCU_adc API:
+            #   setup_minmax(sample_time, sample_count, ...)
+            #   setup_adc_callback(report_time, callback)  # scalar value
+            self.adc.setup_minmax(self._sample_time, self._sample_count)
+            self.adc.setup_adc_callback(self._report_time,
+                                        self._adc_callback_scalar)
 
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)

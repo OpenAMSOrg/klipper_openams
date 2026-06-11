@@ -70,7 +70,7 @@ class LoadTests(unittest.TestCase):
 
     def test_load_completion_success(self):
         sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, gen=0),
                             world(), now=1.0)
         self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
         self.assertEqual(lane_of(sys1).unit, BAY_A)
@@ -79,7 +79,7 @@ class LoadTests(unittest.TestCase):
 
     def test_load_completion_error(self):
         sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY, gen=0),
                             world(), now=1.0)
         self.assertEqual(lane_of(sys1).op, S.OP_UNLOADED)
         self.assertIsNone(lane_of(sys1).unit)
@@ -90,7 +90,7 @@ class LoadTests(unittest.TestCase):
         sys1, fx = S.reduce(sys0, S.Cancel(FPS), world(), now=1.0)
         self.assertEqual(find(fx, S.CancelLoad)[0].unit, BAY_A)
         self.assertEqual(lane_of(sys1).op, S.OP_LOADING)  # still loading until ack
-        sys2, fx2 = S.reduce(sys1, S.OpCompleted(FPS, S.OAMS_OP_CODE_CANCEL),
+        sys2, fx2 = S.reduce(sys1, S.OpCompleted(FPS, S.OAMS_OP_CODE_CANCEL, gen=0),
                              world(), now=2.0)
         self.assertEqual(lane_of(sys2).op, S.OP_UNLOADED)
         self.assertIsNone(lane_of(sys2).unit)          # NOT recorded as loaded
@@ -116,7 +116,7 @@ class LoadBayTests(unittest.TestCase):
 
     def test_load_bay_completion(self):
         sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_B, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, gen=0),
                             world(), now=1.0)
         self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
         self.assertEqual(lane_of(sys1).unit, BAY_B)
@@ -139,7 +139,7 @@ class UnloadTests(unittest.TestCase):
 
     def test_unload_success(self):
         sys0 = system(S.LaneState(op=S.OP_UNLOADING, unit=BAY_A, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, gen=0),
                             world(), now=0.0)
         self.assertEqual(lane_of(sys1).op, S.OP_UNLOADED)
         self.assertIsNone(lane_of(sys1).unit)
@@ -147,7 +147,7 @@ class UnloadTests(unittest.TestCase):
 
     def test_unload_failure_stops_follower_and_stays_loaded(self):
         sys0 = system(S.LaneState(op=S.OP_UNLOADING, unit=BAY_A, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY, gen=0),
                             world(), now=0.0)
         self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
         sf = find(fx, S.SetFollower)
@@ -161,7 +161,8 @@ class CalibrateTests(unittest.TestCase):
                             world(), now=0.0)
         self.assertEqual(lane_of(sys1).op, S.OP_CALIBRATING)
         self.assertEqual(find(fx, S.StartCalibrate)[0].kind, "ptfe")
-        sys2, fx2 = S.reduce(sys1, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, value=1234),
+        sys2, fx2 = S.reduce(sys1, S.OpCompleted(
+            FPS, S.OAMS_OP_CODE_SUCCESS, value=1234, gen=lane_of(sys1).op_gen),
                              world(), now=1.0)
         self.assertEqual(lane_of(sys2).op, S.OP_UNLOADED)
         res = find(fx2, S.Settle)[0].result
@@ -199,8 +200,10 @@ class RunoutTests(unittest.TestCase):
         self.assertEqual(lane_of(s).runout, S.RUNOUT_LOADING)
         self.assertEqual(find(fx, S.StartLoad)[0].unit, BAY_B)
 
-        # 4) reload completes -> unit switched, back to idle
-        s, fx = S.reduce(s, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS), w, now=4.0)
+        # 4) reload completes -> unit switched, back to idle (the reload bumped
+        # the lane's op generation, so the completion must carry it)
+        s, fx = S.reduce(s, S.OpCompleted(
+            FPS, S.OAMS_OP_CODE_SUCCESS, gen=lane_of(s).op_gen), w, now=4.0)
         self.assertEqual(lane_of(s).op, S.OP_LOADED)
         self.assertEqual(lane_of(s).unit, BAY_B)
         self.assertEqual(lane_of(s).runout, S.RUNOUT_IDLE)
@@ -230,7 +233,7 @@ class RunoutTests(unittest.TestCase):
         lane = S.LaneState(op=S.OP_LOADED, group=GROUP, unit=BAY_A,
                            runout=S.RUNOUT_LOADING, reload_target=BAY_B)
         s, fx = S.reduce(system(lane),
-                         S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY),
+                         S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY, gen=0),
                          world(), now=1.0)
         self.assertTrue(has(fx, S.Pause))
         self.assertEqual(lane_of(s).op, S.OP_UNLOADED)
@@ -322,13 +325,16 @@ class OpGenerationTests(unittest.TestCase):
                                                 gen=7), world(), now=1.0)
         self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
 
-    def test_unknown_generation_is_accepted(self):
-        # gen=None (standalone/legacy paths) keeps working.
+    def test_unknown_generation_is_rejected(self):
+        # gen=None marks an unsolicited firmware status (e.g. from an idle
+        # unit on the lane that never started an op); it must not complete
+        # the op in flight.
         sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP,
                                   op_gen=7))
         sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS),
                             world(), now=1.0)
-        self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
+        self.assertEqual(lane_of(sys1).op, S.OP_LOADING)
+        self.assertEqual(fx, [])
 
 
 class TimeoutHardeningTests(unittest.TestCase):
@@ -341,7 +347,7 @@ class TimeoutHardeningTests(unittest.TestCase):
     def test_load_error_does_not_cancel(self):
         # A real firmware error reply means the op already ended on the MCU.
         sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY, gen=0),
                             world(), now=1.0)
         self.assertFalse(has(fx, S.CancelLoad))
 
@@ -413,6 +419,28 @@ class FollowTests(unittest.TestCase):
         self.assertFalse(lane_of(sys1).following)
         self.assertEqual(fx, [])
 
+    def test_load_failure_stops_follower_enabled_mid_load(self):
+        # A follower enabled while a load is in flight must not outlive the
+        # lane's knowledge of its unit when the load fails.
+        sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP,
+                                  following=True, direction=S.FOLLOWER_FORWARD))
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_ERROR_BUSY,
+                                                gen=0), world(), now=1.0)
+        self.assertEqual(lane_of(sys1).op, S.OP_UNLOADED)
+        self.assertFalse(lane_of(sys1).following)
+        sf = find(fx, S.SetFollower)
+        self.assertTrue(sf and sf[0].enable == 0 and sf[0].unit == BAY_A)
+
+    def test_load_cancel_stops_follower_enabled_mid_load(self):
+        sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP,
+                                  following=True, direction=S.FOLLOWER_FORWARD))
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_CANCEL,
+                                                gen=0), world(), now=1.0)
+        self.assertEqual(lane_of(sys1).op, S.OP_UNLOADED)
+        self.assertFalse(lane_of(sys1).following)
+        sf = find(fx, S.SetFollower)
+        self.assertTrue(sf and sf[0].enable == 0)
+
     def test_coasting_clears_following(self):
         lane = S.LaneState(op=S.OP_LOADED, group=GROUP, unit=BAY_A,
                            following=True, runout=S.RUNOUT_PAUSING,
@@ -427,7 +455,7 @@ class FollowTests(unittest.TestCase):
 class StrayCompletionTests(unittest.TestCase):
     def test_completion_with_nothing_in_flight_is_ignored(self):
         sys0 = system(S.LaneState(op=S.OP_LOADED, unit=BAY_A, group=GROUP))
-        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS),
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, gen=0),
                             world(), now=1.0)
         self.assertEqual(lane_of(sys1), lane_of(sys0))
         self.assertEqual(fx, [])
