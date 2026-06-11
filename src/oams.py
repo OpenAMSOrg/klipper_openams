@@ -86,6 +86,9 @@ class OAMS:
         # commands this unit issues (see _apply_action_status).
         self.current_spool = None
         self._pending_bay = None
+        # op_gen the store stamped on the op this unit last started; echoed back
+        # in OpCompleted so the reducer can reject stale or cross-unit replies.
+        self._op_gen = None
 
         # Firmware command handles (resolved at klippy:connect; None until then).
         self.oams_load_spool_cmd = None
@@ -142,7 +145,8 @@ class OAMS:
         self.runtime = runtime
         self.fps_name = fps_name
         self.on_action_complete = (
-            lambda code, value: runtime.dispatch(S.OpCompleted(fps_name, code, value)))
+            lambda code, value, gen: runtime.dispatch(
+                S.OpCompleted(fps_name, code, value, gen=gen)))
 
     # ------------------------------------------------------------------ status
 
@@ -266,7 +270,9 @@ class OAMS:
 
     def _wait_for_action(self, timeout=OAMS_ACTION_TIMEOUT):
         """Bounded wait used by the low-level OAMS_* commands when no runtime is
-        driving completion. Times out instead of hanging on a lost reply."""
+        driving completion. Times out instead of hanging on a lost reply.
+        Returns True if the wait timed out (the firmware op may still be
+        running and should be cancelled where possible)."""
         endtime = self.reactor.monotonic() + timeout
         while self.action_status is not None:
             if self.reactor.monotonic() >= endtime:
@@ -274,8 +280,9 @@ class OAMS:
                                 self.oams_idx)
                 self.action_status_code = OAMS_OP_CODE_ERROR_UNSPECIFIED
                 self.action_status = None
-                break
+                return True
             self.reactor.pause(self.reactor.monotonic() + POLL_INTERVAL)
+        return False
 
     # --------------------------------------------------------------- PID setup
 
@@ -284,6 +291,7 @@ class OAMS:
     def cmd_OAMS_CURRENT_PID_SET(self, gcmd):
         p, i, d = gcmd.get_float("P"), gcmd.get_float("I"), gcmd.get_float("D")
         t = gcmd.get_float("TARGET", self.current_target)
+        self._require_cmd(self.oams_pid_cmd, "PID command")
         self.oams_pid_cmd.send([self.float_to_u32(p), self.float_to_u32(i),
                                 self.float_to_u32(d), self.float_to_u32(t)])
         self.current_kp, self.current_ki, self.current_kd = p, i, d
@@ -296,6 +304,7 @@ class OAMS:
     def cmd_OAMS_PID_SET(self, gcmd):
         p, i, d = gcmd.get_float("P"), gcmd.get_float("I"), gcmd.get_float("D")
         t = gcmd.get_float("TARGET", self.fps_target)
+        self._require_cmd(self.oams_pid_cmd, "PID command")
         self.oams_pid_cmd.send([self.float_to_u32(p), self.float_to_u32(i),
                                 self.float_to_u32(d), self.float_to_u32(t)])
         self.kp, self.ki, self.kd, self.fps_target = p, i, d, t
@@ -317,25 +326,40 @@ class OAMS:
 
     # ----------------------------------------------------- firmware op senders
 
-    def start_load_spool(self, spool_idx):
+    def _require_cmd(self, cmd, name):
+        if cmd is None:
+            raise self.printer.command_error(
+                "OAMS[%s]: %s unavailable (MCU not connected or firmware"
+                " initialization failed; see klippy.log)" % (self.oams_idx, name))
+        return cmd
+
+    def start_load_spool(self, spool_idx, gen=None):
+        cmd = self._require_cmd(self.oams_load_spool_cmd, "load command")
         self._pending_bay = spool_idx
+        self._op_gen = gen
         self.action_status_code = None
         self.action_status = OAMS_STATUS_LOADING
-        self.oams_load_spool_cmd.send([spool_idx])
+        cmd.send([spool_idx])
 
-    def start_unload_spool(self):
+    def start_unload_spool(self, gen=None):
+        cmd = self._require_cmd(self.oams_unload_spool_cmd, "unload command")
+        self._op_gen = gen
         self.action_status_code = None
         self.action_status = OAMS_STATUS_UNLOADING
-        self.oams_unload_spool_cmd.send()
+        cmd.send()
 
-    def start_calibrate(self, kind, bay):
+    def start_calibrate(self, kind, bay, gen=None):
+        if kind == "hub_hes":
+            cmd = self._require_cmd(self.oams_calibrate_hub_hes_cmd,
+                                    "hub HES calibrate command")
+        else:
+            cmd = self._require_cmd(self.oams_calibrate_ptfe_length_cmd,
+                                    "PTFE calibrate command")
+        self._op_gen = gen
         self.action_status_code = None
         self.action_status_value = None
         self.action_status = OAMS_STATUS_CALIBRATING
-        if kind == "hub_hes":
-            self.oams_calibrate_hub_hes_cmd.send([bay])
-        else:
-            self.oams_calibrate_ptfe_length_cmd.send([bay])
+        cmd.send([bay])
 
     def load_spool_cancel(self):
         if self.oams_load_spool_cancel_cmd is None:
@@ -377,7 +401,9 @@ class OAMS:
             return
         # Standalone fallback (no manager bound): bounded blocking.
         self.start_load_spool(bay)
-        self._wait_for_action()
+        if self._wait_for_action():
+            # The firmware op is still running; tell it to stop feeding.
+            self.load_spool_cancel()
         code = self.action_status_code
         if code in (OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL):
             gcmd.respond_info(self._result_message(code, "load"))
@@ -428,7 +454,17 @@ class OAMS:
     def cmd_OAMS_FOLLOWER(self, gcmd):
         enable = gcmd.get_int("ENABLE", minval=0, maxval=1)
         direction = gcmd.get_int("DIRECTION", minval=0, maxval=1)
-        self.set_oams_follower(enable, direction)
+        # When this unit is the lane's loaded unit, go through the store so
+        # LaneState.following/direction stay truthful; otherwise drive the
+        # hardware directly (the store does not track idle units).
+        lane = None
+        if self.runtime is not None:
+            lane = self.runtime.get_state().lanes.get(self.fps_name)
+        if lane is not None and lane.unit is not None \
+                and lane.unit[0] == self.oams_idx:
+            self.runtime.dispatch(S.Follow(self.fps_name, enable, direction))
+        else:
+            self.set_oams_follower(enable, direction)
         if enable == 0:
             gcmd.respond_info("Follower disabled")
         elif direction == FOLLOWER_FORWARD:
@@ -512,13 +548,19 @@ class OAMS:
             elif action == OAMS_STATUS_UNLOADING and code == OAMS_OP_CODE_SUCCESS:
                 self.current_spool = None
         else:
-            logging.error("OAMS[%s]: unexpected action status code=%d action=%d",
-                          self.oams_idx, code, action)
-            self.action_status_code = OAMS_OP_CODE_ERROR_UNSPECIFIED
-        # Publish the completion sentinel last, then notify the store (if bound).
+            # Follower/coast/stop notifications and anything unrecognized are
+            # NOT op completions: dispatching them would falsely complete (or
+            # fail) an in-flight load/unload on this lane. Log and drop.
+            logging.info("OAMS[%s]: ignoring non-completion action status"
+                         " action=%d code=%d", self.oams_idx, action, code)
+            return
+        # Publish the completion sentinel last, then notify the store (if
+        # bound), echoing the op generation this unit was started with so the
+        # reducer can reject stale or cross-unit replies.
         self.action_status = None
         if self.on_action_complete is not None:
-            self.on_action_complete(self.action_status_code, self.action_status_value)
+            self.on_action_complete(self.action_status_code,
+                                    self.action_status_value, self._op_gen)
 
     # -------------------------------------------------------------- utilities
 

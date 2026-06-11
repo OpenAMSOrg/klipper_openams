@@ -4,9 +4,6 @@
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
-import logging
-
-
 class FilamentGroup:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -45,13 +42,6 @@ class FilamentGroup:
         self.bays.append((oam, bay_index))
         if oam not in self.oams:
             self.oams.append(oam)
-
-    def is_any_spool_loaded(self):
-        # A bay counts as loaded when its hub HES reports filament present.
-        for (oam, bay_index) in self.bays:
-            if oam.is_bay_loaded(bay_index):
-                return True
-        return False
 
 
 def load_config_prefix(config):

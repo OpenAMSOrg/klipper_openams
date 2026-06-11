@@ -38,13 +38,19 @@ class Runtime:
         return self.system
 
     def dispatch(self, action):
-        now = self.reactor.monotonic()
-        world = self.build_world(now)
         prev = self.system
         try:
+            now = self.reactor.monotonic()
+            world = self.build_world(now)
             self.system, effects = S.reduce(prev, action, world, now)
         except Exception:
             logging.exception("OAMS: reducer failed on %s", type(action).__name__)
+            # Never leave a gcode waiter blocked on a dispatch that died: fail
+            # the pending op on the action's lane, if any.
+            fps = getattr(action, "fps", None)
+            if fps is not None:
+                self._settle(fps, S.OpResult(False, None,
+                             "internal error (see klippy.log)"))
             return self.system
         self._log_transitions(prev, self.system, action)
         for e in effects:
@@ -52,12 +58,16 @@ class Runtime:
                 self._apply(e)
             except Exception:
                 logging.exception("OAMS: effect %s failed", type(e).__name__)
+                self._effect_failed(e)
         return self.system
 
     def request(self, fps, action):
         """Start an op and return a ReactorCompletion the caller can wait() on.
         The completion is settled by a later OpCompleted/Timeout (or immediately
         if the reducer rejects the request)."""
+        # A waiter normally holds the gcode mutex, so two concurrent requests on
+        # one lane should be impossible — but never leak a previous waiter.
+        self._settle(fps, S.OpResult(False, None, "superseded by a new request"))
         completion = self.reactor.completion()
         self._pending[fps] = completion
         self.dispatch(action)
@@ -82,29 +92,25 @@ class Runtime:
 
     def _apply(self, e):
         if isinstance(e, S.StartLoad):
-            oam = self.resolve_oam(e.unit[0])
-            if oam is not None:
-                oam.start_load_spool(e.unit[1])
+            self._start_oam(e).start_load_spool(e.unit[1], gen=e.gen)
         elif isinstance(e, S.StartUnload):
-            oam = self.resolve_oam(e.unit[0])
-            if oam is not None:
-                oam.start_unload_spool()
+            self._start_oam(e).start_unload_spool(gen=e.gen)
         elif isinstance(e, S.StartCalibrate):
-            oam = self.resolve_oam(e.unit[0])
-            if oam is not None:
-                oam.start_calibrate(e.kind, e.unit[1])
+            self._start_oam(e).start_calibrate(e.kind, e.unit[1], gen=e.gen)
         elif isinstance(e, S.CancelLoad):
             oam = self.resolve_oam(e.unit[0])
-            if oam is not None:
+            if oam is None:
+                logging.warning("OAMS: cannot cancel load, unit %s unknown",
+                                e.unit[0])
+            else:
                 oam.load_spool_cancel()
         elif isinstance(e, S.SetFollower):
             oam = self.resolve_oam(e.unit[0])
-            if oam is not None:
+            if oam is None:
+                logging.warning("OAMS: cannot set follower, unit %s unknown",
+                                e.unit[0])
+            else:
                 oam.set_oams_follower(e.enable, e.direction)
-        elif isinstance(e, S.Led):
-            oam = self.resolve_oam(e.unit[0])
-            if oam is not None:
-                oam.set_led_error(e.unit[1], e.on)
         elif isinstance(e, S.Pause):
             self._pause(e.reason)
         elif isinstance(e, S.ArmDeadline):
@@ -113,6 +119,30 @@ class Runtime:
             self._cancel_deadline(e.fps)
         elif isinstance(e, S.Settle):
             self._settle(e.fps, e.result)
+
+    def _start_oam(self, e):
+        """Resolve the OAMS unit a Start* effect targets, or raise so the
+        failure is surfaced now instead of as a generic timeout 120 s later."""
+        oam = self.resolve_oam(e.unit[0])
+        if oam is None:
+            raise RuntimeError("OAMS unit %s is not configured" % (e.unit[0],))
+        return oam
+
+    def _effect_failed(self, e):
+        # A Start* effect that raised (unit missing, MCU not connected, send
+        # failure) leaves the lane in an in-flight op state that nothing will
+        # ever complete before the deadline. Fail it now — deferred one reactor
+        # iteration so the current dispatch (including a trailing ArmDeadline)
+        # finishes first.
+        if not isinstance(e, (S.StartLoad, S.StartUnload, S.StartCalibrate)):
+            return
+        fps, gen = e.fps, e.gen
+
+        def fail(eventtime):
+            self.dispatch(S.OpCompleted(
+                fps, S.OAMS_OP_CODE_ERROR_KLIPPER_CALL, gen=gen))
+
+        self.reactor.register_async_callback(fail)
 
     def _pause(self, reason):
         try:
@@ -147,7 +177,7 @@ class Runtime:
 
     def _check_stalls(self):
         now = self.reactor.monotonic()
-        for fps, lane in self.system.lanes.items():
+        for fps, lane in list(self.system.lanes.items()):
             if lane.op not in (S.OP_LOADING, S.OP_UNLOADING) or lane.unit is None:
                 self._stall.pop(fps, None)
                 continue
@@ -163,8 +193,12 @@ class Runtime:
                 continue
             if abs(samples[-1] - samples[0]) < MIN_ENCODER_DIFF:
                 logging.info("OAMS[%s]: %s stall detected", fps, lane.op)
-                oam.set_led_error(lane.unit[1], 1)
-                self._pause("%s speed too low" % lane.op.lower())
+                unit, op = lane.unit, lane.op
                 self._stall.pop(fps, None)
-                # Fail the op (settles any waiter) via the unified timeout path.
+                # Fail the op FIRST (settles any waiter via the unified timeout
+                # path). The waiter may hold the gcode mutex that _pause's
+                # run_script("PAUSE") needs, so pausing before settling would
+                # block this tick until the op deadline rescued it.
                 self.dispatch(S.Timeout(fps))
+                oam.set_led_error(unit[1], 1)
+                self._pause("%s speed too low" % op.lower())

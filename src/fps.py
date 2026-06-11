@@ -19,9 +19,7 @@ class FPS:
         self.name = config.get_name()              # "fps" or "fps <name>"
         self.fps_name = self.name.split()[-1]      # short lane key
 
-        # state
         self.fps_value = 0.0
-        self.callbacks = []
 
         self._pin = config.get('pin')
         self._sample_count = config.getint('sample_count', 5)
@@ -33,38 +31,53 @@ class FPS:
         self._sf_max_speed = config.getfloat('max_speed', 300.0)
         self._accel = config.getfloat('accel', 0.0)
         self._set_point = config.getfloat('set_point', 0.5)
-        # Accepted for compatibility; mainline Klipper and Kalico share the same
-        # MCU_adc.setup_adc_sample API so this no longer changes behaviour.
         self._use_kalico = config.getboolean('use_kalico', False)
 
-        # The toolhead extruder this lane feeds (resolved at ready).
+        # The toolhead extruder this lane feeds (resolved at connect).
         self.extruder_name = config.get('extruder', 'extruder')
         self.extruder = None
 
         self.ppins = self.printer.lookup_object('pins')
         self.adc = self.ppins.setup_pin('adc', self._pin)
-        # Klipper signature: setup_adc_sample(report_time, sample_time, sample_count)
-        self.adc.setup_adc_sample(self._report_time,
-                                  sample_time=self._sample_time,
-                                  sample_count=self._sample_count)
-        self.adc.setup_adc_callback(self._adc_callback)
+        if self._use_kalico:
+            # Kalico keeps the pre-2024 mainline MCU_adc API:
+            #   setup_minmax(sample_time, sample_count, ...)
+            #   setup_adc_callback(report_time, callback)  # scalar value
+            self.adc.setup_minmax(self._sample_time, self._sample_count)
+            self.adc.setup_adc_callback(self._report_time,
+                                        self._adc_callback_scalar)
+        else:
+            # Current mainline Klipper API:
+            #   setup_adc_sample(report_time, sample_time, sample_count)
+            #   setup_adc_callback(callback)  # list of (time, value) samples
+            self.adc.setup_adc_sample(self._report_time,
+                                      sample_time=self._sample_time,
+                                      sample_count=self._sample_count)
+            self.adc.setup_adc_callback(self._adc_callback)
 
-        self.printer.register_event_handler("klippy:ready", self._handle_ready)
+        self.printer.register_event_handler("klippy:connect",
+                                            self._handle_connect)
 
-    def _handle_ready(self):
-        self.extruder = self.printer.lookup_object(self.extruder_name)
-
-    def add_callback(self, callback):
-        self.callbacks.append(callback)
+    def _handle_connect(self):
+        self.extruder = self.printer.lookup_object(self.extruder_name, None)
+        if self.extruder is None:
+            raise self.printer.config_error(
+                "[%s]: extruder '%s' not found; check the 'extruder:' option"
+                % (self.name, self.extruder_name))
 
     def _adc_callback(self, samples):
-        # Klipper delivers a list of (read_time, value) samples; use the latest.
+        # Mainline Klipper delivers a list of (read_time, value); use the latest.
         read_time, read_value = samples[-1]
+        self._update_value(read_value)
+
+    def _adc_callback_scalar(self, read_time, read_value):
+        # Kalico delivers one (read_time, value) pair per report.
+        self._update_value(read_value)
+
+    def _update_value(self, read_value):
         if self._reversed:
             read_value = 1.0 - read_value
         self.fps_value = read_value
-        for callback in self.callbacks:
-            callback(read_time, read_value)
 
     def get_status(self, eventtime):
         return {'fps_value': self.fps_value}

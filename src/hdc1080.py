@@ -34,6 +34,11 @@ HUMI_RES_8  = 0x0200 # 8 bit humidity resolution
 
 HUMI_RES = {14: HUMI_RES_14, 11: HUMI_RES_11,8:  HUMI_RES_8}
 
+# Consecutive failed measurement cycles tolerated before the sensor is declared
+# dead. Holding the last good reading hides a transient I2C glitch, but a sensor
+# that stays silent must not keep reporting a frozen value as fresh forever.
+MAX_CONSECUTIVE_FAILURES = 6
+
 class HDC1080:
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -69,6 +74,7 @@ class HDC1080:
                 
         self.is_calibrated  = False
         self.init_sent = False
+        self.consecutive_failures = 0
 
     def handle_connect(self):
         self._init_device()
@@ -146,7 +152,9 @@ class HDC1080:
             logging.info("hdc1080: init not sent")
             return False
         # On a transient read error keep the last good value rather than
-        # fabricating 0.0, which could spuriously trip a configured min_temp.
+        # fabricating 0.0, which could spuriously trip a configured min_temp —
+        # but count the failures so a dead sensor cannot keep reporting a
+        # frozen value as fresh forever.
         temp = self._read_temp()
         if temp is not None:
             self.temp = temp + self.temp_offset
@@ -154,11 +162,21 @@ class HDC1080:
         humidity = self._read_humi()
         if humidity is not None:
             self.humidity = humidity + self.humidity_offset
+        if temp is None or humidity is None:
+            self.consecutive_failures += 1
+        else:
+            self.consecutive_failures = 0
         return True
 
     def _sample_hdc1080(self, eventtime):
         if not self._make_measurements():
             self.temp = self.humidity = .0
+            return self.reactor.NEVER
+
+        if self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            self.printer.invoke_shutdown(
+                "HDC1080 %s: sensor not responding (%d consecutive failed"
+                " reads)" % (self.name, self.consecutive_failures))
             return self.reactor.NEVER
 
         if self.temp < self.min_temp or self.temp > self.max_temp:
