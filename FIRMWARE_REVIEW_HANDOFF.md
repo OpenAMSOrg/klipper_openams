@@ -186,14 +186,64 @@ Useful firmware-source facts from that session:
 - The firmware op state machine is already refactored to a single `g_op`
   with op_begin/op_finish chokepoints in src/sysvars.cpp — start there for
   the section 5 agenda.
-- The firmware session reported it answered the section 5 contract agenda
-  ("the contract answers below"), but that part of its summary was not
-  relayed here. Until those numbered answers (with file:line evidence) reach
-  the host side, treat the agenda as UNCONFIRMED — items 2, 4 and 6 in
-  particular gate host-side changes (completion filter, timeout-cancel
-  semantics, gen-FIFO vs a real correlation id).
+- The section 5 agenda was ANSWERED (firmware 2.0.25 source, file:line
+  evidence relayed 2026-06-12) — see verdicts inline in section 5 below.
+  Net: no completion-attribution bugs firmware-side; the op_begin/op_finish
+  refactor (src/sysvars.cpp) already guarantees the invariants the host's
+  gen-FIFO depends on. T4 shipped no firmware changes; T2+T3 did.
 
-## 5. Mainboard firmware protocol review agenda (STILL OPEN — not yet done)
+## 5. Mainboard firmware protocol review agenda — ANSWERED (2026-06-12)
+
+Verdicts from the firmware review (2.0.25, `_clang` implementation), keyed to
+the questions below. Host-side consequences are marked [HOST].
+
+1. CONFIRMED: exactly one completion per op on every path; op_finish is
+   idempotent (sysvars.cpp:49, `if (!g_op.busy) return;`). The historical
+   ERROR-then-CANCEL double is structurally prevented. Gen-FIFO assumption
+   holds.
+2. CONFIRMED SAFE: code 5 is attached in exactly one place
+   (calibrate-hes cancel via emergency stop, main.cpp:283), always with
+   action=CALIBRATING. Follower paths use BUSY/NO_SPOOL_IN_BAY, never 5.
+   [HOST: the `or code==5` clause in oams.py _apply_action_status is
+   redundant for 2.0.25 — kept, commented, for other firmware versions.]
+3. CONFIRMED: no spontaneous status is op-terminating. Follower watchdog
+   stop and follower_stop emit nothing; COASTING(4) is never emitted at all;
+   actions 2/3/5 appear only as direct oams_cmd_follower responses (already
+   dropped host-side).
+4. CONFIRMED SAFE: load-cancel is a no-op (no status, no wedge) unless a
+   load task is enabled. Minor gap: cancel during the ptfe-calibration
+   unload phase is not honored — irrelevant today because the host only
+   cancels loads (the reducer's Cancel requires OP_LOADING; calibrate
+   timeouts emit no CancelLoad). Do not change that without firmware work.
+5. CONFIRMED: firmware-side watchdog stops a REVERSE follower after 10 s
+   without get_clock (host-death proxy; main.cpp:1028-1046). Forward
+   following deliberately keeps running to avoid starving a print.
+6. ASSESSED, NOT IMPLEMENTED: nonce protocol sketched (~30-40 LOC firmware,
+   new oams_cmd_*2 / oams_action_status2, host feature-detects via
+   lookup_command). DECISION PENDING — with 1/7 confirmed, the FIFO's only
+   residual exposure is a genuinely lost CAN reply (fails by deadline,
+   safe-but-slow), so the nonce is nice-to-have, not required.
+7. CONFIRMED both interlocks: concurrent op -> op_begin replies BUSY(2)
+   with the REQUESTED action (completion-class); occupied hub ->
+   SPOOL_ALREADY_IN_BAY(3). [HOST: a BUSY rejection is consumed by the
+   completion filter — correctly attributed because the store enforces one
+   in-flight op per lane/unit; keep that invariant. describe_code() now
+   renders codes 2/3/4 readably in user messages.]
+8. CONFIRMED: encoder_clicks is a 32-bit software accumulator; 1 s diffs in
+   the host stall detector are safe.
+9. CONFIRMED: ptfe_length unit is encoder clicks end-to-end; 0 is safe
+   (only gates the slow-down point; no div-by-zero). Host's /1.14 factor is
+   host-side only.
+10. CONFIRMED: stats every 450 ms, copied in one pass under a cooperative
+    scheduler -> each oams_cmd_stats is an internally-coherent snapshot
+    (host reads once per second).
+11. MOSTLY SOLID: CRC-gated commit, page-ACK flow, out-of-order chunk
+    rejection, retry-able copy failure. Residual: power loss during the
+    active-region erase/copy is unrecoverable (no fallback bootloader).
+    [HOST: flash_bootloader.py now prints a do-not-power-off warning at
+    commit.]
+
+Original agenda (kept for context; all items now answered above):
 
 Repo: `OpenAMSOrg/mainboard-firmware` (private, C++, STM32F072RBT). It speaks
 Klipper's MCU protocol over CAN. Review it against the host-side contract

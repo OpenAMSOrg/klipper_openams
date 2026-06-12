@@ -247,7 +247,13 @@ class BootloaderFlasher:
     
     async def commit_bootloader(self) -> None:
         """Send COMMIT command to flash bootloader to active area"""
+        # The staged image is CRC-verified and commit is the last, fastest
+        # step, but the device has no fallback bootloader: a power cut during
+        # the active-region erase/copy is unrecoverable over CAN.
         output("Committing bootloader to flash...")
+        output("*** DO NOT power off the device until this completes —"
+               " a power loss during commit bricks the bootloader and"
+               " requires SWD/DFU recovery ***")
         await self._send_admin_command(ADMIN_CMD_BOOTLOADER_UPDATE_COMMIT)
         
         try:

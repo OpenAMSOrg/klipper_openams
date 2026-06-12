@@ -25,6 +25,25 @@ OAMS_OP_CODE_NO_SPOOL_IN_BAY = 4
 OAMS_OP_CODE_ERROR_KLIPPER_CALL = 5
 OAMS_OP_CODE_CANCEL = 6
 
+
+def describe_code(code):
+    """Human-readable form of a firmware result code for user-facing
+    messages. Verified against firmware 2.0.25: BUSY is op_begin's rejection
+    of a concurrent op, ALREADY_IN_BAY is the load coroutine's occupied-hub
+    rejection, NO_SPOOL_IN_BAY is unload-with-nothing-loaded, KLIPPER_CALL is
+    a calibration aborted via emergency stop."""
+    if code == OAMS_OP_CODE_ERROR_BUSY:
+        return "OAMS is busy with another operation"
+    if code == OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY:
+        return "filament already detected in the hub"
+    if code == OAMS_OP_CODE_NO_SPOOL_IN_BAY:
+        return "no spool present in the bay"
+    if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
+        return "stopped by klipper monitor"
+    if code == OAMS_OP_CODE_CANCEL:
+        return "cancelled"
+    return "code %s" % (code,)
+
 # --- follower directions (firmware convention) ---
 FOLLOWER_REVERSE = 0
 FOLLOWER_FORWARD = 1
@@ -411,7 +430,7 @@ def _complete(lane, code, value, now, fps, timed_out=False):
                      reload_target=None, op_deadline=None,
                      message="reload failed")
         reason = ("timed out loading next spool" if timed_out
-                  else "failed to load next spool (code %s)" % (code,))
+                  else "failed to load next spool (%s)" % describe_code(code))
         effects = [CancelDeadline(fps)]
         if timed_out and lane.reload_target is not None:
             # The firmware op is still running; tell it to stop feeding.
@@ -439,7 +458,7 @@ def _complete(lane, code, value, now, fps, timed_out=False):
         nl = replace(lane, op=OP_UNLOADED, group=None, unit=None,
                      following=False, op_deadline=None, message="load failed")
         msg = ("timed out loading spool" if timed_out
-               else "Spool loading failed (code %s)" % (code,))
+               else "Spool loading failed (%s)" % describe_code(code))
         effects = [CancelDeadline(fps)]
         if timed_out and lane.unit is not None:
             # The firmware op is still running; tell it to stop feeding rather
@@ -460,7 +479,7 @@ def _complete(lane, code, value, now, fps, timed_out=False):
         nl = replace(lane, op=OP_LOADED, following=False, op_deadline=None,
                      message="unload failed")
         msg = ("timed out unloading spool" if timed_out
-               else "Spool unloading failed (code %s)" % (code,))
+               else "Spool unloading failed (%s)" % describe_code(code))
         effects = [CancelDeadline(fps)]
         if lane.unit is not None:
             effects.append(SetFollower(lane.unit, 0, FOLLOWER_REVERSE))
@@ -473,7 +492,7 @@ def _complete(lane, code, value, now, fps, timed_out=False):
                      message=("calibrated" if ok else "calibration failed"))
         msg = ("Calibration complete" if ok
                else ("timed out calibrating" if timed_out
-                     else "Calibration failed (code %s)" % (code,)))
+                     else "Calibration failed (%s)" % describe_code(code)))
         return nl, [CancelDeadline(fps),
                     Settle(fps, OpResult(ok, code, msg, value))]
 

@@ -23,7 +23,6 @@ from . import oams_state as S
 from .oams_state import (
     OAMS_OP_CODE_SUCCESS,
     OAMS_OP_CODE_ERROR_UNSPECIFIED,
-    OAMS_OP_CODE_ERROR_BUSY,
     OAMS_OP_CODE_ERROR_KLIPPER_CALL,
     OAMS_OP_CODE_CANCEL,
     FOLLOWER_REVERSE,
@@ -386,11 +385,7 @@ class OAMS:
             return "Spool %sed successfully" % verb
         if code == OAMS_OP_CODE_CANCEL:
             return "Spool %sing cancelled" % verb
-        if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
-            return "Spool %sing stopped by klipper monitor" % verb
-        if code == OAMS_OP_CODE_ERROR_BUSY:
-            return "OAMS is busy"
-        return "Spool %sing failed (code %s)" % (verb, code)
+        return "Spool %sing failed (%s)" % (verb, S.describe_code(code))
 
     cmd_OAMS_LOAD_SPOOL_help = "Load a specific bay on this OAMS"
 
@@ -546,6 +541,10 @@ class OAMS:
         if action == OAMS_STATUS_CALIBRATING:
             self.action_status_value = params["value"]
             self.action_status_code = code
+        # Verified against firmware 2.0.25: code 5 (KLIPPER_CALL) only ever
+        # co-occurs with action=CALIBRATING, so the `or` clause is redundant
+        # there — kept for robustness against other firmware versions. The
+        # follower paths (actions 2-5) only use codes BUSY/NO_SPOOL_IN_BAY.
         elif action in (OAMS_STATUS_LOADING, OAMS_STATUS_UNLOADING,
                         OAMS_STATUS_ERROR) or code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
             self.action_status_code = code
