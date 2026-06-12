@@ -121,7 +121,53 @@ Commit `a671eab` (issues found reviewing 6caa9a9 itself):
 - `_result_message` (oams.py) duplicates reducer message strings — cosmetic.
 - Manager-level commands have no unit-test harness (reducer + runtime do).
 
-## 4. Mainboard firmware review agenda (the reason for the new session)
+## 4. Firmware session outcome (2026-06: build/linker work — protocol agenda still OPEN)
+
+A session on `openamsorg/mainboard-firmware` produced branch
+`claude/firmware-sysvar-review-tb2n6x` (commit `6783c2d`). Scope was
+build/linker only — NO application source, protocol, or codegen changes, so
+the Klipper command/response interface (generated `klipper_impl.hpp`) is
+unchanged. App version 2.0.25, bootloader 1.4.0. **None of the contract
+questions in section 5 below were investigated; they remain open.**
+
+What changed (firmware side):
+- Four build artifacts instead of three:
+  - `kancan_1.4.0.bin` — bootloader only, flashed at 0x08000000.
+  - `oams_2.0.25.bin` — app linked at offset 0x4000, runs behind the
+    bootloader (the Katapult/CAN-update target).
+  - `kancan_1.4.0_oams_2.0.25.bin` — combined image at 0x08000000.
+  - NEW `oams_standalone_2.0.25.bin` — app linked at 0x08000000, no
+    bootloader, flashed via DFU/ST-Link only. No metadata footer; CANNOT be
+    updated over CAN/Katapult. Opt-in build: `pio run -e standalone`.
+- Linker maps hardened so the app stack cannot clobber the
+  reset-into-bootloader magic word at SRAM 0x20003FFC (more reliable
+  handoff; no host-visible change).
+- Memory map: bootloader active 0x08000000-0x08002000 (8KB), self-update
+  staging 0x08002000-0x08004000, app 0x08004000-0x08020000. Standalone app
+  occupies 0x08000000-0x08020000.
+- NOT yet build- or hardware-verified (registry was network-blocked): the
+  8KB bootloader link-time ASSERT and the standalone link location need a
+  real `pio run`.
+
+Host-side consequences applied on this branch:
+- `scripts/flash_bootloader.py` now requires an explicit confirmation
+  (skippable with `-y`) before writing: its staging (0x08002000) and commit
+  (0x08000000) regions are application code on a standalone device, and the
+  variant cannot be detected over CAN, so flashing a standalone board would
+  brick it until SWD/DFU reflash.
+
+New firmware follow-up items (for the next firmware session):
+- F1. Verify the build: `pio run` for all 4 envs; confirm the 8KB bootloader
+  ASSERT and standalone link addresses.
+- F2. Make the admin bootloader-update handler REFUSE on standalone builds
+  (it can know at compile time, or check VTOR at runtime). Today the app
+  source is shared, so a standalone device will happily erase its own code
+  when sent ADMIN_CMD_BOOTLOADER_UPDATE_*. The host-side confirmation prompt
+  is only a mitigation.
+- F3. Consider an admin command to report firmware variant/metadata so host
+  tools can detect standalone devices instead of asking the operator.
+
+## 5. Mainboard firmware protocol review agenda (STILL OPEN — not yet done)
 
 Repo: `OpenAMSOrg/mainboard-firmware` (private, C++, STM32F072RBT). It speaks
 Klipper's MCU protocol over CAN. Review it against the host-side contract

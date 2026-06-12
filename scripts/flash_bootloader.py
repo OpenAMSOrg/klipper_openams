@@ -3,6 +3,16 @@
 Bootloader Update Tool for Mainboard Firmware
 Uses admin CAN channel (0x3f0/0x3f1) to flash bootloader over CAN
 
+WARNING: Only use against devices running the normal bootloader-based
+firmware (oams_*.bin at offset 0x4000, or the combined kancan_*_oams_*.bin
+image). A device flashed with the STANDALONE image (oams_standalone_*.bin,
+linked at 0x08000000 with no bootloader) has its application code in the very
+flash regions this tool erases — the staging area (0x08002000) and the
+bootloader slot (0x08000000) — so running this tool against it will corrupt
+the running application and brick the board until it is reflashed over
+SWD/DFU. The device cannot be interrogated for which variant it runs, so this
+tool asks for confirmation before writing.
+
 Copyright JR Lomas (C) 2026
 This file may be distributed under the terms of the GNU GPLv3 license.
 """
@@ -285,18 +295,42 @@ class BootloaderFlasher:
                 self.cansock.close()
 
 
+def confirm_not_standalone() -> bool:
+    """The flash regions this tool writes hold application code on a
+    standalone-firmware device, and the variant cannot be detected over CAN.
+    Make the operator assert which firmware the target runs."""
+    output(
+        "\nWARNING: this tool erases flash at 0x08000000-0x08004000 over CAN.\n"
+        "On a device flashed with the STANDALONE image (oams_standalone_*.bin,\n"
+        "no bootloader) those regions contain the running application: the\n"
+        "update will corrupt it and brick the board until reflashed via\n"
+        "SWD/DFU. Only proceed if the target runs the bootloader-based\n"
+        "firmware (oams_*.bin at offset 0x4000 or the combined image).\n")
+    try:
+        answer = input("Type 'yes' to confirm the target is NOT standalone: ")
+    except EOFError:
+        return False
+    return answer.strip().lower() == "yes"
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Flash bootloader over CAN using admin channel")
     parser.add_argument("-i", "--interface", required=True, help="CAN interface (e.g., can0)")
     parser.add_argument("-u", "--uuid", required=True, help="Target device UUID (12 hex chars)")
     parser.add_argument("-f", "--file", required=True, type=pathlib.Path, help="Bootloader binary file")
-    
+    parser.add_argument("-y", "--yes", action="store_true",
+                        help="Skip the standalone-firmware safety confirmation")
+
     args = parser.parse_args()
-    
+
     if not args.file.exists():
         output(f"Error: Bootloader file not found: {args.file}")
         return 1
-    
+
+    if not args.yes and not confirm_not_standalone():
+        output("Aborted.")
+        return 1
+
     flasher = BootloaderFlasher(args.interface, args.uuid, args.file)
     
     try:
