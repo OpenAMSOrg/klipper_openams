@@ -156,16 +156,42 @@ Host-side consequences applied on this branch:
   variant cannot be detected over CAN, so flashing a standalone board would
   brick it until SWD/DFU reflash.
 
-New firmware follow-up items (for the next firmware session):
-- F1. Verify the build: `pio run` for all 4 envs; confirm the 8KB bootloader
-  ASSERT and standalone link addresses.
-- F2. Make the admin bootloader-update handler REFUSE on standalone builds
-  (it can know at compile time, or check VTOR at runtime). Today the app
-  source is shared, so a standalone device will happily erase its own code
-  when sent ADMIN_CMD_BOOTLOADER_UPDATE_*. The host-side confirmation prompt
-  is only a mitigation.
-- F3. Consider an admin command to report firmware variant/metadata so host
-  tools can detect standalone devices instead of asking the operator.
+Firmware follow-up status (second firmware session, branch now at `c666498`):
+- F1 build verification: STILL BLOCKED — the remote env's network policy
+  blocks api.registry.platformio.org, so `pio run` could not install the
+  ststm32 platform. Needs a LOCAL `pio run` for all 4 envs (8KB bootloader
+  link ASSERT, standalone link address, and the new standalone guard are all
+  unbuilt). The standalone env now defines `-DOAMS_STANDALONE_BUILD=1`.
+- F2 DONE: all five admin update handlers in src/bootloader_update.cpp begin
+  with BL_REFUSE_IF_STANDALONE — on standalone builds they reply
+  <cmd, ADMIN_RESP_ERROR=0x01> on 0x3f1 and touch no flash. Detection:
+  `firmware_is_standalone()` = OAMS_STANDALONE_BUILD flag with a
+  link-address fallback (&fn < APP_START_ADDR).
+- F3 DONE: new admin command ADMIN_CMD_QUERY_VARIANT = 0x30
+  (src/bootloader_update.cpp::process_admin_query_variant, dispatched in
+  main.cpp). Read-only, safe on every build; only the addressed UUID
+  replies. Request [0x30][UUID x6][reserved 0]; response
+  [0x30][variant 0=bootloader-based 1=standalone][ver major][minor][patch]
+  [app-offset high byte (0x40 => 0x4000, 0x00 => standalone)][reserved]
+  [status 0x00=OK].
+  HOST SIDE DONE on this branch: scripts/flash_bootloader.py probes 0x30
+  before any flash-touching command, hard-refuses standalone targets, and
+  falls back to the operator prompt only for firmware too old to answer
+  (-y skips only that fallback, never a positive standalone report).
+
+Useful firmware-source facts from that session:
+- Active app source is the `_clang` variants (klipper_oams_clang.hpp +
+  generated klipper_impl_clang.hpp); src/lark_impl/* is EXCLUDED from the
+  build — don't review the wrong implementation.
+- The firmware op state machine is already refactored to a single `g_op`
+  with op_begin/op_finish chokepoints in src/sysvars.cpp — start there for
+  the section 5 agenda.
+- The firmware session reported it answered the section 5 contract agenda
+  ("the contract answers below"), but that part of its summary was not
+  relayed here. Until those numbered answers (with file:line evidence) reach
+  the host side, treat the agenda as UNCONFIRMED — items 2, 4 and 6 in
+  particular gate host-side changes (completion filter, timeout-cancel
+  semantics, gen-FIFO vs a real correlation id).
 
 ## 5. Mainboard firmware protocol review agenda (STILL OPEN — not yet done)
 

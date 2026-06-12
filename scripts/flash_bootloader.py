@@ -3,15 +3,16 @@
 Bootloader Update Tool for Mainboard Firmware
 Uses admin CAN channel (0x3f0/0x3f1) to flash bootloader over CAN
 
-WARNING: Only use against devices running the normal bootloader-based
+WARNING: Only usable against devices running the normal bootloader-based
 firmware (oams_*.bin at offset 0x4000, or the combined kancan_*_oams_*.bin
 image). A device flashed with the STANDALONE image (oams_standalone_*.bin,
 linked at 0x08000000 with no bootloader) has its application code in the very
 flash regions this tool erases — the staging area (0x08002000) and the
-bootloader slot (0x08000000) — so running this tool against it will corrupt
-the running application and brick the board until it is reflashed over
-SWD/DFU. The device cannot be interrogated for which variant it runs, so this
-tool asks for confirmation before writing.
+bootloader slot (0x08000000). Before writing anything, the tool queries the
+device's firmware variant (admin command 0x30) and refuses standalone
+targets; firmware too old to answer the query falls back to an operator
+confirmation (recent standalone firmware also refuses the update commands
+itself, replying ADMIN_RESP_ERROR).
 
 Copyright JR Lomas (C) 2026
 This file may be distributed under the terms of the GNU GPLv3 license.
@@ -39,6 +40,14 @@ ADMIN_CMD_BOOTLOADER_UPDATE_CHUNK = 0x21
 ADMIN_CMD_BOOTLOADER_UPDATE_VERIFY = 0x22
 ADMIN_CMD_BOOTLOADER_UPDATE_COMMIT = 0x23
 ADMIN_CMD_BOOTLOADER_UPDATE_ABORT = 0x24
+# Variant/metadata query (firmware >= the claude/firmware-sysvar-review
+# branch). Request: [0x30][UUID 6 bytes][reserved 0]. Response:
+# [0x30][variant: 0=bootloader-based 1=standalone][ver major][ver minor]
+# [ver patch][app offset high byte][reserved][status 0x00=OK].
+ADMIN_CMD_QUERY_VARIANT = 0x30
+
+VARIANT_BOOTLOADER_BASED = 0x00
+VARIANT_STANDALONE = 0x01
 
 # Response codes
 ADMIN_RESP_SUCCESS = 0x00
@@ -64,12 +73,14 @@ def crc32(data: bytes) -> int:
 
 
 class BootloaderFlasher:
-    def __init__(self, can_interface: str, uuid: str, bootloader_path: pathlib.Path):
+    def __init__(self, can_interface: str, uuid: str, bootloader_path: pathlib.Path,
+                 assume_yes: bool = False):
         self.can_interface = can_interface
         self.uuid = bytes.fromhex(uuid)
         if len(self.uuid) != 6:
             raise ValueError("UUID must be 12 hex characters (6 bytes)")
         self.bootloader_path = bootloader_path
+        self.assume_yes = assume_yes
         self.cansock: Optional[socket.socket] = None
         self.loop: Optional[asyncio.AbstractEventLoop] = None
         self.response_queue: asyncio.Queue = asyncio.Queue()
@@ -135,6 +146,49 @@ class BootloaderFlasher:
                 return resp
             # else: stale response for a different command — discard and retry
     
+    async def query_variant(self) -> Optional[dict]:
+        """Ask the device which firmware variant it runs (0x30). Returns a
+        dict with variant/version, or None when the device does not answer
+        (firmware predating the query command)."""
+        payload = self.uuid + b'\x00'    # UUID (6 bytes) + reserved
+        await self._send_admin_command(ADMIN_CMD_QUERY_VARIANT, payload)
+        try:
+            resp = await self._wait_response(
+                timeout=2.0, expected_cmd=ADMIN_CMD_QUERY_VARIANT)
+        except TimeoutError:
+            return None
+        if len(resp) < 8 or resp[7] != 0x00:
+            output(f"Warning: malformed variant response: {resp.hex()}")
+            return None
+        return {
+            "variant": resp[1],
+            "version": f"{resp[2]}.{resp[3]}.{resp[4]}",
+            "app_offset": resp[5] << 8,
+        }
+
+    async def check_target_variant(self) -> None:
+        """Refuse standalone targets; fall back to operator confirmation when
+        the firmware is too old to report its variant."""
+        info = await self.query_variant()
+        if info is not None:
+            if info["variant"] == VARIANT_STANDALONE:
+                raise RuntimeError(
+                    "Target reports STANDALONE firmware v%s (app at"
+                    " 0x08000000, no bootloader). A bootloader update would"
+                    " overwrite the running application — refusing. Reflash"
+                    " this device over SWD/DFU instead." % info["version"])
+            output("Target reports bootloader-based firmware v%s"
+                   " (app offset 0x%04x)" % (info["version"], info["app_offset"]))
+            return
+        # Old firmware: variant unknown; require a human assertion.
+        output("Device did not answer the variant query (older firmware);"
+               " cannot verify it is not standalone.")
+        if self.assume_yes:
+            output("--yes given: proceeding without variant verification")
+            return
+        if not confirm_not_standalone():
+            raise RuntimeError("Aborted: target variant not confirmed")
+
     async def start_update(self, size: int) -> None:
         """Send START command with UUID and size in KB"""
         size_kb = (size + 1023) // 1024  # Round up to KB
@@ -239,8 +293,13 @@ class BootloaderFlasher:
         self.loop = asyncio.get_event_loop()
         self.loop.add_reader(self.cansock.fileno(), self._handle_can_response)
         
+        update_started = False
         try:
+            # Refuse standalone targets before any flash-touching command
+            await self.check_target_variant()
+
             # Start update
+            update_started = True
             await self.start_update(len(bootloader_data))
             
             # Send data in chunks
@@ -286,7 +345,8 @@ class BootloaderFlasher:
             
         except Exception as e:
             output(f"Error during flash: {e}")
-            await self.abort_update()
+            if update_started:
+                await self.abort_update()
             raise
         finally:
             if self.loop and self.cansock:
@@ -296,9 +356,9 @@ class BootloaderFlasher:
 
 
 def confirm_not_standalone() -> bool:
-    """The flash regions this tool writes hold application code on a
-    standalone-firmware device, and the variant cannot be detected over CAN.
-    Make the operator assert which firmware the target runs."""
+    """Fallback for firmware that predates the variant query (0x30): the
+    flash regions this tool writes hold application code on a standalone
+    device, so make the operator assert which firmware the target runs."""
     output(
         "\nWARNING: this tool erases flash at 0x08000000-0x08004000 over CAN.\n"
         "On a device flashed with the STANDALONE image (oams_standalone_*.bin,\n"
@@ -319,7 +379,9 @@ async def main():
     parser.add_argument("-u", "--uuid", required=True, help="Target device UUID (12 hex chars)")
     parser.add_argument("-f", "--file", required=True, type=pathlib.Path, help="Bootloader binary file")
     parser.add_argument("-y", "--yes", action="store_true",
-                        help="Skip the standalone-firmware safety confirmation")
+                        help="Skip the operator confirmation when the device is"
+                             " too old to report its firmware variant (devices"
+                             " that report STANDALONE are always refused)")
 
     args = parser.parse_args()
 
@@ -327,11 +389,8 @@ async def main():
         output(f"Error: Bootloader file not found: {args.file}")
         return 1
 
-    if not args.yes and not confirm_not_standalone():
-        output("Aborted.")
-        return 1
-
-    flasher = BootloaderFlasher(args.interface, args.uuid, args.file)
+    flasher = BootloaderFlasher(args.interface, args.uuid, args.file,
+                                assume_yes=args.yes)
     
     try:
         await flasher.flash()
