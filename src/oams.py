@@ -31,7 +31,10 @@ from .oams_state import (
     OAMS_ACTION_TIMEOUT,
 )
 
-# Firmware "action" identifiers reported by oams_action_status.
+# Firmware "action" identifiers reported by oams_action_status. These are the
+# BUILT-IN FALLBACK values: when the firmware publishes the enum in the data
+# dictionary (OAMS_PROTOCOL_VERSION >= 1) the resolved values are read at
+# connect (see _resolve_protocol); on older firmware these defaults are used.
 OAMS_STATUS_LOADING = 0
 OAMS_STATUS_UNLOADING = 1
 OAMS_STATUS_FORWARD_FOLLOWING = 2
@@ -40,6 +43,35 @@ OAMS_STATUS_COASTING = 4
 OAMS_STATUS_STOPPED = 5
 OAMS_STATUS_CALIBRATING = 6
 OAMS_STATUS_ERROR = 7
+
+# Lowest firmware protocol version this plugin understands. The host also runs
+# against firmware that publishes no version at all (legacy mode), so this is
+# only a forward-compatibility floor, not a hard requirement.
+MIN_PROTOCOL_VERSION = 1
+
+# Driver-local action-enum names resolved from the dictionary, paired with the
+# module fallback. Only the action enum is resolved dynamically: it is consumed
+# solely here in the driver. The op-code and follower-direction enums are
+# shared with the pure reducer (which cannot read the dictionary), so those are
+# VALIDATED against the published values rather than substituted.
+_ACTION_ENUM_NAMES = (
+    ("OAMS_STATUS_LOADING", OAMS_STATUS_LOADING),
+    ("OAMS_STATUS_UNLOADING", OAMS_STATUS_UNLOADING),
+    ("OAMS_STATUS_CALIBRATING", OAMS_STATUS_CALIBRATING),
+    ("OAMS_STATUS_ERROR", OAMS_STATUS_ERROR),
+)
+
+# (published firmware name, host module value) for the enums that flow into the
+# pure reducer and must therefore match exactly. The firmware renamed CANCEL ->
+# CANCEL_LOAD_SPOOL but kept the value (6).
+_VALIDATED_ENUM_NAMES = (
+    ("OAMS_OP_CODE_SUCCESS", OAMS_OP_CODE_SUCCESS),
+    ("OAMS_OP_CODE_ERROR_UNSPECIFIED", OAMS_OP_CODE_ERROR_UNSPECIFIED),
+    ("OAMS_OP_CODE_ERROR_KLIPPER_CALL", OAMS_OP_CODE_ERROR_KLIPPER_CALL),
+    ("OAMS_OP_CODE_CANCEL_LOAD_SPOOL", OAMS_OP_CODE_CANCEL),
+    ("OAMS_FOLLOWER_REVERSE", FOLLOWER_REVERSE),
+    ("OAMS_FOLLOWER_FORWARD", FOLLOWER_FORWARD),
+)
 
 
 class OAMS:
@@ -86,11 +118,25 @@ class OAMS:
         # commands this unit issues (see _apply_action_status).
         self.current_spool = None
         self._pending_bay = None
-        # FIFO of op_gen values for ops started on this unit whose completion
-        # has not arrived yet. The firmware answers ops in order and does not
-        # echo any correlation id, so pairing replies with the OLDEST pending
-        # gen (rather than re-reading a mutable "last gen" slot) keeps a late
-        # reply from a timed-out op from being attributed to its retry.
+
+        # Protocol contract resolved at connect (see _resolve_protocol).
+        self.protocol_version = None
+        # Action-enum values used to interpret oams_action_status; start at the
+        # module fallbacks, overwritten from the dictionary when published.
+        self.status_loading = OAMS_STATUS_LOADING
+        self.status_unloading = OAMS_STATUS_UNLOADING
+        self.status_calibrating = OAMS_STATUS_CALIBRATING
+        self.status_error = OAMS_STATUS_ERROR
+
+        # Generation-matched protocol (oams_cmd_*2 / oams_action_status2). When
+        # the firmware advertises the *2 commands, the gen rides on the wire and
+        # the firmware echoes it, so completions are matched authoritatively.
+        self._use_gen_protocol = False
+        # Legacy fallback: FIFO of op_gen values for ops whose completion has
+        # not arrived yet. The firmware answers ops in order and (pre-*2) does
+        # not echo a correlation id, so pairing replies with the OLDEST pending
+        # gen keeps a late reply from a timed-out op off its retry. Unused once
+        # the *2 protocol is active.
         self._gen_queue = deque()
 
         # Firmware command handles (resolved at klippy:connect; None until then).
@@ -103,6 +149,12 @@ class OAMS:
         self.oams_pid_cmd = None
         self.oams_set_led_error_cmd = None
         self.oams_spool_query_spool_cmd = None
+        # Generation-matched (*2) command handles; None unless the firmware
+        # advertises them (set in handle_connect).
+        self.oams_load_spool2_cmd = None
+        self.oams_unload_spool2_cmd = None
+        self.oams_calibrate_ptfe_length2_cmd = None
+        self.oams_calibrate_hub_hes2_cmd = None
 
         # Live telemetry.
         self.fps_value = 0.0
@@ -193,12 +245,15 @@ class OAMS:
             "hub_hes_value_2": hub[2], "hub_hes_value_3": hub[3],
             "kp": self.kp, "ki": self.ki, "kd": self.kd,
             "encoder_clicks": self.encoder_clicks, "i_value": self.i_value,
+            "protocol_version": self.protocol_version,
+            "gen_matched_protocol": self._use_gen_protocol,
         }
 
     # -------------------------------------------------------------- connection
 
     def handle_connect(self):
         try:
+            self._resolve_protocol()
             self.oams_load_spool_cmd = self.mcu.lookup_command(
                 "oams_cmd_load_spool spool=%c")
             self.oams_unload_spool_cmd = self.mcu.lookup_command(
@@ -223,9 +278,85 @@ class OAMS:
             self.oams_spool_query_spool_cmd = self.mcu.lookup_query_command(
                 "oams_cmd_query_spool", "oams_query_response_spool spool=%u",
                 cq=cmd_queue)
+            self._detect_gen_protocol()
             self.clear_errors()
         except Exception as e:
             logging.exception("OAMS: failed to initialize commands: %s", e)
+
+    def _resolve_protocol(self):
+        """Read the firmware-published protocol contract from the data
+        dictionary. Everything is optional: absent keys keep the built-in
+        defaults so old firmware (which publishes nothing) still works."""
+        try:
+            consts = self.mcu.get_constants()
+        except Exception:
+            consts = {}
+
+        self.protocol_version = consts.get("OAMS_PROTOCOL_VERSION")
+        if self.protocol_version is None:
+            logging.info("OAMS[%s]: firmware publishes no OAMS_PROTOCOL_VERSION;"
+                         " using built-in protocol defaults (legacy mode)",
+                         self.oams_idx)
+        else:
+            logging.info("OAMS[%s]: firmware protocol version %s",
+                         self.oams_idx, self.protocol_version)
+            if self.protocol_version < MIN_PROTOCOL_VERSION:
+                logging.warning(
+                    "OAMS[%s]: firmware protocol version %s is older than the"
+                    " minimum this plugin expects (%s); behaviour may be"
+                    " degraded", self.oams_idx, self.protocol_version,
+                    MIN_PROTOCOL_VERSION)
+
+        # Action enum: resolved dynamically (driver-local interpretation).
+        resolved = {name: consts.get(name, default)
+                    for name, default in _ACTION_ENUM_NAMES}
+        self.status_loading = resolved["OAMS_STATUS_LOADING"]
+        self.status_unloading = resolved["OAMS_STATUS_UNLOADING"]
+        self.status_calibrating = resolved["OAMS_STATUS_CALIBRATING"]
+        self.status_error = resolved["OAMS_STATUS_ERROR"]
+
+        # Op codes / follower directions: these flow into the pure reducer,
+        # which cannot read the dictionary, so we cannot substitute them — we
+        # validate that the firmware agrees with the host's compiled-in values
+        # and warn loudly on any divergence (a real contract break the version
+        # gate is meant to catch).
+        mismatches = ["%s: firmware=%s host=%s" % (name, consts[name], default)
+                      for name, default in _VALIDATED_ENUM_NAMES
+                      if name in consts and consts[name] != default]
+        if mismatches:
+            logging.error(
+                "OAMS[%s]: firmware protocol enum mismatch (%s); the plugin's"
+                " result-code handling may be wrong — update the plugin to a"
+                " version matching this firmware", self.oams_idx,
+                "; ".join(mismatches))
+
+    def _detect_gen_protocol(self):
+        """Feature-detect the generation-matched commands (same try/except
+        pattern as oams_cmd_load_spool_cancel). When present, switch to the *2
+        senders + oams_action_status2 (gen echoed on the wire); otherwise keep
+        the legacy commands and the FIFO heuristic."""
+        try:
+            self.oams_load_spool2_cmd = self.mcu.lookup_command(
+                "oams_cmd_load_spool2 spool=%c gen=%c")
+            self.oams_unload_spool2_cmd = self.mcu.lookup_command(
+                "oams_cmd_unload_spool2 gen=%c")
+            self.oams_calibrate_ptfe_length2_cmd = self.mcu.lookup_command(
+                "oams_cmd_calibrate_ptfe_length2 spool=%c gen=%c")
+            self.oams_calibrate_hub_hes2_cmd = self.mcu.lookup_command(
+                "oams_cmd_calibrate_hub_hes2 spool=%c gen=%c")
+        except Exception:
+            self._use_gen_protocol = False
+            logging.info("OAMS[%s]: generation-matched commands unavailable;"
+                         " using legacy FIFO completion matching", self.oams_idx)
+            return
+        # Only register the status2 handler once we know the firmware speaks it,
+        # so old firmware never has a dangling response registration.
+        self.mcu.register_serial_response(
+            self._action_status2_received,
+            "oams_action_status2 action=%c code=%c value=%u gen=%c")
+        self._use_gen_protocol = True
+        logging.info("OAMS[%s]: using generation-matched completion protocol",
+                     self.oams_idx)
 
     def clear_errors(self):
         for i in range(4):
@@ -339,33 +470,63 @@ class OAMS:
                 " initialization failed; see klippy.log)" % (self.oams_idx, name))
         return cmd
 
+    @staticmethod
+    def _wire_gen(gen):
+        # The gen rides as a single byte (%c). The reducer already keeps op_gen
+        # in 0..255; the standalone fallback path passes gen=None -> 0 (unused).
+        return 0 if gen is None else (gen & 0xFF)
+
+    def _track_gen(self, gen):
+        # Legacy protocol only: remember the gen so the next completion can be
+        # tagged with it. Under the *2 protocol the firmware echoes the gen.
+        if not self._use_gen_protocol:
+            self._gen_queue.append(gen)
+
     def start_load_spool(self, spool_idx, gen=None):
-        cmd = self._require_cmd(self.oams_load_spool_cmd, "load command")
+        # Resolve the command FIRST so a missing-command failure raises before
+        # any state is mutated (no phantom FIFO entry, no stuck sentinel).
+        if self._use_gen_protocol:
+            cmd = self._require_cmd(self.oams_load_spool2_cmd, "load command")
+            args = [spool_idx, self._wire_gen(gen)]
+        else:
+            cmd = self._require_cmd(self.oams_load_spool_cmd, "load command")
+            args = [spool_idx]
         self._pending_bay = spool_idx
-        self._gen_queue.append(gen)
+        self._track_gen(gen)
         self.action_status_code = None
         self.action_status = OAMS_STATUS_LOADING
-        cmd.send([spool_idx])
+        cmd.send(args)
 
     def start_unload_spool(self, gen=None):
-        cmd = self._require_cmd(self.oams_unload_spool_cmd, "unload command")
-        self._gen_queue.append(gen)
+        if self._use_gen_protocol:
+            cmd = self._require_cmd(self.oams_unload_spool2_cmd, "unload command")
+            args = [self._wire_gen(gen)]
+        else:
+            cmd = self._require_cmd(self.oams_unload_spool_cmd, "unload command")
+            args = []
+        self._track_gen(gen)
         self.action_status_code = None
         self.action_status = OAMS_STATUS_UNLOADING
-        cmd.send()
+        cmd.send(args)
 
     def start_calibrate(self, kind, bay, gen=None):
-        if kind == "hub_hes":
-            cmd = self._require_cmd(self.oams_calibrate_hub_hes_cmd,
-                                    "hub HES calibrate command")
+        if self._use_gen_protocol:
+            cmd = self._require_cmd(
+                self.oams_calibrate_hub_hes2_cmd if kind == "hub_hes"
+                else self.oams_calibrate_ptfe_length2_cmd,
+                "calibrate command")
+            args = [bay, self._wire_gen(gen)]
         else:
-            cmd = self._require_cmd(self.oams_calibrate_ptfe_length_cmd,
-                                    "PTFE calibrate command")
-        self._gen_queue.append(gen)
+            cmd = self._require_cmd(
+                self.oams_calibrate_hub_hes_cmd if kind == "hub_hes"
+                else self.oams_calibrate_ptfe_length_cmd,
+                "calibrate command")
+            args = [bay]
+        self._track_gen(gen)
         self.action_status_code = None
         self.action_status_value = None
         self.action_status = OAMS_STATUS_CALIBRATING
-        cmd.send([bay])
+        cmd.send(args)
 
     def load_spool_cancel(self):
         if self.oams_load_spool_cancel_cmd is None:
@@ -535,23 +696,30 @@ class OAMS:
         self.reactor.register_async_callback(
             lambda et, params=params: self._apply_action_status(params))
 
-    def _apply_action_status(self, params):
+    def _action_status2_received(self, params):
+        # Generation-matched variant: the firmware echoes the op gen, so it is
+        # authoritative (no FIFO inference).
+        self.reactor.register_async_callback(
+            lambda et, params=params: self._apply_action_status(
+                params, wire_gen=params["gen"]))
+
+    def _apply_action_status(self, params, wire_gen=None):
         action = params["action"]
         code = params["code"]
-        if action == OAMS_STATUS_CALIBRATING:
+        if action == self.status_calibrating:
             self.action_status_value = params["value"]
             self.action_status_code = code
         # Verified against firmware 2.0.25: code 5 (KLIPPER_CALL) only ever
         # co-occurs with action=CALIBRATING, so the `or` clause is redundant
         # there — kept for robustness against other firmware versions. The
         # follower paths (actions 2-5) only use codes BUSY/NO_SPOOL_IN_BAY.
-        elif action in (OAMS_STATUS_LOADING, OAMS_STATUS_UNLOADING,
-                        OAMS_STATUS_ERROR) or code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
+        elif action in (self.status_loading, self.status_unloading,
+                        self.status_error) or code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
             self.action_status_code = code
             # Keep the firmware mirror of current_spool in step with our commands.
-            if action == OAMS_STATUS_LOADING and code == OAMS_OP_CODE_SUCCESS:
+            if action == self.status_loading and code == OAMS_OP_CODE_SUCCESS:
                 self.current_spool = self._pending_bay
-            elif action == OAMS_STATUS_UNLOADING and code == OAMS_OP_CODE_SUCCESS:
+            elif action == self.status_unloading and code == OAMS_OP_CODE_SUCCESS:
                 self.current_spool = None
         else:
             # Follower/coast/stop notifications and anything unrecognized are
@@ -561,12 +729,18 @@ class OAMS:
                          " action=%d code=%d", self.oams_idx, action, code)
             return
         # Publish the completion sentinel last, then notify the store (if
-        # bound), pairing the reply with the oldest pending op generation so
-        # the reducer can reject stale or cross-unit replies. An unsolicited
-        # completion-class status (empty queue) carries gen=None, which the
-        # reducer never accepts.
+        # bound). The gen is the firmware echo (wire_gen) under the *2 protocol,
+        # or the oldest pending FIFO entry on legacy firmware. Either way the
+        # reducer rejects a gen that does not match the in-flight op; an
+        # unsolicited completion-class status (gen=None / empty queue) is
+        # never accepted.
         self.action_status = None
-        gen = self._gen_queue.popleft() if self._gen_queue else None
+        if wire_gen is not None:
+            gen = wire_gen
+        elif self._gen_queue:
+            gen = self._gen_queue.popleft()
+        else:
+            gen = None
         if self.on_action_complete is not None:
             self.on_action_complete(self.action_status_code,
                                     self.action_status_value, gen)

@@ -192,6 +192,63 @@ Useful firmware-source facts from that session:
   refactor (src/sysvars.cpp) already guarantees the invariants the host's
   gen-FIFO depends on. T4 shipped no firmware changes; T2+T3 did.
 
+## 4b. Protocol Phase 1 + Phase 3 adopted host-side (2026-06-14)
+
+The firmware made itself the single source of truth for the protocol and added
+generation-matched completions. The host now consumes both, with mandatory
+fallbacks (all in src/oams.py unless noted):
+
+Phase 1 — runtime contract (firmware publishes into the data dictionary):
+- `_resolve_protocol()` (called first in handle_connect) reads
+  `self.mcu.get_constants()`. Reads `OAMS_PROTOCOL_VERSION` (version gate:
+  info-logs it; warns if < MIN_PROTOCOL_VERSION=1; None => legacy, no change).
+- The ACTION enum (OAMS_STATUS_*) is resolved dynamically into self.status_*
+  and used in _apply_action_status — it is driver-local so substitution is
+  safe.
+- The OP-CODE and FOLLOWER-DIRECTION enums flow into the PURE reducer
+  (oams_state.py), which cannot read the dictionary, so they are NOT
+  substituted — _resolve_protocol VALIDATES the published values against the
+  host's compiled-in constants and logs an error on any mismatch (a real
+  contract break the version gate is meant to catch). Firmware renamed
+  CANCEL -> CANCEL_LOAD_SPOOL but kept value 6; the validation table maps it.
+- Absent keys keep the module-level fallback constants. Old firmware that
+  publishes nothing still works unchanged.
+
+Phase 3 — generation-matched completions (firmware protocol v2, additive):
+- `_detect_gen_protocol()` (end of handle_connect) feature-detects
+  `oams_cmd_load_spool2/unload_spool2/calibrate_ptfe_length2/calibrate_hub_hes2`
+  via lookup_command try/except (same pattern as load_spool_cancel). If all
+  present: sets self._use_gen_protocol, registers the
+  `oams_action_status2 ... gen=%c` response handler (only then, so old
+  firmware never has a dangling registration).
+- Senders (start_load_spool/unload/calibrate) take gen=; under the *2
+  protocol they put gen on the wire (cmd.send([..., wire_gen])) and skip the
+  FIFO; on legacy firmware they keep appending to self._gen_queue.
+- `_apply_action_status(params, wire_gen=None)`: status2 path passes
+  params["gen"] as authoritative; legacy path pops the FIFO. The reducer
+  still rejects any gen != lane.op_gen, and gen=None (unsolicited / empty
+  FIFO) is never accepted.
+- WIRE WIDTH: the gen is a single byte (%c). oams_state._begin_op now keeps
+  op_gen in 0..255 (`(op_gen + 1) & 0xFF`) so the host's stamp and the
+  firmware's echo compare equal. Wrap collision needs 256 ops on one lane
+  inside the 120 s op window — physically impossible.
+- get_webhook_status now reports protocol_version and gen_matched_protocol.
+
+Tests: test_oams_driver.py (new, stubs `mcu`) covers sender routing,
+gen sourcing (wire vs FIFO), follower-status drop, and _resolve_protocol
+(legacy / adopted enum / get_constants failure). Plus a reducer byte-wrap
+test. 66 tests total, all passing.
+
+NOT yet validated on hardware (compatibility matrix from the spec):
+- old host / new fw: legacy commands -> oams_action_status; constants present
+  but ignored by old host. (N/A to this branch.)
+- new host / old fw: *2 absent -> legacy + FIFO; constants absent -> built-in
+  enum defaults; no version -> legacy mode. (Covered by unit tests; confirm
+  on hardware.)
+- new host / new fw: *2 -> oams_action_status2 with gen echoed and matched;
+  constants + version read at connect. (Needs the firmware *2 build, which is
+  itself still unbuilt — see F1.)
+
 ## 5. Mainboard firmware protocol review agenda — ANSWERED (2026-06-12)
 
 Verdicts from the firmware review (2.0.25, `_clang` implementation), keyed to

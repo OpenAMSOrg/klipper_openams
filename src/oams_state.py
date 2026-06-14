@@ -319,8 +319,13 @@ def _load_guard(lane, lw, fps):
 def _begin_op(lane, now, fps, effect_for_gen, **fields):
     """Single chokepoint for starting a firmware op: bumps the lane's op_gen,
     stamps the deadline, and arms the runtime timer, so the gen/deadline
-    invariant cannot be forgotten at an individual call site."""
-    gen = lane.op_gen + 1
+    invariant cannot be forgotten at an individual call site.
+
+    op_gen is kept in 0..255 because the firmware echoes it back as a single
+    byte (oams_cmd_*2 gen=%c / oams_action_status2 gen=%c). Wrap collisions
+    would need 256 ops on one lane inside the 120 s op window, which is
+    physically impossible, and ordering is still enforced by the FIFO/echo."""
+    gen = (lane.op_gen + 1) & 0xFF
     nl = replace(lane, op_gen=gen, op_deadline=now + OAMS_ACTION_TIMEOUT,
                  since=now, **fields)
     return nl, [effect_for_gen(gen), ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]

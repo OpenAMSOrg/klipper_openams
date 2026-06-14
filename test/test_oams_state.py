@@ -308,6 +308,19 @@ class OpGenerationTests(unittest.TestCase):
         self.assertEqual(lane_of(sys1).op_gen, 5)
         self.assertEqual(find(fx, S.StartLoad)[0].gen, 5)
 
+    def test_generation_wraps_at_one_byte(self):
+        # The firmware echoes gen as a single byte, so op_gen must stay in
+        # 0..255. From 255 the next op wraps to 0, and a completion echoing 0
+        # must match it.
+        sys0 = system(S.LaneState(op=S.OP_UNLOADED, op_gen=255))
+        sys1, fx = S.reduce(sys0, S.Load(FPS, GROUP), world(ready={BAY_A: True}),
+                            now=0.0)
+        self.assertEqual(lane_of(sys1).op_gen, 0)
+        self.assertEqual(find(fx, S.StartLoad)[0].gen, 0)
+        sys2, fx2 = S.reduce(sys1, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS,
+                                                 gen=0), world(), now=1.0)
+        self.assertEqual(lane_of(sys2).op, S.OP_LOADED)
+
     def test_stale_generation_completion_is_ignored(self):
         # A reply from a previous (timed-out) op, or from another OAMS unit on
         # the lane, carries an old gen and must not complete the current op.
