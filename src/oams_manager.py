@@ -11,9 +11,11 @@
 # run in the runtime (oams_runtime.py).
 
 import logging
+import os
 
 from . import oams_state as S
 from . import oams_topology as T
+from . import oams_config_io
 from .oams_runtime import Runtime
 
 
@@ -27,6 +29,13 @@ class OAMSManager:
         # appear in the config; lower = snappier runout reaction, more CPU.
         self.monitor_interval = config.getfloat(
             "monitor_interval", S.MONITOR_INTERVAL, above=0.0)
+        # File that runtime writeback (group edits, calibration results) is
+        # written to — the OpenAMS config holding the [oams ...] and
+        # [filament_group ...] sections. Defaults to oams.cfg next to the main
+        # printer config; SAVE_CONFIG can't reach an included subfile, so the
+        # plugin edits this file in place.
+        self.openams_config_path = os.path.expanduser(config.get(
+            "openams_config_path", self._default_config_path()))
 
         self._build_topology()
 
@@ -50,6 +59,17 @@ class OAMSManager:
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
     # --------------------------------------------------------------- topology
+
+    def _default_config_path(self):
+        """oams.cfg next to the main printer config, derived from Klipper's
+        start args so it works regardless of the user's config directory."""
+        try:
+            main = self.printer.get_start_args().get("config_file")
+        except Exception:
+            main = None
+        if main:
+            return os.path.join(os.path.dirname(main), "oams.cfg")
+        return "~/printer_data/config/oams.cfg"
 
     def _force_load_sections(self):
         """Instantiate every fps / oams / filament_group section up front so
@@ -446,10 +466,12 @@ class OAMSManager:
 
     # ------------------------------------------------ runtime group editing
     # Create groups and reassign bays at runtime (for the UI). Each change
-    # updates the live model immediately and stages a config write; the user
-    # runs SAVE_CONFIG to persist it. Edits are refused on a lane that is mid-op
-    # or printing from the affected group, so the model can't change underneath
-    # an in-flight operation.
+    # validates through the pure model, writes the [filament_group] sections of
+    # the OpenAMS config file in place, and then swaps the live model — so the
+    # change takes effect immediately AND survives a restart, with no
+    # SAVE_CONFIG (which can only rewrite printer.cfg, not an included subfile).
+    # Edits are refused on a lane that is mid-op or printing from the affected
+    # group, so the model cannot change underneath an in-flight operation.
 
     def _assert_editable(self, lanes, group=None):
         state = self.runtime.get_state()
@@ -470,22 +492,51 @@ class OAMSManager:
                     "Cannot edit group '%s' while it is loaded on lane %s;"
                     " unload it first." % (group, lane))
 
-    def _changed_groups(self, old, new):
-        names = set(old.groups) | set(new.groups)
-        return [g for g in names if old.groups.get(g) != new.groups.get(g)]
-
-    def _apply_topology(self, new_topo, changed, removed=()):
+    def _persist_and_apply(self, new_topo):
+        """Persist the difference between the current and new topology to the
+        config file, then swap in the new model. File first: if the write
+        fails the running model is left untouched, so saved and live state can
+        never diverge."""
+        old = self.topo
+        edits = []
+        for g in new_topo.groups:
+            if old.groups.get(g) != new_topo.groups[g]:
+                edits.append((g, new_topo.group_config_value(g)))
+        for g in old.groups:
+            if g not in new_topo.groups:
+                edits.append((g, None))           # delete the section
+        self._rewrite_config(
+            lambda text: oams_config_io.apply_group_edits(text, edits))
         self.topo = new_topo
         self._rebuild_derived()
-        configfile = self.printer.lookup_object("configfile")
-        for g in changed:
-            configfile.set("filament_group %s" % g, "group",
-                           self.topo.group_config_value(g))
-        for g in removed:
-            # configfile cannot delete a section; empty it so SAVE_CONFIG is
-            # consistent (remove the [filament_group] section by hand to drop
-            # it entirely).
-            configfile.set("filament_group %s" % g, "group", "")
+
+    def persist_config_option(self, section, option, value):
+        """Set one option in one section of the OpenAMS config file in place
+        (used by calibration writeback). Like group edits, this targets the
+        included subfile SAVE_CONFIG cannot reach. Raises command_error on
+        an I/O failure."""
+        self._rewrite_config(
+            lambda text: oams_config_io.set_option(text, section, option, value))
+
+    def _rewrite_config(self, transform):
+        """Atomically read -> transform -> write the OpenAMS config file."""
+        path = self.openams_config_path
+        try:
+            with open(path) as f:
+                text = f.read()
+        except OSError as e:
+            raise self.printer.command_error(
+                "Cannot read OpenAMS config '%s' to persist the change"
+                " (set [oams_manager] openams_config_path): %s" % (path, e))
+        new_text = transform(text)
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(new_text)
+            os.replace(tmp, path)                 # atomic
+        except OSError as e:
+            raise self.printer.command_error(
+                "Cannot write OpenAMS config '%s': %s" % (path, e))
 
     cmd_CREATE_GROUP_help = "Create a new (empty) filament group at runtime"
 
@@ -495,9 +546,9 @@ class OAMSManager:
             topo = T.with_group(self.topo, name)
         except T.TopologyError as e:
             raise gcmd.error(str(e))
-        self._apply_topology(topo, [name])
-        gcmd.respond_info("Created group '%s'. Run SAVE_CONFIG to persist."
-                          % name)
+        self._persist_and_apply(topo)
+        gcmd.respond_info("Created group '%s' (saved to %s)."
+                          % (name, self.openams_config_path))
 
     cmd_DELETE_GROUP_help = "Delete a filament group at runtime"
 
@@ -506,11 +557,9 @@ class OAMSManager:
         if name not in self.topo.groups:
             raise gcmd.error("filament_group '%s' does not exist." % name)
         self._assert_editable([self.topo.lane_of_group(name)], group=name)
-        topo = T.without_group(self.topo, name)
-        self._apply_topology(topo, [], removed=[name])
-        gcmd.respond_info("Deleted group '%s' from the running model; its"
-                          " [filament_group %s] section is emptied on"
-                          " SAVE_CONFIG." % (name, name))
+        self._persist_and_apply(T.without_group(self.topo, name))
+        gcmd.respond_info("Deleted group '%s' (saved to %s)."
+                          % (name, self.openams_config_path))
 
     cmd_ASSIGN_BAY_help = "Assign an OAMS bay to a filament group at runtime"
 
@@ -530,9 +579,9 @@ class OAMSManager:
             topo = T.with_bay(self.topo, group, oams_name, bay)
         except T.TopologyError as e:
             raise gcmd.error(str(e))
-        self._apply_topology(topo, self._changed_groups(self.topo, topo))
-        gcmd.respond_info("Assigned %s-%d to '%s'. Run SAVE_CONFIG to persist."
-                          % (oams_name, bay, group))
+        self._persist_and_apply(topo)
+        gcmd.respond_info("Assigned %s-%d to '%s' (saved to %s)."
+                          % (oams_name, bay, group, self.openams_config_path))
 
     cmd_UNASSIGN_BAY_help = "Remove an OAMS bay from a filament group at runtime"
 
@@ -547,9 +596,9 @@ class OAMSManager:
             topo = T.without_bay(self.topo, group, oams_name, bay)
         except T.TopologyError as e:
             raise gcmd.error(str(e))
-        self._apply_topology(topo, [group])
-        gcmd.respond_info("Removed %s-%d from '%s'. Run SAVE_CONFIG to persist."
-                          % (oams_name, bay, group))
+        self._persist_and_apply(topo)
+        gcmd.respond_info("Removed %s-%d from '%s' (saved to %s)."
+                          % (oams_name, bay, group, self.openams_config_path))
 
 
 def load_config(config):

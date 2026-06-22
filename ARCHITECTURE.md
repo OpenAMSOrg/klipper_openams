@@ -143,18 +143,30 @@ For the management UI, groups can be created and bays reassigned at runtime:
 `OAMSM_CREATE_GROUP`, `OAMSM_DELETE_GROUP`, `OAMSM_ASSIGN_BAY`,
 `OAMSM_UNASSIGN_BAY`, plus the read-only `openams/topology` webhook. Each edit:
 
-1. goes through the same pure `oams_topology` validators (so runtime edits can
+1. goes through the same pure `oams_topology` validators (so a runtime edit can
    never produce a config the loader would reject);
-2. updates the live model and the derived runtime maps immediately
-   (`_rebuild_derived`);
-3. stages a config write via `configfile.set`, so `SAVE_CONFIG` persists it.
+2. **persists first**: the affected `[filament_group …]` sections are rewritten
+   in place in the OpenAMS config file (`oams_config_io.apply_group_edits`,
+   atomic temp-file + `os.replace`), preserving every other section, option and
+   comment;
+3. then swaps the live model and rebuilds the derived runtime maps
+   (`_rebuild_derived`).
 
-Reassigning a bay **moves** it (never silently shares). Edits are refused on a
-lane that is mid-op, handling a runout, or printing from the affected group, so
-the topology cannot change underneath an in-flight operation. (`configfile`
-cannot delete a section, so `OAMSM_DELETE_GROUP` empties the group on
-`SAVE_CONFIG`; remove the `[filament_group]` section by hand to drop it
-entirely.)
+Persisting before swapping means a file-write failure aborts the edit with the
+model untouched — saved and live state never diverge. The change takes effect
+immediately *and* survives a restart with **no `SAVE_CONFIG`**: Klipper's
+`SAVE_CONFIG` can only rewrite the main `printer.cfg`, never an included subfile
+like `oams.cfg`, so the plugin edits its own file directly. The target file is
+`[oams_manager] openams_config_path` (default: `oams.cfg` next to the main
+printer config). Reassigning a bay **moves** it (never silently shares);
+`OAMSM_DELETE_GROUP` removes the section outright. Edits are refused on a lane
+that is mid-op, handling a runout, or printing from the affected group.
+
+The same in-place writeback (via `oams_config_io.set_option` and the manager's
+`persist_config_option`) is used for **calibration** results
+(`OAMS_CALIBRATE_PTFE_LENGTH`, `OAMS_CALIBRATE_HUB_HES`), which write
+`ptfe_length` / `hub_hes_on` back onto the `[oams …]` section — again because
+`SAVE_CONFIG` cannot reach them in `oams.cfg`.
 
 ## 8. Tunables
 
@@ -162,6 +174,9 @@ Config-exposed (all defaulted, so none are required in the config):
 - `[oams_manager] reload_before_toolhead_distance` — extra margin before the
   runout reload point.
 - `[oams_manager] monitor_interval` — runout/health monitor period (default 1 s).
+- `[oams_manager] openams_config_path` — file that runtime writeback (group
+  edits, calibration results) is written to (default: `oams.cfg` next to the
+  main printer config).
 - `[fps] extruder`, `[oams] fps:` — topology wiring.
 
 Intentionally internal (safety-relevant timings, kept out of config to avoid
@@ -197,8 +212,8 @@ a ready bay, verify each capability surfaces exactly one completion:
 3. `OAMSM_FOLLOWER ENABLE=1 DIRECTION=1` / `ENABLE=0` → follower starts/stops;
    `following` reflects it in `openams/status`.
 4. `OAMSM_UNLOAD_FILAMENT` → "unloaded"; bay no longer loaded; follower stopped.
-5. `OAMS_CALIBRATE_PTFE_LENGTH SPOOL=<n>` → returns a length in clicks; persists
-   on `SAVE_CONFIG`.
+5. `OAMS_CALIBRATE_PTFE_LENGTH SPOOL=<n>` → returns a length in clicks; written
+   straight into `oams.cfg` (no `SAVE_CONFIG`).
 6. Runout (v3 firmware): start a print from a group with a spare ready bay; cut
    the active filament. Expect PAUSING → COASTING → auto-reload of the spare, or
    a PAUSE if no spare. The lane never wedges.
@@ -207,4 +222,5 @@ a ready bay, verify each capability surfaces exactly one completion:
    failure — no host-side cancel, no double completion.
 8. Runtime edit: `OAMSM_CREATE_GROUP GROUP=test`,
    `OAMSM_ASSIGN_BAY GROUP=test OAMS=<o> BAY=<b>`, check `openams/topology`,
-   `SAVE_CONFIG`, confirm it survives a restart.
+   confirm `oams.cfg` was updated in place (no `SAVE_CONFIG` needed) and the
+   edit survives a restart.

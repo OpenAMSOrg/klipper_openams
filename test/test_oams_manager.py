@@ -9,6 +9,7 @@
 import importlib
 import os
 import sys
+import tempfile
 import types
 import unittest
 
@@ -132,17 +133,38 @@ class FakeRuntime:
         return self._sys
 
 
-def build_manager(objects, section_names, lanes=None):
-    """A bare manager with topology built from fakes, ready for edit commands."""
+DEFAULT_GROUPS_FILE = """\
+# OpenAMS groups
+[filament_group T0]
+group: oams1-0
+
+[filament_group T1]
+group: oams1-1
+"""
+
+
+def build_manager(objects, section_names, lanes=None,
+                  groups_file=DEFAULT_GROUPS_FILE):
+    """A bare manager with topology built from fakes, ready for edit commands.
+    Group edits are persisted to a real temp file so the writeback is exercised
+    end to end; the path is on mgr.openams_config_path."""
     mgr = OAMSManager.__new__(OAMSManager)
     mgr.config = FakeConfig(section_names)
-    mgr.configfile = FakeConfigfile()
-    mgr.printer = FakePrinter(objects, mgr.configfile)
+    mgr.printer = FakePrinter(objects, FakeConfigfile())
     mgr._build_topology()
     if lanes is None:
         lanes = {fps: S.LaneState() for fps in mgr.topo.fps_names}
     mgr.runtime = FakeRuntime(lanes)
+    fd, path = tempfile.mkstemp(suffix=".cfg")
+    os.write(fd, groups_file.encode())
+    os.close(fd)
+    mgr.openams_config_path = path
     return mgr
+
+
+def read_file(path):
+    with open(path) as f:
+        return f.read()
 
 
 def single_lane_objects():
@@ -206,18 +228,22 @@ class GroupEditTests(unittest.TestCase):
         mgr = build_manager(single_lane_objects(), single_lane_sections())
         mgr.cmd_CREATE_GROUP(FakeGcmd({"GROUP": "NEW"}))
         self.assertIn("NEW", mgr.topo.groups)
-        self.assertIn(("filament_group NEW", "group", ""), mgr.configfile.sets)
+        text = read_file(mgr.openams_config_path)
+        self.assertIn("[filament_group NEW]", text)
+        # original sections preserved
+        self.assertIn("[filament_group T0]", text)
+        self.assertIn("# OpenAMS groups", text)
 
     def test_assign_bay_moves_and_persists(self):
         mgr = build_manager(single_lane_objects(), single_lane_sections())
         mgr.cmd_ASSIGN_BAY(FakeGcmd({"GROUP": "T0", "OAMS": "oams1", "BAY": 1}))
-        # bay (oams1,1) moved from T1 into T0; both groups persisted
+        # bay (oams1,1) moved from T1 into T0; model + file both updated
         self.assertIn(("oams1", 1), mgr.topo.groups["T0"])
         self.assertNotIn(("oams1", 1), mgr.topo.groups["T1"])
         self.assertEqual(mgr.groups_by_lane["fps1"]["T0"], ((1, 0), (1, 1)))
-        sections_written = {s for (s, _o, _v) in mgr.configfile.sets}
-        self.assertEqual(sections_written,
-                         {"filament_group T0", "filament_group T1"})
+        text = read_file(mgr.openams_config_path)
+        self.assertIn("group: oams1-0,oams1-1", text)   # T0 updated in place
+        self.assertIn("[filament_group T1]\ngroup:", text)  # T1 emptied
 
     def test_assign_unknown_oams_errors(self):
         mgr = build_manager(single_lane_objects(), single_lane_sections())
@@ -248,7 +274,27 @@ class GroupEditTests(unittest.TestCase):
         mgr.cmd_UNASSIGN_BAY(
             FakeGcmd({"GROUP": "T0", "OAMS": "oams1", "BAY": 0}))
         self.assertEqual(mgr.topo.groups["T0"], ())
-        self.assertIn(("filament_group T0", "group", ""), mgr.configfile.sets)
+        text = read_file(mgr.openams_config_path)
+        self.assertIn("[filament_group T0]\ngroup:", text)
+        self.assertNotIn("oams1-0", text)
+
+    def test_delete_group_removes_section(self):
+        mgr = build_manager(single_lane_objects(), single_lane_sections())
+        mgr.cmd_DELETE_GROUP(FakeGcmd({"GROUP": "T0"}))
+        self.assertNotIn("T0", mgr.topo.groups)
+        text = read_file(mgr.openams_config_path)
+        self.assertNotIn("[filament_group T0]", text)
+        self.assertIn("[filament_group T1]", text)      # sibling kept
+
+    def test_write_failure_leaves_model_unchanged(self):
+        mgr = build_manager(single_lane_objects(), single_lane_sections())
+        mgr.openams_config_path = "/nonexistent_dir/oams.cfg"
+        before = mgr.topo.groups
+        with self.assertRaises(FakeError):
+            mgr.cmd_ASSIGN_BAY(
+                FakeGcmd({"GROUP": "T0", "OAMS": "oams1", "BAY": 1}))
+        # file write failed -> running model untouched (no divergence)
+        self.assertEqual(mgr.topo.groups, before)
 
 
 class SelfTestTests(unittest.TestCase):

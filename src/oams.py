@@ -678,6 +678,19 @@ class OAMS:
         ok = self.action_status_code == OAMS_OP_CODE_SUCCESS
         return ok, self.action_status_value
 
+    def _persist_option(self, option, value, gcmd):
+        """Persist one option on this [oams ...] section. Routes through the
+        manager's in-place file writeback (SAVE_CONFIG can't reach an included
+        subfile like oams.cfg); falls back to configfile.set only if no manager
+        is present (unsupported, but never silently lose the value)."""
+        mgr = self.printer.lookup_object("oams_manager", None)
+        if mgr is not None and hasattr(mgr, "persist_config_option"):
+            mgr.persist_config_option(self.name, option, value)
+            return "saved to %s" % mgr.openams_config_path
+        configfile = self.printer.lookup_object("configfile")
+        configfile.set(self.name, option, value)
+        return "run SAVE_CONFIG to persist"
+
     cmd_OAMS_CALIBRATE_HUB_HES_help = "Calibrate the range of a single hub HES"
 
     def cmd_OAMS_CALIBRATE_HUB_HES(self, gcmd):
@@ -687,10 +700,10 @@ class OAMS:
             raise gcmd.error("Calibration of HES %d failed" % bay)
         threshold = self.u32_to_float(value)
         self.hub_hes_on[bay] = threshold
-        configfile = self.printer.lookup_object("configfile")
-        configfile.set(self.name, "hub_hes_on", ",".join(map(str, self.hub_hes_on)))
-        gcmd.respond_info("Calibrated HES %d to %f threshold. Run SAVE_CONFIG (or"
-                          " update hub_hes_on) to persist it." % (bay, threshold))
+        how = self._persist_option(
+            "hub_hes_on", ",".join(map(str, self.hub_hes_on)), gcmd)
+        gcmd.respond_info("Calibrated HES %d to %f threshold (%s)."
+                          % (bay, threshold, how))
 
     cmd_OAMS_CALIBRATE_PTFE_LENGTH_help = "Calibrate the length of the PTFE tube"
 
@@ -699,10 +712,8 @@ class OAMS:
         ok, value = self._calibrate("ptfe", bay)
         if not ok:
             raise gcmd.error("Calibration of PTFE length failed")
-        configfile = self.printer.lookup_object("configfile")
-        configfile.set(self.name, "ptfe_length", "%d" % (value,))
-        gcmd.respond_info("Calibrated PTFE length to %d. Run SAVE_CONFIG (or"
-                          " update ptfe_length) to persist it." % (value,))
+        how = self._persist_option("ptfe_length", "%d" % (value,), gcmd)
+        gcmd.respond_info("Calibrated PTFE length to %d (%s)." % (value, how))
 
     # ----------------------------------------------------- firmware callbacks
 
