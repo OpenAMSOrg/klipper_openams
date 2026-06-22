@@ -23,6 +23,10 @@ class OAMSManager:
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.reload_before = config.getfloat("reload_before_toolhead_distance", 0.0)
+        # How often the runout/health monitor runs. Defaulted so it need not
+        # appear in the config; lower = snappier runout reaction, more CPU.
+        self.monitor_interval = config.getfloat(
+            "monitor_interval", S.MONITOR_INTERVAL, above=0.0)
 
         self._build_topology()
 
@@ -162,7 +166,7 @@ class OAMSManager:
             self.runtime.tick()
         except Exception:
             logging.exception("OAMS: monitor tick failed")
-        return eventtime + S.MONITOR_INTERVAL
+        return eventtime + self.monitor_interval
 
     # --------------------------------------------------------------- status
 
@@ -244,8 +248,56 @@ class OAMSManager:
             ("OAMSM_ASSIGN_BAY", self.cmd_ASSIGN_BAY, self.cmd_ASSIGN_BAY_help),
             ("OAMSM_UNASSIGN_BAY", self.cmd_UNASSIGN_BAY,
              self.cmd_UNASSIGN_BAY_help),
+            ("OAMSM_SELFTEST", self.cmd_SELFTEST, self.cmd_SELFTEST_help),
         ):
             gcode.register_command(name, handler, desc=desc)
+
+    cmd_SELFTEST_help = "Report OpenAMS wiring/health (read-only diagnostics)"
+
+    def cmd_SELFTEST(self, gcmd):
+        """Non-destructive bring-up check: confirms every OAMS connected, the
+        negotiated protocol per unit, sensor readings, the validated topology
+        and live lane state, and flags anything suspicious. Moves no filament."""
+        lines = ["OpenAMS self-test:"]
+        warns = []
+        for name, fps in self.fpss.items():
+            lines.append("  FPS %s: value=%.3f extruder=%s"
+                         % (name, fps.get_value(),
+                            getattr(fps, "extruder_name", "?")))
+            if getattr(fps, "extruder", None) is None:
+                warns.append("FPS %s extruder unresolved" % name)
+        versions = set()
+        for short, oam in sorted(self.oams.items()):
+            connected = oam.oams_load_spool_cmd is not None
+            pv = oam.protocol_version
+            versions.add(pv)
+            ready = [b for b in range(4) if oam.f1s_hes_value[b]]
+            loaded = [b for b in range(4) if oam.hub_hes_value[b]]
+            lines.append(
+                "  OAMS %s (idx %s) lane %s: %s, protocol=%s%s%s"
+                % (short, oam.oams_idx, oam.fps_name,
+                   "connected" if connected else "NOT CONNECTED",
+                   pv if pv is not None else "legacy",
+                   ", gen-matched" if getattr(oam, "_use_gen_protocol", False)
+                   else "",
+                   ", fw-liveness" if oam.firmware_owns_liveness else ""))
+            lines.append("    bays ready=%s loaded=%s"
+                         % (ready or "-", loaded or "-"))
+            if not connected:
+                warns.append("OAMS %s firmware commands not resolved" % short)
+        if len(versions) > 1:
+            warns.append("mixed firmware protocol versions %s"
+                         % sorted(str(v) for v in versions))
+        for g in self.topo.groups:
+            bays = ",".join("%s-%d" % e for e in self.topo.groups[g])
+            lines.append("  group %s: lane=%s bays=%s"
+                         % (g, self.topo.lane_of_group(g), bays or "(empty)"))
+        for fps, ls in self.runtime.get_state().lanes.items():
+            lines.append("  lane %s: op=%s group=%s unit=%s following=%s"
+                         % (fps, ls.op, ls.group, ls.unit, ls.following))
+        lines.append("  RESULT: %s"
+                     % ("PASS" if not warns else "WARN -> " + "; ".join(warns)))
+        gcmd.respond_info("\n".join(lines))
 
     def _resolve_fps(self, gcmd, prefer_op=None, required=True):
         """Resolve which FPS lane a command targets. Optional FPS= parameter;

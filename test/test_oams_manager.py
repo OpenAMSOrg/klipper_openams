@@ -55,6 +55,13 @@ class FakeOam:
         self.hub_hes_value = [0, 0, 0, 0]
         self.f1s_hes_value = [0, 0, 0, 0]
         self.filament_path_length = 600
+        self.protocol_version = None
+        self.oams_load_spool_cmd = None
+        self._use_gen_protocol = False
+
+    @property
+    def firmware_owns_liveness(self):
+        return self.protocol_version is not None and self.protocol_version >= 3
 
 
 class FakeFps:
@@ -242,6 +249,44 @@ class GroupEditTests(unittest.TestCase):
             FakeGcmd({"GROUP": "T0", "OAMS": "oams1", "BAY": 0}))
         self.assertEqual(mgr.topo.groups["T0"], ())
         self.assertIn(("filament_group T0", "group", ""), mgr.configfile.sets)
+
+
+class SelfTestTests(unittest.TestCase):
+    def _oam(self, idx, connected=True, protocol=3):
+        o = FakeOam(idx)
+        o.oams_load_spool_cmd = object() if connected else None
+        o.protocol_version = protocol
+        o._use_gen_protocol = protocol is not None and protocol >= 2
+        o.f1s_hes_value = [1, 0, 0, 1]
+        return o
+
+    def test_selftest_pass(self):
+        objs = single_lane_objects()
+        oam = self._oam(1, connected=True, protocol=3)
+        objs["oams"] = [("oams oams1", oam)]
+        mgr = build_manager(objs, single_lane_sections())
+        # FakeFps needs get_value/extruder for the report
+        for fps in mgr.fpss.values():
+            fps.get_value = lambda: 0.5
+            fps.extruder_name = "extruder"
+            fps.extruder = object()
+        gcmd = FakeGcmd({})
+        mgr.cmd_SELFTEST(gcmd)
+        out = gcmd.responses[0]
+        self.assertIn("RESULT: PASS", out)
+        self.assertIn("protocol=3", out)
+
+    def test_selftest_warns_on_disconnected_unit(self):
+        objs = single_lane_objects()
+        objs["oams"] = [("oams oams1", self._oam(1, connected=False))]
+        mgr = build_manager(objs, single_lane_sections())
+        for fps in mgr.fpss.values():
+            fps.get_value = lambda: 0.0
+            fps.extruder_name = "extruder"
+            fps.extruder = object()
+        gcmd = FakeGcmd({})
+        mgr.cmd_SELFTEST(gcmd)
+        self.assertIn("WARN", gcmd.responses[0])
 
 
 if __name__ == "__main__":
