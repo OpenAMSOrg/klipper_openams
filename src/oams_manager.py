@@ -130,6 +130,14 @@ class OAMSManager:
 
     def handle_ready(self):
         self.idle_timeout = self.printer.lookup_object("idle_timeout")
+        # The firmware owns per-op liveness only if EVERY bound unit guarantees
+        # it (protocol >= 3); otherwise the host keeps its own op deadline as
+        # the conservative choice. Versions are resolved at connect, so this is
+        # known by ready.
+        owns = bool(self.oams) and all(
+            oam.firmware_owns_liveness for oam in self.oams.values())
+        self.runtime.set_firmware_liveness(owns)
+        logging.info("OAMS: firmware owns per-op liveness: %s", owns)
         # Resync every lane from the hub HES hardware (the source of truth).
         self.runtime.dispatch(S.ClearErrors())
         self.start_monitor()

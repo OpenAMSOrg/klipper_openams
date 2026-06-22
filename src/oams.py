@@ -25,6 +25,7 @@ from .oams_state import (
     OAMS_OP_CODE_ERROR_UNSPECIFIED,
     OAMS_OP_CODE_ERROR_KLIPPER_CALL,
     OAMS_OP_CODE_CANCEL,
+    OAMS_OP_CODE_TIMEOUT,
     FOLLOWER_REVERSE,
     FOLLOWER_FORWARD,
     POLL_INTERVAL,
@@ -49,6 +50,12 @@ OAMS_STATUS_ERROR = 7
 # only a forward-compatibility floor, not a hard requirement.
 MIN_PROTOCOL_VERSION = 1
 
+# From this protocol version the firmware owns per-op liveness: it runs its own
+# no-progress watchdog, stops the motors on a stall, and completes the op with
+# code OAMS_OP_CODE_TIMEOUT. The host then drops its authoritative op deadline
+# and its own stall detection (see Runtime.set_firmware_liveness).
+LIVENESS_PROTOCOL_VERSION = 3
+
 # Driver-local action-enum names resolved from the dictionary, paired with the
 # module fallback. Only the action enum is resolved dynamically: it is consumed
 # solely here in the driver. The op-code and follower-direction enums are
@@ -69,6 +76,7 @@ _VALIDATED_ENUM_NAMES = (
     ("OAMS_OP_CODE_ERROR_UNSPECIFIED", OAMS_OP_CODE_ERROR_UNSPECIFIED),
     ("OAMS_OP_CODE_ERROR_KLIPPER_CALL", OAMS_OP_CODE_ERROR_KLIPPER_CALL),
     ("OAMS_OP_CODE_CANCEL_LOAD_SPOOL", OAMS_OP_CODE_CANCEL),
+    ("OAMS_OP_CODE_TIMEOUT", OAMS_OP_CODE_TIMEOUT),
     ("OAMS_FOLLOWER_REVERSE", FOLLOWER_REVERSE),
     ("OAMS_FOLLOWER_FORWARD", FOLLOWER_FORWARD),
 )
@@ -207,6 +215,13 @@ class OAMS:
 
     def get_status(self, eventtime):
         return {"current_spool": self.current_spool}
+
+    @property
+    def firmware_owns_liveness(self):
+        """True when this unit's firmware runs its own per-op no-progress
+        watchdog (protocol >= 3), so the host need not impose its own deadline."""
+        return (self.protocol_version is not None
+                and self.protocol_version >= LIVENESS_PROTOCOL_VERSION)
 
     def is_bay_ready(self, bay_index):
         return bool(self.f1s_hes_value[bay_index])

@@ -24,6 +24,7 @@ OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY = 3
 OAMS_OP_CODE_NO_SPOOL_IN_BAY = 4
 OAMS_OP_CODE_ERROR_KLIPPER_CALL = 5
 OAMS_OP_CODE_CANCEL = 6
+OAMS_OP_CODE_TIMEOUT = 7
 
 
 def describe_code(code):
@@ -31,7 +32,8 @@ def describe_code(code):
     messages. Verified against firmware 2.0.25: BUSY is op_begin's rejection
     of a concurrent op, ALREADY_IN_BAY is the load coroutine's occupied-hub
     rejection, NO_SPOOL_IN_BAY is unload-with-nothing-loaded, KLIPPER_CALL is
-    a calibration aborted via emergency stop."""
+    a calibration aborted via emergency stop. TIMEOUT (protocol v3+) is the
+    firmware's own no-progress watchdog: it has already stopped the motors."""
     if code == OAMS_OP_CODE_ERROR_BUSY:
         return "OAMS is busy with another operation"
     if code == OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY:
@@ -40,6 +42,8 @@ def describe_code(code):
         return "no spool present in the bay"
     if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
         return "stopped by klipper monitor"
+    if code == OAMS_OP_CODE_TIMEOUT:
+        return "no filament progress (jam, dead motor, or missing sensor)"
     if code == OAMS_OP_CODE_CANCEL:
         return "cancelled"
     return "code %s" % (code,)
@@ -64,7 +68,13 @@ RUNOUT_LOADING = "loading"      # next-spool load in flight (non-blocking)
 # --- tunables (decision constants; shared with the runtime) ---
 PAUSE_DISTANCE = 60.0
 FILAMENT_PATH_LENGTH_FACTOR = 1.14
+# Authoritative per-op deadline used ONLY against firmware that makes no
+# liveness promise (protocol < 3 / legacy). Protocol >= 3 firmware runs its own
+# no-progress watchdog and always completes an op, so the host downgrades this
+# to a coarse disconnect backstop (OAMS_DISCONNECT_BACKSTOP) that exists only to
+# release a blocked GCode wait() if the MCU dies entirely.
 OAMS_ACTION_TIMEOUT = 120.0
+OAMS_DISCONNECT_BACKSTOP = 300.0
 POLL_INTERVAL = 0.1
 MONITOR_INTERVAL = 1.0
 
@@ -99,6 +109,16 @@ class LaneState:
 @dataclass(frozen=True)
 class SystemState:
     lanes: Mapping[str, LaneState] = field(default_factory=dict)  # fps_name -> LaneState
+    # True once every bound OAMS reports protocol >= 3, i.e. the firmware owns
+    # per-op liveness (its own no-progress watchdog). The host then uses only a
+    # coarse disconnect backstop instead of an authoritative per-op deadline.
+    fw_owns_liveness: bool = False
+
+
+def set_liveness(system, owns):
+    """Return system with the firmware-owns-liveness flag set (called once at
+    ready, after every unit's protocol version is known)."""
+    return replace(system, fw_owns_liveness=bool(owns))
 
 
 # ====================================================================== world
@@ -258,28 +278,35 @@ def initial_system(fps_names):
 
 def reduce(system, action, world, now):
     """Pure top-level reducer. Returns (new_system, [effects])."""
+    # Per-op deadline: authoritative for legacy firmware, a coarse disconnect
+    # backstop once the firmware owns liveness (protocol >= 3).
+    deadline = (OAMS_DISCONNECT_BACKSTOP if system.fw_owns_liveness
+                else OAMS_ACTION_TIMEOUT)
+
     if isinstance(action, ClearErrors):
         lanes = {fps: _resync_lane(world.lane(fps), now)
                  for fps in system.lanes}
-        return SystemState(lanes=lanes), []
+        return replace(system, lanes=lanes), []
 
     if isinstance(action, Tick):
         lanes = dict(system.lanes)
         effects = []
         for fps, lane in system.lanes.items():
-            nl, fx = _reduce_lane(lane, action, world.lane(fps), now, fps)
+            nl, fx = _reduce_lane(lane, action, world.lane(fps), now, fps,
+                                  deadline)
             lanes[fps] = nl
             effects.extend(fx)
-        return SystemState(lanes=lanes), effects
+        return replace(system, lanes=lanes), effects
 
     # lane-scoped action
     fps = getattr(action, "fps", None)
     if fps is None or fps not in system.lanes:
         return system, []
-    nl, fx = _reduce_lane(system.lanes[fps], action, world.lane(fps), now, fps)
+    nl, fx = _reduce_lane(system.lanes[fps], action, world.lane(fps), now, fps,
+                          deadline)
     lanes = dict(system.lanes)
     lanes[fps] = nl
-    return SystemState(lanes=lanes), fx
+    return replace(system, lanes=lanes), fx
 
 
 def _resync_lane(lw, now):
@@ -316,22 +343,24 @@ def _load_guard(lane, lw, fps):
     return None
 
 
-def _begin_op(lane, now, fps, effect_for_gen, **fields):
+def _begin_op(lane, now, fps, deadline, effect_for_gen, **fields):
     """Single chokepoint for starting a firmware op: bumps the lane's op_gen,
     stamps the deadline, and arms the runtime timer, so the gen/deadline
-    invariant cannot be forgotten at an individual call site.
+    invariant cannot be forgotten at an individual call site. `deadline` is the
+    authoritative per-op timeout for legacy firmware, or a coarse disconnect
+    backstop once the firmware owns liveness.
 
     op_gen is kept in 0..255 because the firmware echoes it back as a single
     byte (oams_cmd_*2 gen=%c / oams_action_status2 gen=%c). Wrap collisions
-    would need 256 ops on one lane inside the 120 s op window, which is
-    physically impossible, and ordering is still enforced by the FIFO/echo."""
+    would need 256 ops on one lane inside the op window, which is physically
+    impossible, and ordering is still enforced by the FIFO/echo."""
     gen = (lane.op_gen + 1) & 0xFF
-    nl = replace(lane, op_gen=gen, op_deadline=now + OAMS_ACTION_TIMEOUT,
+    nl = replace(lane, op_gen=gen, op_deadline=now + deadline,
                  since=now, **fields)
-    return nl, [effect_for_gen(gen), ArmDeadline(fps, OAMS_ACTION_TIMEOUT)]
+    return nl, [effect_for_gen(gen), ArmDeadline(fps, deadline)]
 
 
-def _reduce_lane(lane, action, lw, now, fps):
+def _reduce_lane(lane, action, lw, now, fps, deadline):
     op = lane.op
 
     if isinstance(action, Load):
@@ -341,7 +370,7 @@ def _reduce_lane(lane, action, lw, now, fps):
         for unit in lw.group_bays.get(action.group, ()):
             if lw.ready.get(unit):
                 return _begin_op(
-                    lane, now, fps,
+                    lane, now, fps, deadline,
                     lambda gen, unit=unit: StartLoad(unit, fps, gen),
                     op=OP_LOADING, group=action.group, unit=unit,
                     runout=RUNOUT_IDLE, pause_origin=None, coast_origin=None,
@@ -355,7 +384,7 @@ def _reduce_lane(lane, action, lw, now, fps):
             return lane, rejected
         unit = action.unit
         return _begin_op(
-            lane, now, fps, lambda gen: StartLoad(unit, fps, gen),
+            lane, now, fps, deadline, lambda gen: StartLoad(unit, fps, gen),
             op=OP_LOADING, group=_group_of(lw, unit), unit=unit,
             runout=RUNOUT_IDLE, pause_origin=None, coast_origin=None,
             reload_target=None, message=None)
@@ -365,7 +394,7 @@ def _reduce_lane(lane, action, lw, now, fps):
             return lane, [Settle(fps, OpResult(False, None, "nothing loaded"))]
         unit = lane.unit
         return _begin_op(
-            lane, now, fps, lambda gen: StartUnload(unit, fps, gen),
+            lane, now, fps, deadline, lambda gen: StartUnload(unit, fps, gen),
             op=OP_UNLOADING, runout=RUNOUT_IDLE, pause_origin=None,
             coast_origin=None, reload_target=None)
 
@@ -375,7 +404,7 @@ def _reduce_lane(lane, action, lw, now, fps):
                           "busy, cannot calibrate now"))]
         unit = (action.oams_idx, action.bay)
         return _begin_op(
-            lane, now, fps,
+            lane, now, fps, deadline,
             lambda gen: StartCalibrate(unit, action.kind, fps, gen),
             op=OP_CALIBRATING, prior_op=op)
 
@@ -404,15 +433,17 @@ def _reduce_lane(lane, action, lw, now, fps):
                          timed_out=True)
 
     if isinstance(action, Tick):
-        # Belt-and-braces deadline: the runtime arms a reactor timer for every
-        # op, but if that timer was ever lost the lane must still not wedge.
+        # Belt-and-braces deadline backing up the runtime's reactor timer in
+        # case it was ever lost. For legacy firmware this enforces the 120 s
+        # op timeout; once the firmware owns liveness op_deadline is the long
+        # disconnect backstop, so this only fires if the MCU went silent.
         if (lane.op_deadline is not None and now > lane.op_deadline
                 and (op in (OP_LOADING, OP_UNLOADING, OP_CALIBRATING)
                      or (op == OP_LOADED and lane.runout == RUNOUT_LOADING))):
             return _complete(lane, OAMS_OP_CODE_ERROR_UNSPECIFIED, None, now,
                              fps, timed_out=True)
         if op == OP_LOADED:
-            return _runout_tick(lane, lw, now, fps)
+            return _runout_tick(lane, lw, now, fps, deadline)
         return lane, []
 
     return lane, []
@@ -505,7 +536,7 @@ def _complete(lane, code, value, now, fps, timed_out=False):
     return lane, []
 
 
-def _runout_tick(lane, lw, now, fps):
+def _runout_tick(lane, lw, now, fps, deadline):
     r = lane.runout
 
     if r == RUNOUT_IDLE:
@@ -543,7 +574,7 @@ def _runout_tick(lane, lw, now, fps):
                     continue  # never reload the bay that just ran out
                 if lw.ready.get(unit):
                     return _begin_op(
-                        lane, now, fps,
+                        lane, now, fps, deadline,
                         lambda gen, unit=unit: StartLoad(unit, fps, gen),
                         runout=RUNOUT_LOADING, reload_target=unit)
             nl = replace(lane, op=OP_UNLOADED, group=None, unit=None,

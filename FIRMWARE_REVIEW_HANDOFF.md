@@ -249,6 +249,49 @@ NOT yet validated on hardware (compatibility matrix from the spec):
   constants + version read at connect. (Needs the firmware *2 build, which is
   itself still unbuilt — see F1.)
 
+## 4c. Protocol v3 adopted host-side — firmware owns per-op liveness (2026-06-14)
+
+Firmware bumped OAMS_PROTOCOL_VERSION to 3 and now runs its own no-progress
+watchdog: on a stall it stops the motors and completes the op with code
+OAMS_OP_CODE_TIMEOUT (=7). Every op is guaranteed exactly one terminal status
+(SUCCESS / failure / CANCEL_LOAD_SPOOL / TIMEOUT). Host adoption (gated on the
+version read at connect; legacy/<3 behaviour fully preserved):
+
+- OAMS_OP_CODE_TIMEOUT = 7 added (oams_state.py) and rendered by describe_code
+  ("no filament progress (jam, dead motor, or missing sensor)"). It is treated
+  as an ordinary op FAILURE; because it arrives as a real OpCompleted
+  (timed_out=False) the reducer emits NO CancelLoad — the hardware already
+  stopped. Added to the oams.py validated-enum table.
+- The host's authoritative 120 s deadline is downgraded to a coarse disconnect
+  backstop (OAMS_DISCONNECT_BACKSTOP = 300 s) when the firmware owns liveness:
+  - SystemState gained `fw_owns_liveness`; set once at handle_ready via
+    Runtime.set_firmware_liveness(all units' protocol >= 3). Conservative: any
+    legacy/<3 (or unconnected) unit keeps the full 120 s host deadline.
+  - reduce() picks the deadline (OAMS_DISCONNECT_BACKSTOP vs OAMS_ACTION_TIMEOUT)
+    and threads it through _reduce_lane/_runout_tick/_begin_op; the existing
+    ArmDeadline/Tick-backstop machinery is reused at the longer duration (so a
+    truly dead MCU still releases a blocked GCode wait()). The flag is
+    preserved across every reduce path (replace(system, ...), not a fresh
+    SystemState).
+  - Runtime._check_stalls() early-returns when fw_owns_liveness — the host
+    encoder-stall watchdog is redundant with the firmware's.
+- KEPT (inherently host-side, per the spec): the async->GCode bridge
+  (request().wait()/_pending/_settle), gen matching, and all runout/group/lane
+  sequencing. These just no longer maintain a tight per-op deadline.
+
+oams.py: LIVENESS_PROTOCOL_VERSION = 3; OAMS.firmware_owns_liveness property.
+
+Back-compat matrix (unit-test verified; hardware still pending, gated on F1):
+- new host / old fw: *2 absent -> legacy + FIFO; version absent -> legacy mode
+  + built-in enum defaults; firmware_owns_liveness False -> host keeps 120 s
+  deadline + host stall detection.
+- new host / v3 fw: *2 + gen matching; fw_owns_liveness True -> coarse backstop
+  only, host stall detection off, TIMEOUT handled as failure (no cancel).
+
+Tests: 78 total (was 66). New: FirmwareTimeoutTests + LivenessTests
+(test_oams_state), LivenessPropertyTests (test_oams_driver), LivenessTests
+(test_oams_runtime: coarse vs authoritative deadline arming, stall-check skip).
+
 ## 5. Mainboard firmware protocol review agenda — ANSWERED (2026-06-12)
 
 Verdicts from the firmware review (2.0.25, `_clang` implementation), keyed to

@@ -256,5 +256,31 @@ class StallTests(unittest.TestCase):
         self.assertFalse(completion.test())
 
 
+class LivenessTests(unittest.TestCase):
+    def test_coarse_deadline_armed_when_firmware_owns_liveness(self):
+        runtime, reactor, oam, events = make_runtime()
+        runtime.set_firmware_liveness(True)
+        runtime.request(FPS, S.LoadBay(FPS, UNIT))
+        self.assertEqual(len(reactor.timers), 1)
+        waketime = reactor.timers[0][1]
+        self.assertAlmostEqual(waketime, reactor.now + S.OAMS_DISCONNECT_BACKSTOP)
+
+    def test_authoritative_deadline_armed_for_legacy(self):
+        runtime, reactor, oam, events = make_runtime()
+        runtime.request(FPS, S.LoadBay(FPS, UNIT))
+        waketime = reactor.timers[0][1]
+        self.assertAlmostEqual(waketime, reactor.now + S.OAMS_ACTION_TIMEOUT)
+
+    def test_stall_check_skipped_when_firmware_owns_liveness(self):
+        runtime, reactor, oam, events = make_runtime()
+        runtime.set_firmware_liveness(True)
+        completion = runtime.request(FPS, S.LoadBay(FPS, UNIT))
+        reactor.now = oams_runtime.STALL_AFTER + 3.0     # past the grace window
+        runtime.tick()
+        runtime.tick()                                   # would stall if checked
+        self.assertFalse(completion.test())
+        self.assertEqual(runtime.get_state().lanes[FPS].op, S.OP_LOADING)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

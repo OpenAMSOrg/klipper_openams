@@ -480,5 +480,63 @@ class StrayCompletionTests(unittest.TestCase):
         self.assertEqual(fx, [])
 
 
+class FirmwareTimeoutTests(unittest.TestCase):
+    # Protocol v3: the firmware's no-progress watchdog stops the motors and
+    # completes the op with code TIMEOUT(7). The host treats it as an ordinary
+    # failure and must NOT send a cancel (the hardware is already stopped).
+    def test_load_timeout_is_failure_without_cancel(self):
+        sys0 = system(S.LaneState(op=S.OP_LOADING, unit=BAY_A, group=GROUP,
+                                  op_gen=3))
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_TIMEOUT,
+                                                gen=3), world(), now=1.0)
+        self.assertEqual(lane_of(sys1).op, S.OP_UNLOADED)
+        self.assertFalse(find(fx, S.Settle)[0].result.ok)
+        self.assertFalse(has(fx, S.CancelLoad))
+        self.assertIn("progress", find(fx, S.Settle)[0].result.message)
+
+    def test_unload_timeout_stops_follower_without_cancel(self):
+        sys0 = system(S.LaneState(op=S.OP_UNLOADING, unit=BAY_A, group=GROUP,
+                                  op_gen=2))
+        sys1, fx = S.reduce(sys0, S.OpCompleted(FPS, S.OAMS_OP_CODE_TIMEOUT,
+                                                gen=2), world(), now=1.0)
+        self.assertEqual(lane_of(sys1).op, S.OP_LOADED)
+        sf = find(fx, S.SetFollower)
+        self.assertTrue(sf and sf[0].enable == 0)
+        self.assertFalse(has(fx, S.CancelLoad))
+
+    def test_describe_timeout_is_human_readable(self):
+        self.assertIn("progress", S.describe_code(S.OAMS_OP_CODE_TIMEOUT))
+
+
+class LivenessTests(unittest.TestCase):
+    def test_coarse_deadline_when_firmware_owns_liveness(self):
+        sys0 = S.set_liveness(system(S.LaneState(op=S.OP_UNLOADED)), True)
+        sys1, fx = S.reduce(sys0, S.Load(FPS, GROUP), world(ready={BAY_A: True}),
+                            now=100.0)
+        self.assertEqual(lane_of(sys1).op_deadline,
+                         100.0 + S.OAMS_DISCONNECT_BACKSTOP)
+        self.assertEqual(find(fx, S.ArmDeadline)[0].seconds,
+                         S.OAMS_DISCONNECT_BACKSTOP)
+
+    def test_authoritative_deadline_for_legacy_firmware(self):
+        sys0 = system(S.LaneState(op=S.OP_UNLOADED))   # fw_owns_liveness=False
+        sys1, fx = S.reduce(sys0, S.Load(FPS, GROUP), world(ready={BAY_A: True}),
+                            now=100.0)
+        self.assertEqual(find(fx, S.ArmDeadline)[0].seconds,
+                         S.OAMS_ACTION_TIMEOUT)
+
+    def test_liveness_flag_survives_every_reduce_path(self):
+        sys0 = S.set_liveness(
+            system(S.LaneState(op=S.OP_LOADED, unit=BAY_A, group=GROUP)), True)
+        sys1, _ = S.reduce(sys0, S.Tick(), world(loaded={BAY_A: True}), now=1.0)
+        self.assertTrue(sys1.fw_owns_liveness)
+        sys2, _ = S.reduce(sys1, S.Follow(FPS, 1, S.FOLLOWER_FORWARD),
+                           world(), now=2.0)
+        self.assertTrue(sys2.fw_owns_liveness)
+        sys3, _ = S.reduce(sys2, S.ClearErrors(), world(loaded={BAY_A: True}),
+                           now=3.0)
+        self.assertTrue(sys3.fw_owns_liveness)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

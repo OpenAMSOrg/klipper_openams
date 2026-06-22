@@ -37,6 +37,12 @@ class Runtime:
     def get_state(self):
         return self.system
 
+    def set_firmware_liveness(self, owns):
+        """Record whether the firmware owns per-op liveness (protocol >= 3).
+        When it does, the host stops running its own encoder-stall watchdog and
+        downgrades its op deadline to a coarse disconnect backstop."""
+        self.system = S.set_liveness(self.system, owns)
+
     def dispatch(self, action):
         prev = self.system
         try:
@@ -182,6 +188,11 @@ class Runtime:
     # ---------------------------------------------------------- stall detect
 
     def _check_stalls(self):
+        # Protocol >= 3 firmware runs its own no-progress watchdog (and stops
+        # the motors, completing the op with code TIMEOUT), so the host's
+        # encoder-stall detection is redundant and disabled.
+        if self.system.fw_owns_liveness:
+            return
         now = self.reactor.monotonic()
         for fps, lane in list(self.system.lanes.items()):
             if lane.op not in (S.OP_LOADING, S.OP_UNLOADING) or lane.unit is None:

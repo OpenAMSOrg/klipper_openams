@@ -201,5 +201,22 @@ class ResolveProtocolTests(unittest.TestCase):
         self.assertIsNone(o.protocol_version)
 
 
+class LivenessPropertyTests(unittest.TestCase):
+    def test_v3_owns_liveness(self):
+        o = make_oams(use_gen_protocol=True)
+        o.protocol_version = 3
+        self.assertTrue(o.firmware_owns_liveness)
+
+    def test_v2_does_not_own_liveness(self):
+        o = make_oams(use_gen_protocol=True)
+        o.protocol_version = 2
+        self.assertFalse(o.firmware_owns_liveness)
+
+    def test_legacy_does_not_own_liveness(self):
+        o = make_oams(use_gen_protocol=False)
+        o.protocol_version = None
+        self.assertFalse(o.firmware_owns_liveness)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
