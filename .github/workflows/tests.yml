@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Klipper runs on the host Python; cover the range seen in the field.
+        python-version: ["3.8", "3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Byte-compile sources (syntax check)
+        run: python -m py_compile src/*.py scripts/*.py
+      - name: Run unit tests
+        # Pure tests: no Klipper, no hardware, no third-party deps.
+        run: python -m unittest discover -s test -v

@@ -40,8 +40,8 @@ ADMIN_CMD_BOOTLOADER_UPDATE_CHUNK = 0x21
 ADMIN_CMD_BOOTLOADER_UPDATE_VERIFY = 0x22
 ADMIN_CMD_BOOTLOADER_UPDATE_COMMIT = 0x23
 ADMIN_CMD_BOOTLOADER_UPDATE_ABORT = 0x24
-# Variant/metadata query (firmware >= the claude/firmware-sysvar-review
-# branch). Request: [0x30][UUID 6 bytes][reserved 0]. Response:
+# Variant/metadata query (firmware that publishes the standalone-image
+# support). Request: [0x30][UUID 6 bytes][reserved 0]. Response:
 # [0x30][variant: 0=bootloader-based 1=standalone][ver major][ver minor]
 # [ver patch][app offset high byte][reserved][status 0x00=OK].
 ADMIN_CMD_QUERY_VARIANT = 0x30

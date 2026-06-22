@@ -302,10 +302,24 @@ class OAMS:
         """Read the firmware-published protocol contract from the data
         dictionary. Everything is optional: absent keys keep the built-in
         defaults so old firmware (which publishes nothing) still works."""
-        try:
-            consts = self.mcu.get_constants()
-        except Exception:
-            consts = {}
+        consts = {}
+        get_constants = getattr(self.mcu, "get_constants", None)
+        if get_constants is None:
+            # Should not happen on a real Klipper MCU, but never assume.
+            logging.warning("OAMS[%s]: MCU has no get_constants(); assuming"
+                            " legacy protocol", self.oams_idx)
+        else:
+            try:
+                consts = get_constants() or {}
+            except Exception:
+                logging.exception("OAMS[%s]: reading firmware constants failed;"
+                                  " assuming legacy protocol", self.oams_idx)
+        # Distinguish "no OAMS_* published at all" (legacy firmware) from "some
+        # published" so a misconfigured/partial dictionary is diagnosable.
+        oams_keys = sorted(k for k in consts if k.startswith("OAMS_"))
+        logging.info("OAMS[%s]: firmware published %d OAMS_* constant(s)%s",
+                     self.oams_idx, len(oams_keys),
+                     "" if not oams_keys else ": " + ", ".join(oams_keys))
 
         self.protocol_version = consts.get("OAMS_PROTOCOL_VERSION")
         if self.protocol_version is None:
