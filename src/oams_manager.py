@@ -13,6 +13,7 @@
 import logging
 
 from . import oams_state as S
+from . import oams_topology as T
 from .oams_runtime import Runtime
 
 
@@ -39,67 +40,69 @@ class OAMSManager:
         webhooks = self.printer.lookup_object("webhooks")
         webhooks.register_endpoint("openams/status", self._webhook_status)
         webhooks.register_endpoint("openams/cancel_load", self._webhook_cancel_load)
+        webhooks.register_endpoint("openams/topology", self._webhook_topology)
 
         self.register_commands()
         self.printer.register_event_handler("klippy:ready", self.handle_ready)
 
     # --------------------------------------------------------------- topology
 
+    def _force_load_sections(self):
+        """Instantiate every fps / oams / filament_group section up front so
+        topology validation does not depend on Klipper's config load order.
+        load_object is idempotent (returns the already-loaded object), and
+        filament_group no longer cross-references OAMS at load time, so the
+        order we load these in does not matter."""
+        for section in self.config.get_prefix_sections(''):
+            name = section.get_name()
+            if (name == "fps" or name.startswith("fps ")
+                    or name.startswith("oams ")
+                    or name.startswith("filament_group ")):
+                self.printer.load_object(self.config, name)
+
     def _build_topology(self):
-        # FPS lanes, keyed by short name.
-        self.fpss = {}
-        for _, fps in self.printer.lookup_objects(module="fps"):
-            self.fpss[fps.fps_name] = fps
-        if not self.fpss:
-            raise self.config.error(
-                "No [fps] section found; OpenAMS requires at least one FPS.")
-        sole_fps = next(iter(self.fpss)) if len(self.fpss) == 1 else None
+        self._force_load_sections()
 
-        # OAMS units + lane assignment.
-        self.oams = {}
-        self.oam_by_idx = {}
-        self.lane_oams = {name: [] for name in self.fpss}
-        for name, oam in self.printer.lookup_objects(module="oams"):
-            self.oams[name] = oam
-            fps_name = oam.fps_name or sole_fps
-            if fps_name is None:
-                raise self.config.error(
-                    "%s must set 'fps:' when multiple [fps] are defined" % name)
-            if fps_name not in self.fpss:
-                raise self.config.error(
-                    "%s references unknown fps '%s'" % (name, fps_name))
-            oam.fps_name = fps_name
-            self.lane_oams[fps_name].append(oam)
-            self.oam_by_idx[oam.oams_idx] = oam
+        # Klipper object maps (objects can't live in the pure model).
+        self.fpss = {fps.fps_name: fps
+                     for _name, fps in self.printer.lookup_objects(module="fps")}
+        self.oams = {full.split()[-1]: oam
+                     for full, oam in self.printer.lookup_objects(module="oams")}
+        self._groups = {full.split()[-1]: g
+                        for full, g in self.printer.lookup_objects(
+                            module="filament_group")}
 
-        # Filament groups -> lane + per-lane (oams_idx, bay) lists. A group's bays
-        # must all live on one FPS lane (invariant G1).
-        self.filament_groups = {}
+        # Validate all relationships in the pure model (raises with a clear,
+        # user-facing message that we surface as a Klipper config error).
+        oams_specs = [T.OamsSpec(name=short, idx=oam.oams_idx, fps=oam.fps_name)
+                      for short, oam in self.oams.items()]
+        group_specs = [(short, list(g.bay_specs))
+                       for short, g in self._groups.items()]
+        try:
+            self.topo = T.build_topology(list(self.fpss.keys()),
+                                         oams_specs, group_specs)
+        except T.TopologyError as e:
+            raise self.config.error("OpenAMS configuration error: %s" % (e,))
+
+        # Tell each OAMS its resolved lane (used by bind_runtime and requests).
+        for short, oam in self.oams.items():
+            oam.fps_name = self.topo.lane_of_oams(short)
+        self._rebuild_derived()
+
+    def _rebuild_derived(self):
+        """(Re)compute the object-keyed maps the runtime/world/handlers use from
+        the current topology. Called at build and after every runtime edit."""
+        self.oam_by_idx = {oam.oams_idx: oam for oam in self.oams.values()}
+        self.lane_oams = {lane: [self.oams[n] for n in self.topo.oams_on_lane(lane)]
+                          for lane in self.topo.fps_names}
         self.group_lane = {}
-        self.groups_by_lane = {name: {} for name in self.fpss}
-        seen = set()
-        for name, group in self.printer.lookup_objects(module="filament_group"):
-            gname = name.split()[-1]
-            if gname in seen:
-                raise self.config.error(
-                    "Duplicate filament_group '%s'; names must be unique." % gname)
-            seen.add(gname)
-            self.filament_groups[gname] = group
-            lane = None
-            bays = []
-            for (oam, bay) in group.bays:
-                oam_fps = oam.fps_name
-                if lane is None:
-                    lane = oam_fps
-                elif lane != oam_fps:
-                    raise self.config.error(
-                        "filament_group '%s' spans multiple FPS lanes (%s and %s);"
-                        " a group's bays must share one FPS" % (gname, lane, oam_fps))
-                bays.append((oam.oams_idx, bay))
-            if lane is not None:
-                self.group_lane[gname] = lane
-                self.groups_by_lane[lane][gname] = tuple(bays)
-            logging.info("OAMS: group %s on lane %s -> %s", gname, lane, bays)
+        self.groups_by_lane = {lane: {} for lane in self.topo.fps_names}
+        for gname in self.topo.groups:
+            lane = self.topo.lane_of_group(gname)
+            if lane is None:
+                continue  # empty group (created at runtime, not yet populated)
+            self.group_lane[gname] = lane
+            self.groups_by_lane[lane][gname] = self.topo.group_bays_idx(gname)
 
     # ------------------------------------------------------------- world build
 
@@ -188,12 +191,24 @@ class OAMSManager:
                                        "extruder": fps.extruder_name}
         for fps_name, lane in state.lanes.items():
             status["lanes"][fps_name] = self._lane_status(lane)
-        for gname, group in self.filament_groups.items():
+        for gname in self.topo.groups:
             status["filament_groups"][gname] = {
                 "lane": self.group_lane.get(gname),
-                "bays": ["oams%d-%d" % (oam.oams_idx, bay)
-                         for (oam, bay) in group.bays]}
+                "bays": ["%s-%d" % (oams_name, bay)
+                         for (oams_name, bay) in self.topo.groups[gname]]}
         request.send({"status": {"openams": status}})
+
+    def _webhook_topology(self, request):
+        # Read-only model for a UI to render lanes/OAMS/groups and build edits.
+        t = self.topo
+        request.send({"topology": {
+            "fps": list(t.fps_names),
+            "oams": {n: {"idx": t.idx_of(n), "lane": t.lane_of_oams(n)}
+                     for n in t.oams},
+            "groups": {g: {"lane": t.lane_of_group(g),
+                           "bays": ["%s-%d" % e for e in t.groups[g]]}
+                       for g in t.groups},
+        }})
 
     def _webhook_cancel_load(self, request):
         state = self.runtime.get_state()
@@ -222,6 +237,13 @@ class OAMSManager:
              self.cmd_CLEAR_ERRORS_help),
             ("OAMSM_LOAD_FILAMENT_CANCEL", self.cmd_LOAD_FILAMENT_CANCEL,
              self.cmd_LOAD_FILAMENT_CANCEL_help),
+            ("OAMSM_CREATE_GROUP", self.cmd_CREATE_GROUP,
+             self.cmd_CREATE_GROUP_help),
+            ("OAMSM_DELETE_GROUP", self.cmd_DELETE_GROUP,
+             self.cmd_DELETE_GROUP_help),
+            ("OAMSM_ASSIGN_BAY", self.cmd_ASSIGN_BAY, self.cmd_ASSIGN_BAY_help),
+            ("OAMSM_UNASSIGN_BAY", self.cmd_UNASSIGN_BAY,
+             self.cmd_UNASSIGN_BAY_help),
         ):
             gcode.register_command(name, handler, desc=desc)
 
@@ -359,6 +381,8 @@ class OAMSManager:
         group = gcmd.get("GROUP")
         fps = self.group_lane.get(group)
         if fps is None:
+            if group in self.topo.groups:
+                raise gcmd.error("Group %s has no bays assigned" % group)
             raise gcmd.error("Group %s does not exist" % group)
         result = self.runtime.request(fps, S.Load(fps, group)).wait()
         if result.ok or result.code == S.OAMS_OP_CODE_CANCEL:
@@ -367,6 +391,113 @@ class OAMSManager:
             # Raise so toolchange macros stop instead of printing without
             # filament loaded.
             raise gcmd.error(result.message)
+
+    # ------------------------------------------------ runtime group editing
+    # Create groups and reassign bays at runtime (for the UI). Each change
+    # updates the live model immediately and stages a config write; the user
+    # runs SAVE_CONFIG to persist it. Edits are refused on a lane that is mid-op
+    # or printing from the affected group, so the model can't change underneath
+    # an in-flight operation.
+
+    def _assert_editable(self, lanes, group=None):
+        state = self.runtime.get_state()
+        for lane in lanes:
+            ls = state.lanes.get(lane)
+            if ls is None:
+                continue
+            if ls.op in (S.OP_LOADING, S.OP_UNLOADING, S.OP_CALIBRATING):
+                raise self.printer.command_error(
+                    "Cannot edit filament groups while lane %s is busy (%s)."
+                    % (lane, ls.op))
+            if ls.op == S.OP_LOADED and ls.runout != S.RUNOUT_IDLE:
+                raise self.printer.command_error(
+                    "Cannot edit filament groups while lane %s is handling a"
+                    " runout." % lane)
+            if group is not None and ls.op == S.OP_LOADED and ls.group == group:
+                raise self.printer.command_error(
+                    "Cannot edit group '%s' while it is loaded on lane %s;"
+                    " unload it first." % (group, lane))
+
+    def _changed_groups(self, old, new):
+        names = set(old.groups) | set(new.groups)
+        return [g for g in names if old.groups.get(g) != new.groups.get(g)]
+
+    def _apply_topology(self, new_topo, changed, removed=()):
+        self.topo = new_topo
+        self._rebuild_derived()
+        configfile = self.printer.lookup_object("configfile")
+        for g in changed:
+            configfile.set("filament_group %s" % g, "group",
+                           self.topo.group_config_value(g))
+        for g in removed:
+            # configfile cannot delete a section; empty it so SAVE_CONFIG is
+            # consistent (remove the [filament_group] section by hand to drop
+            # it entirely).
+            configfile.set("filament_group %s" % g, "group", "")
+
+    cmd_CREATE_GROUP_help = "Create a new (empty) filament group at runtime"
+
+    def cmd_CREATE_GROUP(self, gcmd):
+        name = gcmd.get("GROUP")
+        try:
+            topo = T.with_group(self.topo, name)
+        except T.TopologyError as e:
+            raise gcmd.error(str(e))
+        self._apply_topology(topo, [name])
+        gcmd.respond_info("Created group '%s'. Run SAVE_CONFIG to persist."
+                          % name)
+
+    cmd_DELETE_GROUP_help = "Delete a filament group at runtime"
+
+    def cmd_DELETE_GROUP(self, gcmd):
+        name = gcmd.get("GROUP")
+        if name not in self.topo.groups:
+            raise gcmd.error("filament_group '%s' does not exist." % name)
+        self._assert_editable([self.topo.lane_of_group(name)], group=name)
+        topo = T.without_group(self.topo, name)
+        self._apply_topology(topo, [], removed=[name])
+        gcmd.respond_info("Deleted group '%s' from the running model; its"
+                          " [filament_group %s] section is emptied on"
+                          " SAVE_CONFIG." % (name, name))
+
+    cmd_ASSIGN_BAY_help = "Assign an OAMS bay to a filament group at runtime"
+
+    def cmd_ASSIGN_BAY(self, gcmd):
+        group = gcmd.get("GROUP")
+        oams_name = gcmd.get("OAMS")
+        bay = gcmd.get_int("BAY", minval=0, maxval=3)
+        if oams_name not in self.oams:
+            raise gcmd.error("Unknown OAMS '%s'." % oams_name)
+        affected = {self.topo.lane_of_oams(oams_name)}
+        if group in self.topo.groups:
+            gl = self.topo.lane_of_group(group)
+            if gl is not None:
+                affected.add(gl)
+        self._assert_editable(affected)
+        try:
+            topo = T.with_bay(self.topo, group, oams_name, bay)
+        except T.TopologyError as e:
+            raise gcmd.error(str(e))
+        self._apply_topology(topo, self._changed_groups(self.topo, topo))
+        gcmd.respond_info("Assigned %s-%d to '%s'. Run SAVE_CONFIG to persist."
+                          % (oams_name, bay, group))
+
+    cmd_UNASSIGN_BAY_help = "Remove an OAMS bay from a filament group at runtime"
+
+    def cmd_UNASSIGN_BAY(self, gcmd):
+        group = gcmd.get("GROUP")
+        oams_name = gcmd.get("OAMS")
+        bay = gcmd.get_int("BAY", minval=0, maxval=3)
+        if group not in self.topo.groups:
+            raise gcmd.error("filament_group '%s' does not exist." % group)
+        self._assert_editable([self.topo.lane_of_group(group)], group=group)
+        try:
+            topo = T.without_bay(self.topo, group, oams_name, bay)
+        except T.TopologyError as e:
+            raise gcmd.error(str(e))
+        self._apply_topology(topo, [group])
+        gcmd.respond_info("Removed %s-%d from '%s'. Run SAVE_CONFIG to persist."
+                          % (oams_name, bay, group))
 
 
 def load_config(config):

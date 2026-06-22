@@ -3,28 +3,38 @@
 # Copyright (C) 2023-2026 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
+#
+# A filament_group is a thin config holder: it parses its own bay list and does
+# NOT resolve the referenced OAMS objects. Cross-section validation (that each
+# OAMS exists, bays are unique and share one FPS lane, etc.) is owned centrally
+# by [oams_manager] via oams_topology, so a group never depends on whether its
+# OAMS sections happen to load before or after it.
+
 
 class FilamentGroup:
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.config = config
         self.group_name = config.get_name().split()[-1]
-        self.bays = []
-        self.oams = []
-        self._initialize_bays(config)
+        # [(oams_short_name, bay_index)] in declared order. The manager resolves
+        # and validates these against the real OAMS units.
+        self.bay_specs = self._parse(config)
 
-    def _initialize_bays(self, config):
+    def _parse(self, config):
         # "group" is a comma-separated list of "<oams_name>-<bay_index>" entries.
-        for raw in config.get("group").split(","):
+        # Optional/empty is allowed so a group can be declared and then populated
+        # at runtime (OAMSM_ASSIGN_BAY).
+        specs = []
+        for raw in config.get("group", "").split(","):
             entry = raw.strip().strip('"').strip()
             if not entry:
                 continue
-            if entry.count("-") != 1:
+            # rsplit on the LAST '-' so OAMS names may themselves contain '-'.
+            oams_name, sep, bay_text = entry.rpartition("-")
+            if not sep or not oams_name:
                 raise config.error(
                     "Invalid filament_group bay '%s' in [%s]; expected"
                     " '<oams_name>-<bay_index>' (e.g. oams1-0)"
                     % (entry, config.get_name()))
-            oams_name, bay_text = entry.split("-")
             try:
                 bay_index = int(bay_text)
             except ValueError:
@@ -35,13 +45,8 @@ class FilamentGroup:
                 raise config.error(
                     "Bay index %d out of range in filament_group [%s]; must be"
                     " 0-3" % (bay_index, config.get_name()))
-            oam = self.printer.lookup_object("oams " + oams_name.strip())
-            self.add_bay(oam, bay_index)
-
-    def add_bay(self, oam, bay_index):
-        self.bays.append((oam, bay_index))
-        if oam not in self.oams:
-            self.oams.append(oam)
+            specs.append((oams_name.strip(), bay_index))
+        return specs
 
 
 def load_config_prefix(config):
