@@ -23,7 +23,9 @@ sys.modules.setdefault("mcu", types.ModuleType("mcu"))
 S = importlib.import_module("oamspkg.oams_state")
 T = importlib.import_module("oamspkg.oams_topology")
 manager_mod = importlib.import_module("oamspkg.oams_manager")
+filament_group_mod = importlib.import_module("oamspkg.filament_group")
 OAMSManager = manager_mod.OAMSManager
+FilamentGroup = filament_group_mod.FilamentGroup
 
 
 class FakeError(Exception):
@@ -296,6 +298,52 @@ class GroupEditTests(unittest.TestCase):
         # file write failed -> running model untouched (no divergence)
         self.assertEqual(mgr.topo.groups, before)
 
+    def test_edit_refused_while_donor_group_loaded(self):
+        # T0 is loaded and printing; moving one of ITS bays into another group
+        # via ASSIGN must be refused just like UNASSIGN/DELETE on T0 would be.
+        lanes = {"fps1": S.LaneState(op=S.OP_LOADED, group="T0", unit=(1, 0))}
+        mgr = build_manager(single_lane_objects(), single_lane_sections(),
+                            lanes=lanes)
+        with self.assertRaises(FakeError) as cm:
+            mgr.cmd_ASSIGN_BAY(
+                FakeGcmd({"GROUP": "T1", "OAMS": "oams1", "BAY": 0}))
+        self.assertIn("loaded", str(cm.exception))
+        self.assertIn(("oams1", 0), mgr.topo.groups["T0"])   # unchanged
+
+    def test_edit_refused_while_destination_group_loaded(self):
+        lanes = {"fps1": S.LaneState(op=S.OP_LOADED, group="T0", unit=(1, 0))}
+        mgr = build_manager(single_lane_objects(), single_lane_sections(),
+                            lanes=lanes)
+        with self.assertRaises(FakeError) as cm:
+            mgr.cmd_ASSIGN_BAY(
+                FakeGcmd({"GROUP": "T0", "OAMS": "oams1", "BAY": 2}))
+        self.assertIn("loaded", str(cm.exception))
+
+    def test_edit_refused_when_group_section_lives_elsewhere(self):
+        # The model knows T0 (defined in printer.cfg, say) but the writeback
+        # file does not contain its section: appending a copy would create a
+        # duplicate section Klipper rejects at restart, so the edit must be
+        # refused and the model left unchanged.
+        mgr = build_manager(single_lane_objects(), single_lane_sections(),
+                            groups_file="# no group sections here\n")
+        before = mgr.topo.groups
+        with self.assertRaises(FakeError) as cm:
+            mgr.cmd_ASSIGN_BAY(
+                FakeGcmd({"GROUP": "T0", "OAMS": "oams1", "BAY": 2}))
+        self.assertIn("openams_config_path", str(cm.exception))
+        self.assertEqual(mgr.topo.groups, before)
+        self.assertEqual(read_file(mgr.openams_config_path),
+                         "# no group sections here\n")       # file untouched
+
+    def test_create_still_allowed_when_file_lacks_groups(self):
+        # Creating a genuinely NEW group appends; that is safe even when the
+        # existing groups live in another file.
+        mgr = build_manager(single_lane_objects(), single_lane_sections(),
+                            groups_file="# no group sections here\n")
+        mgr.cmd_CREATE_GROUP(FakeGcmd({"GROUP": "NEW"}))
+        self.assertIn("[filament_group NEW]",
+                      read_file(mgr.openams_config_path))
+
 
 class SelfTestTests(unittest.TestCase):
     def _oam(self, idx, connected=True, protocol=3):
@@ -333,6 +381,63 @@ class SelfTestTests(unittest.TestCase):
         gcmd = FakeGcmd({})
         mgr.cmd_SELFTEST(gcmd)
         self.assertIn("WARN", gcmd.responses[0])
+
+
+class FakeGroupConfig:
+    def __init__(self, name, value):
+        self._name = name
+        self._value = value
+
+    def get_printer(self):
+        return None
+
+    def get_name(self):
+        return self._name
+
+    def get(self, key, default=None):
+        # None models "option absent": Klipper's config.get then returns the
+        # caller's default.
+        if key == "group" and self._value is not None:
+            return self._value
+        return default
+
+    def error(self, msg):
+        return FakeError(msg)
+
+
+class FilamentGroupParseTests(unittest.TestCase):
+    def _parse(self, value):
+        return FilamentGroup(
+            FakeGroupConfig("filament_group T0", value)).bay_specs
+
+    def test_basic_list(self):
+        self.assertEqual(self._parse("oams1-0,oams1-3"),
+                         [("oams1", 0), ("oams1", 3)])
+
+    def test_whitespace_and_quotes_stripped(self):
+        self.assertEqual(self._parse(' "oams1-0" , oams1-1 '),
+                         [("oams1", 0), ("oams1", 1)])
+
+    def test_empty_and_missing_value(self):
+        self.assertEqual(self._parse(""), [])
+        self.assertEqual(FilamentGroup(
+            FakeGroupConfig("filament_group T0", None)).bay_specs, [])
+
+    def test_oams_name_with_dash_uses_last_segment_as_bay(self):
+        self.assertEqual(self._parse("unit-2-3"), [("unit-2", 3)])
+
+    def test_bad_entry_raises(self):
+        for bad in ("oams1", "-0", "oams1-x", "oams1-9"):
+            with self.assertRaises(FakeError, msg=repr(bad)):
+                self._parse(bad)
+
+    def test_roundtrip_with_group_config_value(self):
+        # What the topology writes must re-parse to the same bay list.
+        topo = T.build_topology(
+            ["fps1"], [T.OamsSpec(name="unit-2", idx=1)],
+            [("G", [("unit-2", 0), ("unit-2", 3)])])
+        value = topo.group_config_value("G")
+        self.assertEqual(self._parse(value), [("unit-2", 0), ("unit-2", 3)])
 
 
 if __name__ == "__main__":

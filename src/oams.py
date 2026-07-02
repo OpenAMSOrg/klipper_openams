@@ -56,17 +56,11 @@ MIN_PROTOCOL_VERSION = 1
 # and its own stall detection (see Runtime.set_firmware_liveness).
 LIVENESS_PROTOCOL_VERSION = 3
 
-# Driver-local action-enum names resolved from the dictionary, paired with the
-# module fallback. Only the action enum is resolved dynamically: it is consumed
-# solely here in the driver. The op-code and follower-direction enums are
-# shared with the pure reducer (which cannot read the dictionary), so those are
-# VALIDATED against the published values rather than substituted.
-_ACTION_ENUM_NAMES = (
-    ("OAMS_STATUS_LOADING", OAMS_STATUS_LOADING),
-    ("OAMS_STATUS_UNLOADING", OAMS_STATUS_UNLOADING),
-    ("OAMS_STATUS_CALIBRATING", OAMS_STATUS_CALIBRATING),
-    ("OAMS_STATUS_ERROR", OAMS_STATUS_ERROR),
-)
+# Only the action enum is resolved dynamically from the dictionary (see
+# _resolve_protocol): it is consumed solely here in the driver. The op-code and
+# follower-direction enums are shared with the pure reducer (which cannot read
+# the dictionary), so those are VALIDATED against the published values rather
+# than substituted.
 
 # (published firmware name, host module value) for the enums that flow into the
 # pure reducer and must therefore match exactly. The firmware renamed CANCEL ->
@@ -321,7 +315,21 @@ class OAMS:
                      self.oams_idx, len(oams_keys),
                      "" if not oams_keys else ": " + ", ".join(oams_keys))
 
-        self.protocol_version = consts.get("OAMS_PROTOCOL_VERSION")
+        # A malformed value (e.g. a string) must degrade to the built-in
+        # default, never raise: an exception here would abort handle_connect
+        # and leave the whole unit without its firmware commands.
+        def int_const(name, default):
+            value = consts.get(name, default)
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                logging.warning("OAMS[%s]: ignoring non-integer firmware"
+                                " constant %s=%r", self.oams_idx, name, value)
+                return default
+
+        self.protocol_version = (
+            None if "OAMS_PROTOCOL_VERSION" not in consts
+            else int_const("OAMS_PROTOCOL_VERSION", None))
         if self.protocol_version is None:
             logging.info("OAMS[%s]: firmware publishes no OAMS_PROTOCOL_VERSION;"
                          " using built-in protocol defaults (legacy mode)",
@@ -337,12 +345,13 @@ class OAMS:
                     MIN_PROTOCOL_VERSION)
 
         # Action enum: resolved dynamically (driver-local interpretation).
-        resolved = {name: consts.get(name, default)
-                    for name, default in _ACTION_ENUM_NAMES}
-        self.status_loading = resolved["OAMS_STATUS_LOADING"]
-        self.status_unloading = resolved["OAMS_STATUS_UNLOADING"]
-        self.status_calibrating = resolved["OAMS_STATUS_CALIBRATING"]
-        self.status_error = resolved["OAMS_STATUS_ERROR"]
+        self.status_loading = int_const("OAMS_STATUS_LOADING",
+                                        OAMS_STATUS_LOADING)
+        self.status_unloading = int_const("OAMS_STATUS_UNLOADING",
+                                          OAMS_STATUS_UNLOADING)
+        self.status_calibrating = int_const("OAMS_STATUS_CALIBRATING",
+                                            OAMS_STATUS_CALIBRATING)
+        self.status_error = int_const("OAMS_STATUS_ERROR", OAMS_STATUS_ERROR)
 
         # Op codes / follower directions: these flow into the pure reducer,
         # which cannot read the dictionary, so we cannot substitute them — we
@@ -351,7 +360,7 @@ class OAMS:
         # gate is meant to catch).
         mismatches = ["%s: firmware=%s host=%s" % (name, consts[name], default)
                       for name, default in _VALIDATED_ENUM_NAMES
-                      if name in consts and consts[name] != default]
+                      if name in consts and int_const(name, default) != default]
         if mismatches:
             logging.error(
                 "OAMS[%s]: firmware protocol enum mismatch (%s); the plugin's"
@@ -512,31 +521,33 @@ class OAMS:
             self._gen_queue.append(gen)
 
     def start_load_spool(self, spool_idx, gen=None):
-        # Resolve the command FIRST so a missing-command failure raises before
-        # any state is mutated (no phantom FIFO entry, no stuck sentinel).
+        # Resolve the command and SEND before mutating any state: a lookup or
+        # send failure must leave no phantom FIFO entry and no stuck sentinel
+        # (a stale FIFO entry would desync completion matching for every
+        # subsequent op on legacy firmware). The reply cannot race the
+        # bookkeeping below — replies are marshalled back onto this same
+        # reactor thread and only run after we return.
         if self._use_gen_protocol:
             cmd = self._require_cmd(self.oams_load_spool2_cmd, "load command")
-            args = [spool_idx, self._wire_gen(gen)]
+            cmd.send([spool_idx, self._wire_gen(gen)])
         else:
             cmd = self._require_cmd(self.oams_load_spool_cmd, "load command")
-            args = [spool_idx]
+            cmd.send([spool_idx])
         self._pending_bay = spool_idx
         self._track_gen(gen)
         self.action_status_code = None
         self.action_status = OAMS_STATUS_LOADING
-        cmd.send(args)
 
     def start_unload_spool(self, gen=None):
         if self._use_gen_protocol:
             cmd = self._require_cmd(self.oams_unload_spool2_cmd, "unload command")
-            args = [self._wire_gen(gen)]
+            cmd.send([self._wire_gen(gen)])
         else:
             cmd = self._require_cmd(self.oams_unload_spool_cmd, "unload command")
-            args = []
+            cmd.send([])
         self._track_gen(gen)
         self.action_status_code = None
         self.action_status = OAMS_STATUS_UNLOADING
-        cmd.send(args)
 
     def start_calibrate(self, kind, bay, gen=None):
         if self._use_gen_protocol:
@@ -544,18 +555,17 @@ class OAMS:
                 self.oams_calibrate_hub_hes2_cmd if kind == "hub_hes"
                 else self.oams_calibrate_ptfe_length2_cmd,
                 "calibrate command")
-            args = [bay, self._wire_gen(gen)]
+            cmd.send([bay, self._wire_gen(gen)])
         else:
             cmd = self._require_cmd(
                 self.oams_calibrate_hub_hes_cmd if kind == "hub_hes"
                 else self.oams_calibrate_ptfe_length_cmd,
                 "calibrate command")
-            args = [bay]
+            cmd.send([bay])
         self._track_gen(gen)
         self.action_status_code = None
         self.action_status_value = None
         self.action_status = OAMS_STATUS_CALIBRATING
-        cmd.send(args)
 
     def load_spool_cancel(self):
         if self.oams_load_spool_cancel_cmd is None:

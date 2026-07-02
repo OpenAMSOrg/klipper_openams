@@ -110,6 +110,20 @@ class MutationTests(unittest.TestCase):
         with self.assertRaises(T.TopologyError):
             T.with_group(single_lane(), "T0")
 
+    def test_create_group_rejects_unwritable_names(self):
+        # Runtime-created names must round-trip through a config file: no
+        # empty/whitespace names, and nothing that breaks a section header or
+        # gets eaten by Klipper's comment stripping.
+        for bad in ("", " ", "two words", "a]b", "a[b", "a#b", "a;b",
+                    "new\nline"):
+            with self.assertRaises(T.TopologyError, msg=repr(bad)):
+                T.with_group(single_lane(), bad)
+
+    def test_create_group_accepts_sane_names(self):
+        t = single_lane()
+        for good in ("PLA", "T4", "red-petg", "user_group.2"):
+            self.assertIn(good, T.with_group(t, good).groups)
+
     def test_assign_bay_moves_it_between_groups(self):
         t = single_lane()                                # bay (oams1,3) is in T3
         t2 = T.with_bay(t, "T0", "oams1", 3)

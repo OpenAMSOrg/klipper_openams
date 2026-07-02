@@ -507,6 +507,51 @@ class FirmwareTimeoutTests(unittest.TestCase):
     def test_describe_timeout_is_human_readable(self):
         self.assertIn("progress", S.describe_code(S.OAMS_OP_CODE_TIMEOUT))
 
+    def test_reload_timeout_code_pauses_without_cancel(self):
+        # Firmware TIMEOUT(7) during a runout auto-reload: the firmware
+        # already stopped, so pause but do NOT send a cancel.
+        lane = S.LaneState(op=S.OP_LOADED, group=GROUP, unit=BAY_A,
+                           runout=S.RUNOUT_LOADING, reload_target=BAY_B,
+                           op_gen=4)
+        s, fx = S.reduce(system(lane),
+                         S.OpCompleted(FPS, S.OAMS_OP_CODE_TIMEOUT, gen=4),
+                         world(), now=1.0)
+        self.assertTrue(has(fx, S.Pause))
+        self.assertFalse(has(fx, S.CancelLoad))
+        self.assertEqual(lane_of(s).op, S.OP_UNLOADED)
+
+
+class RunoutReloadGuardTests(unittest.TestCase):
+    # While a runout auto-reload firmware op is in flight (op stays LOADED,
+    # runout == RUNOUT_LOADING), starting another op would bump op_gen and
+    # orphan the reload's completion — Unload/Calibrate must be rejected.
+    def _reloading_lane(self):
+        return S.LaneState(op=S.OP_LOADED, group=GROUP, unit=BAY_A,
+                           runout=S.RUNOUT_LOADING, reload_target=BAY_B,
+                           op_gen=4)
+
+    def test_unload_rejected_during_reload(self):
+        s, fx = S.reduce(system(self._reloading_lane()), S.Unload(FPS),
+                         world(), now=1.0)
+        self.assertEqual(lane_of(s).op, S.OP_LOADED)
+        self.assertEqual(lane_of(s).runout, S.RUNOUT_LOADING)  # untouched
+        self.assertEqual(lane_of(s).op_gen, 4)                 # not bumped
+        self.assertFalse(has(fx, S.StartUnload))
+        self.assertFalse(find(fx, S.Settle)[0].result.ok)
+
+    def test_calibrate_rejected_during_reload(self):
+        s, fx = S.reduce(system(self._reloading_lane()),
+                         S.Calibrate(FPS, oams_idx=1, bay=2, kind="ptfe"),
+                         world(), now=1.0)
+        self.assertEqual(lane_of(s).op, S.OP_LOADED)           # not CALIBRATING
+        self.assertEqual(lane_of(s).op_gen, 4)
+        self.assertFalse(has(fx, S.StartCalibrate))
+        # ...and the reload can still complete normally afterwards
+        s2, fx2 = S.reduce(s, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS, gen=4),
+                           world(), now=2.0)
+        self.assertEqual(lane_of(s2).unit, BAY_B)
+        self.assertEqual(lane_of(s2).runout, S.RUNOUT_IDLE)
+
 
 class LivenessTests(unittest.TestCase):
     def test_coarse_deadline_when_firmware_owns_liveness(self):

@@ -23,12 +23,27 @@
 #       silently shared)
 
 from dataclasses import dataclass, replace
+import re
 from typing import Mapping, Optional, Tuple
 
 
 class TopologyError(Exception):
     """Invalid OpenAMS configuration. The manager re-raises this as a Klipper
     config.error, so messages are written to be user-facing and actionable."""
+
+
+# Names created at RUNTIME must survive the round trip through a config file:
+# a single token (multi-word section names collapse to their last token at
+# load), and none of the characters that break a section header or get eaten
+# by Klipper's comment stripping (']', '[', '#', ';', whitespace, newlines).
+_GROUP_NAME_RE = re.compile(r'^[A-Za-z0-9_.\-]+$')
+
+
+def _check_group_name(name):
+    if not name or not _GROUP_NAME_RE.match(name):
+        raise TopologyError(
+            "Invalid filament_group name %r: use only letters, digits,"
+            " '_', '-' and '.'" % (name,))
 
 
 @dataclass(frozen=True)
@@ -163,6 +178,7 @@ def _validate_groups(oams, groups):
 # Topology; the manager swaps it in and persists the affected group(s).
 
 def with_group(topo, name):
+    _check_group_name(name)
     if name in topo.groups:
         raise TopologyError("filament_group '%s' already exists." % name)
     groups = dict(topo.groups)

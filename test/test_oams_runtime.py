@@ -255,6 +255,35 @@ class StallTests(unittest.TestCase):
         runtime.tick()
         self.assertFalse(completion.test())
 
+    def test_runout_reload_stall_cancels_and_pauses(self):
+        # Legacy firmware: a jammed runout auto-reload (op stays LOADED,
+        # runout==RUNOUT_LOADING) must be caught by the host stall detector,
+        # not left to feed the print a dwindling tail until the deadline.
+        events = []
+        reactor = FakeReactor(events)
+        printer = FakePrinter(reactor, FakeGcode(events))
+        oam = FakeOam()
+        lw = S.LaneWorld(extruder_pos=1000.0, printing=True,
+                         loaded={UNIT: False, (1, 3): True},
+                         ready={(1, 3): True},
+                         group_bays={"G": (UNIT, (1, 3))},
+                         path_len={1: 600.0})
+        runtime = Runtime(printer, [FPS],
+                          lambda now: S.World(lanes={FPS: lw}),
+                          lambda idx: oam if idx == UNIT[0] else None)
+        reloading = S.LaneState(op=S.OP_LOADED, group="G", unit=UNIT,
+                                runout=S.RUNOUT_LOADING, reload_target=(1, 3),
+                                op_gen=4, since=0.0)
+        runtime.system = S.SystemState(lanes={FPS: reloading})
+        reactor.now = oams_runtime.STALL_AFTER + 3.0
+        runtime.tick()                                 # first encoder sample
+        runtime.tick()                                 # identical -> stall
+        lane = runtime.get_state().lanes[FPS]
+        self.assertEqual(lane.op, S.OP_UNLOADED)       # reload failed over
+        self.assertIn(("cancel_load",), oam.calls)     # firmware op cancelled
+        scripts = [e[1] for e in events if e[0] == "script"]
+        self.assertEqual(scripts.count("PAUSE"), 1)    # paused exactly once
+
 
 class LivenessTests(unittest.TestCase):
     def test_coarse_deadline_armed_when_firmware_owns_liveness(self):

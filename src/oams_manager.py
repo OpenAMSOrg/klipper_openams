@@ -81,6 +81,7 @@ class OAMSManager:
             name = section.get_name()
             if (name == "fps" or name.startswith("fps ")
                     or name.startswith("oams ")
+                    or name == "filament_group"
                     or name.startswith("filament_group ")):
                 self.printer.load_object(self.config, name)
 
@@ -473,7 +474,11 @@ class OAMSManager:
     # Edits are refused on a lane that is mid-op or printing from the affected
     # group, so the model cannot change underneath an in-flight operation.
 
-    def _assert_editable(self, lanes, group=None):
+    def _assert_editable(self, lanes, groups=()):
+        """Refuse edits on a busy/runout lane, and refuse changing the
+        membership of any group in `groups` that is currently loaded — the
+        runout auto-reload picks its spare from the loaded group's bays, so
+        mutating it mid-print would silently change what gets loaded next."""
         state = self.runtime.get_state()
         for lane in lanes:
             ls = state.lanes.get(lane)
@@ -487,10 +492,10 @@ class OAMSManager:
                 raise self.printer.command_error(
                     "Cannot edit filament groups while lane %s is handling a"
                     " runout." % lane)
-            if group is not None and ls.op == S.OP_LOADED and ls.group == group:
+            if ls.op == S.OP_LOADED and ls.group and ls.group in groups:
                 raise self.printer.command_error(
                     "Cannot edit group '%s' while it is loaded on lane %s;"
-                    " unload it first." % (group, lane))
+                    " unload it first." % (ls.group, lane))
 
     def _persist_and_apply(self, new_topo):
         """Persist the difference between the current and new topology to the
@@ -499,24 +504,51 @@ class OAMSManager:
         never diverge."""
         old = self.topo
         edits = []
+        must_exist = []
         for g in new_topo.groups:
             if old.groups.get(g) != new_topo.groups[g]:
                 edits.append((g, new_topo.group_config_value(g)))
+                if g in old.groups:
+                    must_exist.append(g)   # pre-existing group: update in place
         for g in old.groups:
             if g not in new_topo.groups:
                 edits.append((g, None))           # delete the section
-        self._rewrite_config(
-            lambda text: oams_config_io.apply_group_edits(text, edits))
+                must_exist.append(g)
+
+        def transform(text):
+            # A pre-existing group whose section is NOT in this file lives in
+            # another config file (e.g. printer.cfg). Appending a copy here
+            # would create a duplicate section; Klipper merges duplicates with
+            # later-wins semantics, so the edit would silently apply-or-not
+            # depending on include order — refuse with a pointer at the knob.
+            for g in must_exist:
+                if not oams_config_io.has_group(text, g):
+                    raise self.printer.command_error(
+                        "[filament_group %s] is not defined in '%s'; move the"
+                        " section into that file or point [oams_manager]"
+                        " openams_config_path at the file that holds it."
+                        % (g, self.openams_config_path))
+            return oams_config_io.apply_group_edits(text, edits)
+
+        self._rewrite_config(transform)
         self.topo = new_topo
         self._rebuild_derived()
 
     def persist_config_option(self, section, option, value):
         """Set one option in one section of the OpenAMS config file in place
         (used by calibration writeback). Like group edits, this targets the
-        included subfile SAVE_CONFIG cannot reach. Raises command_error on
-        an I/O failure."""
-        self._rewrite_config(
-            lambda text: oams_config_io.set_option(text, section, option, value))
+        included subfile SAVE_CONFIG cannot reach. Refuses (rather than
+        appending a duplicate section) when the section lives in a different
+        file. Raises command_error on any failure."""
+        def transform(text):
+            if not oams_config_io.has_section(text, section):
+                raise self.printer.command_error(
+                    "[%s] is not defined in '%s'; move the section into that"
+                    " file or point [oams_manager] openams_config_path at the"
+                    " file that holds it." % (section, self.openams_config_path))
+            return oams_config_io.set_option(text, section, option, value)
+
+        self._rewrite_config(transform)
 
     def _rewrite_config(self, transform):
         """Atomically read -> transform -> write the OpenAMS config file."""
@@ -556,7 +588,7 @@ class OAMSManager:
         name = gcmd.get("GROUP")
         if name not in self.topo.groups:
             raise gcmd.error("filament_group '%s' does not exist." % name)
-        self._assert_editable([self.topo.lane_of_group(name)], group=name)
+        self._assert_editable([self.topo.lane_of_group(name)], groups=(name,))
         self._persist_and_apply(T.without_group(self.topo, name))
         gcmd.respond_info("Deleted group '%s' (saved to %s)."
                           % (name, self.openams_config_path))
@@ -570,11 +602,19 @@ class OAMSManager:
         if oams_name not in self.oams:
             raise gcmd.error("Unknown OAMS '%s'." % oams_name)
         affected = {self.topo.lane_of_oams(oams_name)}
-        if group in self.topo.groups:
-            gl = self.topo.lane_of_group(group)
-            if gl is not None:
-                affected.add(gl)
-        self._assert_editable(affected)
+        # Both groups whose membership changes are protected while loaded: the
+        # destination AND the donor (the group the bay is being moved out of).
+        touched = {group}
+        donor = next((g for g, bays in self.topo.groups.items()
+                      if (oams_name, bay) in bays), None)
+        if donor is not None:
+            touched.add(donor)
+        for g in touched:
+            if g in self.topo.groups:
+                gl = self.topo.lane_of_group(g)
+                if gl is not None:
+                    affected.add(gl)
+        self._assert_editable(affected, groups=touched)
         try:
             topo = T.with_bay(self.topo, group, oams_name, bay)
         except T.TopologyError as e:
@@ -591,7 +631,7 @@ class OAMSManager:
         bay = gcmd.get_int("BAY", minval=0, maxval=3)
         if group not in self.topo.groups:
             raise gcmd.error("filament_group '%s' does not exist." % group)
-        self._assert_editable([self.topo.lane_of_group(group)], group=group)
+        self._assert_editable([self.topo.lane_of_group(group)], groups=(group,))
         try:
             topo = T.without_bay(self.topo, group, oams_name, bay)
         except T.TopologyError as e:

@@ -195,13 +195,22 @@ class Runtime:
             return
         now = self.reactor.monotonic()
         for fps, lane in list(self.system.lanes.items()):
-            if lane.op not in (S.OP_LOADING, S.OP_UNLOADING) or lane.unit is None:
+            # Watched ops: explicit load/unload, and the runout auto-reload
+            # (op stays LOADED while the reload firmware op feeds from
+            # reload_target — a jam there must pause promptly, not print the
+            # dwindling tail for the whole deadline).
+            if lane.op in (S.OP_LOADING, S.OP_UNLOADING) and lane.unit is not None:
+                unit, label = lane.unit, lane.op
+            elif (lane.op == S.OP_LOADED and lane.runout == S.RUNOUT_LOADING
+                    and lane.reload_target is not None):
+                unit, label = lane.reload_target, "RELOADING"
+            else:
                 self._stall.pop(fps, None)
                 continue
             if now - lane.since <= STALL_AFTER:
                 self._stall.pop(fps, None)   # reset window at op start
                 continue
-            oam = self.resolve_oam(lane.unit[0])
+            oam = self.resolve_oam(unit[0])
             if oam is None:
                 continue
             samples = self._stall.setdefault(fps, deque(maxlen=STALL_SAMPLES))
@@ -209,13 +218,15 @@ class Runtime:
             if len(samples) < STALL_SAMPLES:
                 continue
             if abs(samples[-1] - samples[0]) < MIN_ENCODER_DIFF:
-                logging.info("OAMS[%s]: %s stall detected", fps, lane.op)
-                unit, op = lane.unit, lane.op
+                logging.info("OAMS[%s]: %s stall detected", fps, label)
                 self._stall.pop(fps, None)
                 # Fail the op FIRST (settles any waiter via the unified timeout
-                # path). The waiter may hold the gcode mutex that _pause's
+                # path; for a reload it cancels the firmware op and pauses).
+                # The waiter may hold the gcode mutex that _pause's
                 # run_script("PAUSE") needs, so pausing before settling would
                 # block this tick until the op deadline rescued it.
                 self.dispatch(S.Timeout(fps))
                 oam.set_led_error(unit[1], 1)
-                self._pause("%s speed too low" % op.lower())
+                if label != "RELOADING":
+                    # (the reducer's reload-timeout branch pauses by itself)
+                    self._pause("%s speed too low" % label.lower())

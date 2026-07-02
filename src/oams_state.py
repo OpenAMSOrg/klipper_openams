@@ -392,6 +392,13 @@ def _reduce_lane(lane, action, lw, now, fps, deadline):
     if isinstance(action, Unload):
         if op != OP_LOADED or lane.unit is None:
             return lane, [Settle(fps, OpResult(False, None, "nothing loaded"))]
+        if lane.runout == RUNOUT_LOADING:
+            # A runout auto-reload firmware op is in flight on this lane.
+            # Starting another op would bump op_gen (orphaning the reload's
+            # completion) and leave that unit feeding unmonitored.
+            return lane, [Settle(fps, OpResult(False, None,
+                          "lane is auto-loading the next spool after a runout;"
+                          " wait for it to finish"))]
         unit = lane.unit
         return _begin_op(
             lane, now, fps, deadline, lambda gen: StartUnload(unit, fps, gen),
@@ -399,7 +406,11 @@ def _reduce_lane(lane, action, lw, now, fps, deadline):
             coast_origin=None, reload_target=None)
 
     if isinstance(action, Calibrate):
-        if op in (OP_LOADING, OP_UNLOADING, OP_CALIBRATING):
+        if (op in (OP_LOADING, OP_UNLOADING, OP_CALIBRATING)
+                or (op == OP_LOADED and lane.runout == RUNOUT_LOADING)):
+            # RUNOUT_LOADING included: calibrating over an in-flight reload
+            # would restore op=LOADED with a bumped gen and no deadline,
+            # wedging the lane until CLEAR_ERRORS.
             return lane, [Settle(fps, OpResult(False, None,
                           "busy, cannot calibrate now"))]
         unit = (action.oams_idx, action.bay)

@@ -107,6 +107,20 @@ class SenderRoutingTests(unittest.TestCase):
         o.start_load_spool(0)            # gen defaults to None (standalone path)
         self.assertEqual(o.oams_load_spool2_cmd.sent, [[0, 0]])
 
+    def test_send_failure_leaves_no_phantom_fifo_entry(self):
+        # On legacy firmware a FIFO entry for an op whose send() raised would
+        # desync completion matching for every subsequent op.
+        class BoomCmd:
+            def send(self, args=None):
+                raise RuntimeError("mcu shutdown")
+
+        o = make_oams(use_gen_protocol=False)
+        o.oams_load_spool_cmd = BoomCmd()
+        with self.assertRaises(RuntimeError):
+            o.start_load_spool(2, gen=7)
+        self.assertEqual(list(o._gen_queue), [])
+        self.assertIsNone(o.action_status)     # sentinel not left armed either
+
 
 class GenSourcingTests(unittest.TestCase):
     def test_status2_uses_wire_gen(self):
@@ -184,6 +198,27 @@ class ResolveProtocolTests(unittest.TestCase):
         self.assertEqual(o.protocol_version, 2)
         self.assertEqual(o.status_loading, 10)
         self.assertEqual(o.status_error, 17)
+
+    def test_string_constants_are_coerced(self):
+        # Dictionary values may arrive as strings; they must coerce, not
+        # TypeError inside handle_connect (which would skip all command
+        # lookups and kill the unit).
+        o = self._oams_with_consts({
+            "OAMS_PROTOCOL_VERSION": "3",
+            "OAMS_STATUS_LOADING": "0",
+        })
+        o._resolve_protocol()                # must not raise
+        self.assertEqual(o.protocol_version, 3)
+        self.assertEqual(o.status_loading, 0)
+
+    def test_garbage_constants_fall_back_to_defaults(self):
+        o = self._oams_with_consts({
+            "OAMS_PROTOCOL_VERSION": "not-a-number",
+            "OAMS_STATUS_LOADING": "junk",
+        })
+        o._resolve_protocol()                # must not raise
+        self.assertIsNone(o.protocol_version)          # -> legacy mode
+        self.assertEqual(o.status_loading, oams.OAMS_STATUS_LOADING)
 
     def test_get_constants_failure_is_tolerated(self):
         o = OAMS.__new__(OAMS)
