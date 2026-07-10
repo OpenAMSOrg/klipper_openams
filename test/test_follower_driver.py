@@ -72,6 +72,21 @@ class FakeError(Exception):
     pass
 
 
+class FakeReactor:
+    """Async callbacks run immediately with a late eventtime (so the
+    telemetry reconciliation's recent-local-change guard does not fire
+    unless a test arranges it)."""
+
+    def __init__(self):
+        self.now = 100.0
+
+    def monotonic(self):
+        return self.now
+
+    def register_async_callback(self, cb):
+        cb(self.now)
+
+
 def make_follower(steps_per_mm=100.0):
     f = Follower.__new__(Follower)
     f.short_name = "belay"
@@ -104,6 +119,8 @@ def make_follower(steps_per_mm=100.0):
     f._ff_last_v = None
     f._ff_last_send = 0.0
     f._ff_capable = True
+    f._local_change_time = -10.0
+    f.reactor = FakeReactor()
     f.mcu = FakeMcu()
     f._toolhead = None
     f._extruder = None
@@ -220,6 +237,74 @@ class CompletionTests(unittest.TestCase):
         self.assertTrue(f.ff_underrun)
 
 
+class ReviewRegressionTests(unittest.TestCase):
+    # Fixes from the adversarial review of the first implementation.
+
+    def test_busy_rejection_keeps_op_in_flight(self):
+        # H1: a BUSY status rejects a NEW op while the old one still runs;
+        # clearing _op_in_flight would stop the FPS stream and let the
+        # firmware stale-watchdog kill the healthy op.
+        f = make_follower()
+        f._op_in_flight = True
+        f._apply_action_status({"action": f.status_loading,
+                                "code": S.OAMS_OP_CODE_ERROR_BUSY,
+                                "value": 0, "gen": 9})
+        self.assertTrue(f._op_in_flight)
+        self.assertEqual(f.completions[-1][0], S.OAMS_OP_CODE_ERROR_BUSY)
+
+    def test_stats_flags_reconcile_mirrors(self):
+        # H2: telemetry carries the firmware's own following/op/direction
+        # truth; the host adopts it, self-healing drift (e.g. a lost
+        # terminal status leaving _op_in_flight stuck True).
+        f = make_follower()
+        f._op_in_flight = True                    # stuck: status was lost
+        f._following = True
+        f._stats_received({"oid": 5, "pre": 1, "post": 1,
+                           "flags": 0,            # firmware: idle
+                           "step_count": 0, "velocity": 0})
+        self.assertFalse(f._op_in_flight)
+        self.assertFalse(f._following)
+
+    def test_stats_reconcile_defers_to_recent_local_change(self):
+        f = make_follower()
+        f._local_change_time = f.reactor.now - 0.2   # just changed locally
+        f._following = True
+        f._stats_received({"oid": 5, "pre": 0, "post": 0,
+                           "flags": 0, "step_count": 0, "velocity": 0})
+        self.assertTrue(f._following)                # old report ignored
+
+    def test_follower_stop_skipped_during_op(self):
+        # M1: firmware cmd_set enable=0 hard-aborts an op; broadcast stops
+        # (e.g. _stop_followers) must not cancel an in-flight load/reload.
+        f = make_follower()
+        f._op_in_flight = True
+        f.set_oams_follower(0, S.FOLLOWER_REVERSE)
+        self.assertEqual(f.cmd_set.sent, [])
+
+    def test_load_refused_without_path_length(self):
+        # M5: firmware phase-2 budget would be 0 -> immediate TIMEOUT with
+        # filament stuck between the switches; refuse with a clear error.
+        f = make_follower()
+        f.path_length = 0.0
+        with self.assertRaises(FakeError) as cm:
+            f.start_load_spool(0, gen=1)
+        self.assertIn("path_length", str(cm.exception))
+        self.assertEqual(f.cmd_load.sent, [])
+
+    def test_tmc_register_map_has_ifcnt(self):
+        # C2: MCU_TMC_uart.set_register() reads IFCNT back after every write.
+        self.assertIn("IFCNT", follower_mod._TmcUartInit._REGS)
+
+    def test_clear_errors_mirrors_firmware_hard_stop(self):
+        f = make_follower()
+        f._following = True
+        f._op_in_flight = True
+        f.clear_errors()
+        self.assertFalse(f._following)
+        self.assertFalse(f._op_in_flight)
+        self.assertEqual(f.cmd_clear.sent, [[5]])
+
+
 class FpsForwardTests(unittest.TestCase):
     def test_forward_only_while_active(self):
         f = make_follower()
@@ -241,19 +326,21 @@ class FeedForwardTests(unittest.TestCase):
         return f
 
     def test_constant_velocity_collapses_to_one_segment(self):
-        # 5 mm/s commanded, 1 s of flushed lookahead: delta suppression sends
-        # exactly one segment of 500 steps/s.
+        # 5 mm/s commanded, plenty of PLANNED lookahead: delta suppression
+        # sends exactly one segment of 500 steps/s, and the window is bounded
+        # by the GENERATED horizon (0.35 s), not the planned print_time.
         f = self._streaming(LinearExtruder(5.0), flushed_pt=11.0)
         self.assertEqual(len(f.cmd_ff.sent), 1)
         oid, clock, v = f.cmd_ff.sent[0]
         self.assertEqual(v, 500)
         self.assertEqual(clock, int(10.0 * 1e6))        # segment starts "now"
-        # window consumed up to (a float-rounding sample of) the horizon
-        self.assertGreaterEqual(f._ff_last_pt, 11.0 - f.ff_sample_period - 1e-9)
-        self.assertLessEqual(f._ff_last_pt, 11.0 + 1e-9)
+        cap = 10.0 + follower_mod.FF_GENERATED_HORIZON
+        self.assertGreaterEqual(f._ff_last_pt, cap - f.ff_sample_period - 1e-9)
+        self.assertLessEqual(f._ff_last_pt, cap + 1e-9)
 
     def test_velocity_step_produces_second_segment(self):
-        f = self._streaming(LinearExtruder(5.0, v2=10.0, t_step=10.5),
+        # velocity step INSIDE the generated horizon
+        f = self._streaming(LinearExtruder(5.0, v2=10.0, t_step=10.2),
                             flushed_pt=11.0)
         vs = [v for (_o, _c, v) in f.cmd_ff.sent]
         self.assertEqual(vs[0], 500)
@@ -277,6 +364,40 @@ class FeedForwardTests(unittest.TestCase):
         f._stream_feed_forward(10.0)
         self.assertEqual(len(f.cmd_ff.sent), 1)
         self.assertEqual(f.cmd_ff.sent[0][2], 0)        # v=0 keepalive
+
+    def test_suppressed_cruise_still_refreshes(self):
+        # H3: the firmware holds the last segment and treats ~2 s of host
+        # silence as underrun, so a long constant-velocity cruise must
+        # refresh the (suppressed) velocity at least every 0.5 s.
+        f = make_follower(steps_per_mm=100.0)
+        f._following = True
+        f._extruder = LinearExtruder(5.0)
+        f._toolhead = FakeToolhead(flushed_pt=100.0)
+        f._stream_feed_forward(10.0)
+        self.assertEqual(len(f.cmd_ff.sent), 1)          # initial segment
+        f._stream_feed_forward(10.7)                     # > FF_REFRESH_INTERVAL
+        self.assertEqual(len(f.cmd_ff.sent), 2)          # refreshed, same v
+        self.assertEqual(f.cmd_ff.sent[1][2], 500)
+
+    def test_window_bounded_by_generated_horizon(self):
+        # C1: find_past_position goes FLAT past the step-generation horizon;
+        # sampling there would stream spurious v=0. The window must never
+        # reach past now + FF_GENERATED_HORIZON even with plenty of planned
+        # print_time, so no zero-velocity segment is ever produced from the
+        # flat region.
+        class SaturatingExtruder:
+            def find_past_position(self, print_time):
+                capped = min(print_time, 10.4)           # generation stopped
+                return 5.0 * capped
+        f = make_follower(steps_per_mm=100.0)
+        f._following = True
+        f._extruder = SaturatingExtruder()
+        f._toolhead = FakeToolhead(flushed_pt=12.0)      # planned way ahead
+        f._stream_feed_forward(10.0)
+        self.assertLessEqual(f._ff_last_pt,
+                             10.0 + follower_mod.FF_GENERATED_HORIZON + 1e-9)
+        for (_o, _c, v) in f.cmd_ff.sent:
+            self.assertGreater(v, 0)                     # no flat-region zeros
 
     def test_window_resumes_where_it_left_off(self):
         ext = LinearExtruder(5.0)

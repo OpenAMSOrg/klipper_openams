@@ -135,11 +135,18 @@ follower_cmd_clear_errors oid=%c                 # stop motor, clear error
 ```
 
 Feed-forward semantics: from MCU clock `clock` (low 32 bits; wraparound
-comparison is safe because segments are only scheduled ~1–2 s ahead), the
-commanded extruder velocity is `velocity` steps/s (signed; retractions are
-negative), piecewise-constant until the next segment. Keep a ring of ≥64
-segments. The host sends ≤ ~20 segments/s with delta suppression and a v=0
-keepalive (~1 Hz) when the print queue is idle.
+comparison is safe because segments are only scheduled well under a second
+ahead), the commanded extruder velocity is `velocity` steps/s (signed;
+retractions are negative), piecewise-constant — the firmware HOLDS the last
+segment's velocity until a newer segment's clock passes. Keep a ring of ≥64
+segments. The host sends ≤ ~20 segments/s with delta suppression, REFRESHES
+the current velocity at least every 0.5 s even when suppressed, and sends a
+v=0 keepalive (~1 Hz) when the print queue is idle; the firmware declares
+`ff_underrun` (hold ff at 0, FPS-trim-only degraded mode) only after 2 s
+with NO segment received. Host sampling is bounded to the STEP-GENERATED
+window (~0.35 s ahead of the clock): Klipper's toolhead `print_time` is the
+PLANNED horizon (up to ~1 s ahead) but `find_past_position` only sees
+generated steps (~0.45–0.7 s ahead) and returns flat positions beyond them.
 
 ## 6. Responses (firmware → host)
 
@@ -163,19 +170,28 @@ follower_stats oid=%c pre=%c post=%c flags=%c step_count=%i velocity=%i
    two. `ERROR_BUSY` is the rejection of a second op while one is in flight
    and carries the REJECTED op's gen.
 2. **Load sequence**: reject `NO_SPOOL_IN_BAY` if PRE open; reject
-   `SPOOL_ALREADY_IN_BAY` if POST already made. Phase 1: feed at `load_v`
-   until POST makes — TIMEOUT if not within `switch_travel_steps`. Phase 2:
-   continue at `load_v`, slowing near the end, until the forwarded FPS
-   reaches `fps_upper` (filament pressed into the extruder gears); total
-   budget 1.2 × `path_steps` else TIMEOUT. On SUCCESS **auto-start forward
-   following** (OAMS parity — the store expects a loaded lane to follow).
+   `SPOOL_ALREADY_IN_BAY` if POST already made. Accepting a load clears any
+   active follow mode (ops own the motor). Phase 1: feed at `load_v` until
+   POST makes — TIMEOUT if not within `switch_travel_steps`. Phase 2
+   (budgeted separately, 1.2 × `path_steps` measured FROM the POST edge):
+   continue at `load_v`, slowing for the final `path_steps/8`, until the
+   forwarded FPS reaches `fps_upper` (a fresh sample is required — the
+   stale/default FPS value never terminates a load). On SUCCESS
+   **auto-start forward following** with the PID state reset (OAMS parity —
+   the store expects a loaded lane to follow).
 3. **Unload sequence**: reject `NO_SPOOL_IN_BAY` if POST open. Reverse at
    `unload_v` until POST clears (budget 1.2 × `path_steps` else TIMEOUT),
-   then reverse `park_extra_steps` more and stop → SUCCESS. PRE should stay
-   made (the bay remains "ready" as a runout spare); do not eject past PRE.
+   then reverse `park_extra_steps` more — stopping EARLY if PRE clears (the
+   bay must remain "ready" as a runout spare; never eject past PRE) →
+   SUCCESS.
 4. **Cancel**: `follower_cmd_load_cancel` mid-load stops the motor and
-   completes that op with `CANCEL_LOAD_SPOOL` (gen echoed). A cancel with no
-   load in flight is a silent no-op (no status).
+   completes that op with `CANCEL_LOAD_SPOOL` (gen echoed) — honored even
+   while the FPS stream is stale. A cancel with no load in flight is a
+   silent no-op (no status). `follower_cmd_set enable=0` during an op aborts
+   it the hard way with its one terminal status: loads report
+   `CANCEL_LOAD_SPOOL`; unloads report `ERROR_UNSPECIFIED` (CANCEL is a
+   load-only code, and the host lane then stays LOADED, matching the
+   partially retracted filament).
 5. **Follow loop** (`follower_cmd_set enable=1`):
    `v = slew(clamp(ff(t) + PID(fps_target − fps), ±max_v), accel)`.
    `direction=FORWARD` uses ff + trim as above. `direction=REVERSE` (used by
@@ -187,29 +203,45 @@ follower_stats oid=%c pre=%c post=%c flags=%c step_count=%i velocity=%i
 6. **Watchdogs** (the firmware owns liveness; the host keeps only a coarse
    300 s disconnect backstop):
    - FPS staleness: while following or an op is in flight, if no
-     `follower_cmd_fps` arrives within `fps_stale_ms`, ramp velocity to 0
-     within ~100 ms and set the `fps_stale` flag. This is the HOST-DEATH
-     protection. If staleness persists > 5 s during an op, abort the op with
-     TIMEOUT. Idle followers never arm this watchdog.
+     `follower_cmd_fps` arrives within `fps_stale_ms`, decelerate to 0
+     within ~100 ms (a dedicated stale-decel of at least `max_v/100` per
+     control tick, independent of the configured accel) and set the
+     `fps_stale` flag. This is the HOST-DEATH protection. If staleness
+     persists > 5 s during an op, abort the op with TIMEOUT. Idle followers
+     never arm this watchdog. The PID trim is additionally gated until the
+     FIRST sample after each follow/op start (no cold-start surge from a
+     default value).
    - No-progress: op distance budgets above; there is no encoder, so
      progress is switch/step-count based.
-   - ff underrun: playback passing the last received segment sets
+   - ff underrun: 2 s with no `follower_cmd_ff` received (see §5) sets
      `ff_underrun`, holds ff at 0 and continues on FPS trim alone
-     (degraded, not fatal).
+     (degraded, not fatal). Any received segment clears it.
 7. **Ops ignore ff segments** (they use their own speed profile), but FPS
    forwarding stays active during ops — load termination depends on it.
-8. `DECL_SHUTDOWN` handler: stop the step timer and de-assert enable — the
-   motor must be safe on any MCU shutdown.
+8. `DECL_SHUTDOWN` handler: stop motion and de-assert enable — the motor
+   must be safe on any MCU shutdown. Documented exception to §7.1: an op in
+   flight at shutdown emits NO terminal status (the scheduler is already
+   stopped); the host's disconnect backstop and shutdown handling own it.
+9. Status-queue integrity: a pending TERMINAL status is never evicted; under
+   overflow the firmware drops/evicts BUSY rejections instead.
+10. `debounce_ms` is capped at 254 (0 selects the 5 ms default).
 
 ## 8. Implementation blueprint (maps to proven in-tree patterns)
 
 - `struct follower { struct timer step_timer; struct timer control_timer; … }`
   per oid (`oid_alloc`, like `src/stepper.c:222`).
-- **Step generator**: self-rescheduling `step_timer` with
-  `interval = timer_freq / |v_cmd|` (0 → idle; min interval = the step-rate
-  budget). Same timer technique as `stepper_event` (`src/stepper.c:139-210`)
-  minus the move queue — velocity is a variable, not queued moves. Maintain
-  the signed `int32_t step_count` here.
+- **Step generator**: a self-rescheduling velocity-DDA `step_timer`. Do
+  NOT sleep a full `timer_freq / |v_cmd|` between steps — slewing from rest
+  visits tiny velocities whose naive interval is ~1 s, stalling the motor
+  while `v_cmd` has long since risen. Instead wake at least once per control
+  period, accumulate `|v| * elapsed_ticks`, and step when a full
+  `timer_freq`'s worth accumulates (debt capped at ~2 steps: this follows a
+  RATE, it does not chase position). Maintain the signed `int32_t
+  step_count` here. Resync any timer that discovers it is running late
+  (`waketime` fell behind `timer_read_time()`) instead of blindly `+=` —
+  ARM targets shut the whole MCU down if a reschedule lands >~1 ms in the
+  past (`generic/timer_irq.c`), and a 1 kHz `+=` chain after a comms storm
+  would do exactly that.
 - **Control tick** at 1 kHz: debounced switch sampling (pattern:
   `src/buttons.c:28-68`); ff ring playback selected by `timer_is_before`;
   Q12 PID with clamped integrator; velocity slew; op state machine advanced
@@ -229,8 +261,9 @@ follower_stats oid=%c pre=%c post=%c flags=%c step_count=%i velocity=%i
   (one immediately on follow-enable), never while idle.
 - ff segments are pre-clamped to ±max_v host-side too (belt and braces),
   time-stamped with the follower MCU's own clock via Klipper's standard
-  clock sync, and only ever scheduled inside the already-generated (flushed)
-  motion window.
+  clock sync, only ever sampled inside the step-GENERATED window (~0.35 s
+  ahead; see §5), refreshed at least every 0.5 s during cruises, and kept
+  alive at ~1 Hz when idle.
 - The host treats `follower_stats` as the truth for switch state
   (world model: PRE = "ready", POST = "loaded"), `step_count` as its
   encoder mirror, and TIMEOUT as an ordinary op failure requiring NO cancel
@@ -253,5 +286,8 @@ follower_stats oid=%c pre=%c post=%c flags=%c step_count=%i velocity=%i
 7. Mixed group (`oams1-0, follower-0`): runout on the OAMS bay auto-reloads
    through the follower; runout with the follower as the runner-out pauses
    (or reloads onto an OAMS spare).
-8. Tune PID defaults and the reverse-follow behavior (§7.5); bake results
+8. Inverted `dir_pin` wiring (`!` prefix): load must feed TOWARD the
+   toolhead and `step_count` must increase — verifies the firmware honors
+   the dir-invert flag at runtime, not just at setup.
+9. Tune PID defaults and the reverse-follow behavior (§7.5); bake results
    into `follower.py` defaults and this document.

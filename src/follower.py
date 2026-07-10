@@ -31,6 +31,7 @@ from . import oams_state as S
 from .oams_state import (
     OAMS_OP_CODE_SUCCESS,
     OAMS_OP_CODE_ERROR_UNSPECIFIED,
+    OAMS_OP_CODE_ERROR_BUSY,
     OAMS_OP_CODE_ERROR_KLIPPER_CALL,
     OAMS_OP_CODE_CANCEL,
     OAMS_OP_CODE_TIMEOUT,
@@ -55,6 +56,17 @@ FPS_WIRE_SCALE = 65535.0
 # PID gains ride as Q12 fixed point: steps/s of trim per count of FPS error
 # (per second for ki, seconds for kd).
 PID_Q = 4096.0
+# find_past_position() only knows about GENERATED steps. Klipper's
+# background flusher generates steps just 0.45-0.7 s ahead of the clock
+# (motion_queuing BGFLUSH_*), while toolhead print_time (the PLANNED
+# horizon) runs up to ~1 s ahead — sampling beyond the generated window
+# returns a flat position (zero velocity). Cap the ff window safely inside
+# the generated horizon.
+FF_GENERATED_HORIZON = 0.35
+# Refresh the last ff velocity at least this often even when delta
+# suppression would skip it: the firmware holds the last segment and
+# declares underrun only after ~2 s of host silence.
+FF_REFRESH_INTERVAL = 0.5
 
 # (published firmware name, host reducer value): the op-code enum flows into
 # the shared reducer, so it is VALIDATED, not substituted.
@@ -95,7 +107,7 @@ class Follower:
         # Lane + unit identity ('oams_idx' attribute name kept: it is the
         # cross-kind unit index the manager/runtime/reducer route by).
         self.fps_name = config.get("fps", None)
-        self.oams_idx = config.getint("unit_idx")
+        self.oams_idx = config.getint("unit_idx", minval=0)
 
         # ------------------------------------------------- stepper geometry
         self.step_pin = config.get("step_pin")
@@ -123,7 +135,7 @@ class Follower:
         self.pre_switch_pin = config.get("pre_switch_pin")
         self.post_switch_pin = config.get("post_switch_pin")
         self.switch_debounce = config.getfloat("switch_debounce", 0.005,
-                                               above=0.0)
+                                               above=0.0, maxval=0.25)
 
         # --------------------------------------------------------- geometry
         # POST-switch -> extruder gears, in mm. 0 = uncalibrated: the runout
@@ -134,10 +146,14 @@ class Follower:
         self.park_extra = config.getfloat("park_extra", 20.0, minval=0.0)
 
         # ------------------------------------------------- control tunables
-        self.fps_target = config.getfloat("fps_target", 0.5,
-                                          minval=0.0, maxval=1.0)
-        self.fps_lower_threshold = config.getfloat("fps_lower_threshold", 0.3)
-        self.fps_upper_threshold = config.getfloat("fps_upper_threshold", 0.7)
+        self.fps_lower_threshold = config.getfloat(
+            "fps_lower_threshold", 0.3, minval=0.0, maxval=1.0)
+        self.fps_upper_threshold = config.getfloat(
+            "fps_upper_threshold", 0.7, minval=0.0, maxval=1.0,
+            above=self.fps_lower_threshold)
+        self.fps_target = config.getfloat(
+            "fps_target", 0.5, above=self.fps_lower_threshold,
+            below=self.fps_upper_threshold)
         self.fps_is_reversed = config.getboolean("fps_is_reversed", False)
         self.kp = config.getfloat("kp", 40.0, minval=0.0)
         self.ki = config.getfloat("ki", 2.0, minval=0.0)
@@ -147,6 +163,18 @@ class Follower:
         self.load_speed = config.getfloat("load_speed", 100.0, above=0.0)
         self.unload_speed = config.getfloat("unload_speed", 60.0, above=0.0)
         self.fps_stale_ms = config.getint("fps_stale_ms", 500, minval=50)
+        # The firmware rejects (MCU shutdown) speeds beyond its step budget;
+        # catch it here as a readable config error instead.
+        if self._steps_s(self.max_speed) > 100000:
+            raise config.error(
+                "[%s] max_speed %.0f mm/s is %d steps/s, above the firmware's"
+                " 100000 steps/s budget; lower max_speed or microsteps."
+                % (self.name, self.max_speed, self._steps_s(self.max_speed)))
+        if self.load_speed > self.max_speed \
+                or self.unload_speed > self.max_speed:
+            raise config.error(
+                "[%s] load_speed/unload_speed must not exceed max_speed"
+                % (self.name,))
         self.telemetry_ms = config.getint("telemetry_ms", 500, minval=100)
 
         # --------------------------------------------------- host loop rates
@@ -190,7 +218,10 @@ class Follower:
         self.cmd_ff = None
         self.cmd_clear = None
 
-        # Host stream state
+        # Host stream state. _local_change_time guards the telemetry
+        # reconciliation: a stats report older than a just-made local change
+        # must not immediately overwrite it.
+        self._local_change_time = -10.0
         self._following = False
         self._direction = FOLLOWER_FORWARD
         self._op_in_flight = False
@@ -236,8 +267,12 @@ class Follower:
 
     def _gain_q12(self, gain_mm_s):
         # steps/s of trim per COUNT of fps16 error, Q12 fixed point.
-        return max(0, min(0xFFFF, int(round(
-            gain_mm_s * self.steps_per_mm / FPS_WIRE_SCALE * PID_Q))))
+        raw = int(round(gain_mm_s * self.steps_per_mm / FPS_WIRE_SCALE * PID_Q))
+        if raw > 0xFFFF:
+            logging.warning("follower[%s]: PID gain %.1f clamps to the Q12"
+                            " wire maximum; the effective gain is weaker than"
+                            " configured", self.short_name, gain_mm_s)
+        return max(0, min(0xFFFF, raw))
 
     # ---------------------------------------------------------- mcu config
 
@@ -247,6 +282,11 @@ class Follower:
         def pin(desc, pullup_ok=False):
             params = ppins.lookup_pin(desc, can_invert=True,
                                       can_pullup=pullup_ok)
+            if params.get("pullup", 0) < 0:
+                raise self.printer.config_error(
+                    "[%s]: pull-down ('~') is not supported on follower"
+                    " switch pin '%s'; use '^' or a plain pin."
+                    % (self.name, desc))
             if params["chip"] is not self.mcu:
                 raise self.printer.config_error(
                     "[%s]: pin '%s' is not on mcu '%s'; every follower pin"
@@ -445,6 +485,8 @@ class Follower:
             "step_count": self.encoder_clicks,
             "fps_stale": self.fps_stale,
             "ff_underrun": self.ff_underrun,
+            "op_in_flight": self._op_in_flight,
+            "error_latched": self.error_latched,
             "protocol_version": self.protocol_version,
         }
 
@@ -478,14 +520,24 @@ class Follower:
             raise self.printer.command_error(
                 "follower[%s] has a single bay (0); bay %d does not exist"
                 % (self.short_name, spool_idx))
+        if self.path_length <= 0.0:
+            # Firmware phase-2 budget would be 0 steps: the load would feed to
+            # the POST switch and then TIMEOUT immediately with filament stuck
+            # between the switches. Refuse with an actionable message instead.
+            raise self.printer.command_error(
+                "follower[%s]: path_length is not configured; measure the"
+                " POST-switch to extruder distance and set path_length"
+                % (self.short_name,))
         cmd = self._require_cmd(self.cmd_load, "load command")
         cmd.send([self.oid, self._wire_gen(gen)])
         self._op_in_flight = True
+        self._local_change_time = self.reactor.monotonic()
 
     def start_unload_spool(self, gen=None):
         cmd = self._require_cmd(self.cmd_unload, "unload command")
         cmd.send([self.oid, self._wire_gen(gen)])
         self._op_in_flight = True
+        self._local_change_time = self.reactor.monotonic()
 
     def start_calibrate(self, kind, bay, gen=None):
         # No calibrate op in follower protocol v1 (path_length is configured
@@ -510,9 +562,18 @@ class Follower:
         # the "enable the follower loop" call.
         if self.cmd_set is None:
             return
+        if not enable and self._op_in_flight:
+            # Firmware cmd_set enable=0 hard-aborts an in-flight op. Broadcast
+            # follower stops (e.g. _stop_followers on a no-op unload path)
+            # must not cancel a load/unload/auto-reload: explicit cancellation
+            # goes through load_spool_cancel/clear_errors.
+            logging.info("follower[%s]: ignoring follower stop while an op is"
+                         " in flight", self.short_name)
+            return
         self.cmd_set.send([self.oid, 1 if enable else 0, direction])
         self._following = bool(enable)
         self._direction = direction
+        self._local_change_time = self.reactor.monotonic()
         if enable:
             # prime the loop promptly rather than waiting a full interval
             self._send_fps_now()
@@ -525,6 +586,10 @@ class Follower:
         if self.cmd_clear is not None:
             self.cmd_clear.send([self.oid])
         self.error_latched = False
+        # Firmware cmd_clear_errors hard-stops the follow loop and any op.
+        self._following = False
+        self._op_in_flight = False
+        self._local_change_time = self.reactor.monotonic()
         self.current_spool = 0 if self.hub_hes_value[0] else None
 
     # ------------------------------------------------------------ host loops
@@ -571,9 +636,14 @@ class Follower:
         instead of behind it. Never query beyond the flushed horizon."""
         if self.cmd_ff is None:
             return
+        # toolhead print_time is the PLANNED horizon; steps are only
+        # GENERATED ~0.45-0.7 s ahead (see FF_GENERATED_HORIZON). Sampling
+        # past the generated window would read flat positions (v=0), so the
+        # window is bounded by BOTH.
         flushed_pt = self._toolhead.get_status(eventtime)["print_time"]
         now_pt = self.mcu.estimated_print_time(eventtime)
-        end = min(flushed_pt, now_pt + self.ff_horizon)
+        horizon = min(self.ff_horizon, FF_GENERATED_HORIZON)
+        end = min(flushed_pt, now_pt + horizon)
         start = self._ff_last_pt
         if start is None or start < now_pt:
             start = now_pt
@@ -595,8 +665,12 @@ class Follower:
             v = max(-max_v, min(max_v, v))
             last = self._ff_last_v
             # Delta suppression: only segments that meaningfully change the
-            # commanded velocity ride the wire.
-            if last is None or abs(v - last) > max(2, abs(last) // 50):
+            # commanded velocity ride the wire — but refresh at least every
+            # FF_REFRESH_INTERVAL so the firmware (which holds the last
+            # velocity and treats ~2 s of silence as underrun) keeps seeing a
+            # live stream during long constant-velocity cruises.
+            if (last is None or abs(v - last) > max(2, abs(last) // 50)
+                    or eventtime - self._ff_last_send >= FF_REFRESH_INTERVAL):
                 self._send_ff(pt, v)
                 self._ff_last_send = eventtime
             pos, pt = npos, nxt
@@ -680,7 +754,11 @@ class Follower:
             logging.info("follower[%s]: ignoring non-completion status"
                          " action=%d code=%d", self.short_name, action, code)
             return
-        self._op_in_flight = False
+        if code != OAMS_OP_CODE_ERROR_BUSY:
+            # BUSY is the rejection of a NEW op while another is still in
+            # flight — the running op (and its FPS stream!) must live on.
+            self._op_in_flight = False
+        self._local_change_time = self.reactor.monotonic()
         if action == self.status_loading and code == OAMS_OP_CODE_SUCCESS:
             self.current_spool = 0
             # Firmware auto-starts forward following after a load SUCCESS
@@ -704,6 +782,27 @@ class Follower:
         self.fps_stale = bool(flags & FLAG_FPS_STALE)
         self.ff_underrun = bool(flags & FLAG_FF_UNDERRUN)
         self.error_latched = bool(flags & FLAG_ERROR_LATCHED)
+        # The firmware also reports its OWN following/op/direction state:
+        # adopt it (on the reactor thread) so mirror drift self-heals — e.g.
+        # a lost terminal status leaving _op_in_flight stuck, or an enable
+        # the firmware ignored because an op was running.
+        following = bool(flags & FLAG_FOLLOWING)
+        op_in_flight = bool(flags & FLAG_OP_IN_FLIGHT)
+        direction = FOLLOWER_FORWARD if flags & FLAG_DIRECTION \
+            else FOLLOWER_REVERSE
+        self.reactor.register_async_callback(
+            lambda et, a=following, b=op_in_flight, c=direction:
+                self._reconcile_flags(et, a, b, c))
+
+    def _reconcile_flags(self, eventtime, following, op_in_flight, direction):
+        # Telemetry is the firmware truth, but a report generated BEFORE a
+        # just-made local change must not immediately overwrite it; the next
+        # report (<= telemetry_ms later) reconciles for real.
+        if eventtime - self._local_change_time < 1.0:
+            return
+        self._following = following
+        self._op_in_flight = op_in_flight
+        self._direction = direction
 
 
 class _TmcUartInit:
@@ -713,7 +812,10 @@ class _TmcUartInit:
     chip's reset defaults. A full-featured alternative is running the driver
     in standalone mode (no uart_pin) with straps."""
 
-    _REGS = {"GCONF": 0x00, "IHOLD_IRUN": 0x10, "CHOPCONF": 0x6C}
+    # IFCNT is required: MCU_TMC_uart.set_register() reads it back to
+    # verify every write.
+    _REGS = {"GCONF": 0x00, "IFCNT": 0x02, "IHOLD_IRUN": 0x10,
+             "CHOPCONF": 0x6C}
     _CHOPCONF_RESET = 0x10000053         # TMC2209 datasheet reset value
 
     class _FieldsStub:
