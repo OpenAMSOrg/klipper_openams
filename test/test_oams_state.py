@@ -191,8 +191,8 @@ class RunoutTests(unittest.TestCase):
         self.assertEqual(lane_of(s).runout, S.RUNOUT_COASTING)
         self.assertTrue(has(fx, S.SetFollower))
 
-        # 3) consume beyond path_len/FACTOR -> LOADING the next group bay
-        far = 1000.0 + S.PAUSE_DISTANCE + (600.0 / S.FILAMENT_PATH_LENGTH_FACTOR)
+        # 3) consume beyond path_len (mm) -> LOADING the next group bay
+        far = 1000.0 + S.PAUSE_DISTANCE + 600.0
         w = world(extruder_pos=far + 1.0, printing=True,
                   loaded={BAY_A: False, BAY_B: True},
                   ready={BAY_A: False, BAY_B: True})
@@ -220,7 +220,7 @@ class RunoutTests(unittest.TestCase):
     def test_no_spare_pauses(self):
         lane = S.LaneState(op=S.OP_LOADED, group=GROUP, unit=BAY_A,
                            runout=S.RUNOUT_COASTING, coast_origin=0.0)
-        far = S.PAUSE_DISTANCE + 600.0 / S.FILAMENT_PATH_LENGTH_FACTOR + 1.0
+        far = S.PAUSE_DISTANCE + 600.0 + 1.0
         # only the ran-out bay looks "ready" -> must NOT be chosen
         w = world(extruder_pos=far, printing=True,
                   loaded={BAY_A: False}, ready={BAY_A: True, BAY_B: False})
@@ -237,6 +237,29 @@ class RunoutTests(unittest.TestCase):
                          world(), now=1.0)
         self.assertTrue(has(fx, S.Pause))
         self.assertEqual(lane_of(s).op, S.OP_UNLOADED)
+
+    def test_reload_into_single_bay_follower_unit(self):
+        # The reducer is unit-kind agnostic: a follower is just another
+        # (idx, bay) with its own path_len entry. Runout on the OAMS bay must
+        # auto-reload from the follower's bay 0 spare.
+        FOLLOWER_BAY = (9, 0)
+        lane = S.LaneState(op=S.OP_LOADED, group="MIX", unit=BAY_A,
+                           runout=S.RUNOUT_COASTING, coast_origin=0.0)
+        lw = S.LaneWorld(
+            extruder_pos=S.PAUSE_DISTANCE + 600.0 + 1.0, printing=True,
+            loaded={BAY_A: False, FOLLOWER_BAY: False},
+            ready={FOLLOWER_BAY: True},
+            group_bays={"MIX": (BAY_A, FOLLOWER_BAY)},
+            path_len={1: 600.0, 9: 500.0})
+        s, fx = S.reduce(system(lane), S.Tick(),
+                         S.World(lanes={FPS: lw}), now=1.0)
+        self.assertEqual(lane_of(s).runout, S.RUNOUT_LOADING)
+        self.assertEqual(find(fx, S.StartLoad)[0].unit, FOLLOWER_BAY)
+        # completion switches the lane onto the follower unit
+        s2, _ = S.reduce(s, S.OpCompleted(FPS, S.OAMS_OP_CODE_SUCCESS,
+                                          gen=lane_of(s).op_gen),
+                         S.World(lanes={FPS: lw}), now=2.0)
+        self.assertEqual(lane_of(s2).unit, FOLLOWER_BAY)
 
     def test_idle_tick_is_noop(self):
         lane = self._loaded_lane()

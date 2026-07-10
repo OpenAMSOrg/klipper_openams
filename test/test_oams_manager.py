@@ -58,6 +58,7 @@ class FakeOam:
         self.hub_hes_value = [0, 0, 0, 0]
         self.f1s_hes_value = [0, 0, 0, 0]
         self.filament_path_length = 600
+        self.path_length_mm = 600.0
         self.protocol_version = None
         self.oams_load_spool_cmd = None
         self._use_gen_protocol = False
@@ -66,10 +67,51 @@ class FakeOam:
     def firmware_owns_liveness(self):
         return self.protocol_version is not None and self.protocol_version >= 3
 
+    @property
+    def connected(self):
+        return self.oams_load_spool_cmd is not None
+
+    def protocol_summary(self):
+        return "protocol=%s" % (self.protocol_version
+                                if self.protocol_version is not None
+                                else "legacy")
+
+
+class FakeFollower:
+    """A [follower] unit as the manager sees it (single bay, switches)."""
+
+    def __init__(self, idx, fps=None, path_length=500.0):
+        self.oams_idx = idx
+        self.fps_name = fps
+        self.f1s_hes_value = [0, 0, 0, 0]     # [pre, -, -, -]
+        self.hub_hes_value = [0, 0, 0, 0]     # [post, -, -, -]
+        self.path_length_mm = path_length
+        self.filament_path_length = path_length
+        self.protocol_version = 1
+        self.fps_stale = False
+        self.ff_underrun = False
+        self._connected = True
+        self.follower_calls = []
+
+    @property
+    def connected(self):
+        return self._connected
+
+    @property
+    def firmware_owns_liveness(self):
+        return True
+
+    def protocol_summary(self):
+        return "protocol=FOLLOWER v1"
+
+    def set_oams_follower(self, enable, direction):
+        self.follower_calls.append((enable, direction))
+
 
 class FakeFps:
     def __init__(self, name):
         self.fps_name = name
+        self.extruder = None
 
 
 class FakeGroup:
@@ -202,7 +244,7 @@ class BuildTopologyTests(unittest.TestCase):
             ("filament_group T0", FakeGroup([("oamsX", 0)]))]
         with self.assertRaises(FakeError) as cm:
             build_manager(objs, single_lane_sections())
-        self.assertIn("unknown OAMS", str(cm.exception))
+        self.assertIn("unknown unit", str(cm.exception))
 
     def test_order_independence(self):
         # filament_group sections listed BEFORE the oams section: must still
@@ -438,6 +480,116 @@ class FilamentGroupParseTests(unittest.TestCase):
             [("G", [("unit-2", 0), ("unit-2", 3)])])
         value = topo.group_config_value("G")
         self.assertEqual(self._parse(value), [("unit-2", 0), ("unit-2", 3)])
+
+
+def mixed_lane_objects():
+    """One OAMS + one follower on a single lane; T0 spans both (the follower
+    bay is the runout spare)."""
+    return {
+        "fps": [("fps", FakeFps("fps1"))],
+        "oams": [("oams oams1", FakeOam(1))],
+        "follower": [("follower belay", FakeFollower(9))],
+        "filament_group": [
+            ("filament_group T0", FakeGroup([("oams1", 0), ("belay", 0)])),
+        ],
+    }
+
+
+def mixed_lane_sections():
+    return ["fps", "oams oams1", "follower belay", "filament_group T0",
+            "oams_manager"]
+
+
+class FollowerIntegrationTests(unittest.TestCase):
+    def test_follower_merges_into_topology(self):
+        mgr = build_manager(mixed_lane_objects(), mixed_lane_sections(),
+                            groups_file="[filament_group T0]\n"
+                                        "group: oams1-0,belay-0\n")
+        self.assertEqual(mgr.topo.kind_of("belay"), "follower")
+        self.assertEqual(mgr.oam_by_idx[9].oams_idx, 9)
+        self.assertEqual(mgr.groups_by_lane["fps1"]["T0"], ((1, 0), (9, 0)))
+        self.assertIn("follower belay", mgr.printer.loaded)  # force-loaded
+        # follower lane resolved onto the sole [fps]
+        self.assertEqual(mgr.oams["belay"].fps_name, "fps1")
+
+    def test_world_uses_path_length_mm_for_all_units(self):
+        mgr = build_manager(mixed_lane_objects(), mixed_lane_sections(),
+                            groups_file="[filament_group T0]\n"
+                                        "group: oams1-0,belay-0\n")
+        mgr.reload_before = 0.0
+        mgr.idle_timeout = None
+        world = mgr.build_world(0.0)
+        lw = world.lanes["fps1"]
+        self.assertEqual(lw.path_len[1], 600.0)   # OAMS, already mm in fake
+        self.assertEqual(lw.path_len[9], 500.0)   # follower path_length
+        # follower switch states feed the (idx, 0) world entries
+        self.assertIn((9, 0), lw.loaded)
+        self.assertIn((9, 0), lw.ready)
+
+    def test_selftest_reports_follower(self):
+        objs = mixed_lane_objects()
+        objs["follower"][0][1].f1s_hes_value = [1, 0, 0, 0]
+        mgr = build_manager(objs, mixed_lane_sections(),
+                            groups_file="[filament_group T0]\n"
+                                        "group: oams1-0,belay-0\n")
+        for fps in mgr.fpss.values():
+            fps.get_value = lambda: 0.5
+            fps.extruder_name = "extruder"
+            fps.extruder = object()
+        # make the OAMS side healthy so only follower content is at play
+        mgr.oams["oams1"].oams_load_spool_cmd = object()
+        mgr.oams["oams1"].protocol_version = 3
+        gcmd = FakeGcmd({})
+        mgr.cmd_SELFTEST(gcmd)
+        out = gcmd.responses[0]
+        self.assertIn("FOLLOWER belay", out)
+        self.assertIn("protocol=FOLLOWER v1", out)
+        self.assertIn("pre(ready)=1", out)
+        self.assertIn("RESULT: PASS", out)
+
+    def test_selftest_warns_on_uncalibrated_follower_path(self):
+        objs = mixed_lane_objects()
+        objs["follower"] = [("follower belay",
+                             FakeFollower(9, path_length=0.0))]
+        mgr = build_manager(objs, mixed_lane_sections(),
+                            groups_file="[filament_group T0]\n"
+                                        "group: oams1-0,belay-0\n")
+        for fps in mgr.fpss.values():
+            fps.get_value = lambda: 0.5
+            fps.extruder_name = "extruder"
+            fps.extruder = object()
+        mgr.oams["oams1"].oams_load_spool_cmd = object()
+        gcmd = FakeGcmd({})
+        mgr.cmd_SELFTEST(gcmd)
+        self.assertIn("path_length is 0", gcmd.responses[0])
+
+    def test_assign_bay_to_follower_persists_and_bay1_errors(self):
+        mgr = build_manager(mixed_lane_objects(), mixed_lane_sections(),
+                            groups_file="[filament_group T0]\n"
+                                        "group: oams1-0,belay-0\n")
+        mgr.cmd_CREATE_GROUP(FakeGcmd({"GROUP": "SOLO"}))
+        mgr.cmd_ASSIGN_BAY(FakeGcmd({"GROUP": "SOLO", "OAMS": "belay",
+                                     "BAY": 0}))
+        self.assertIn(("belay", 0), mgr.topo.groups["SOLO"])
+        self.assertNotIn(("belay", 0), mgr.topo.groups["T0"])   # moved
+        self.assertIn("belay-0", read_file(mgr.openams_config_path))
+        with self.assertRaises(FakeError) as cm:
+            mgr.cmd_ASSIGN_BAY(FakeGcmd({"GROUP": "SOLO", "OAMS": "belay",
+                                         "BAY": 1}))
+        self.assertIn("single bay", str(cm.exception))
+
+    def test_stop_followers_reaches_follower_units(self):
+        mgr = build_manager(mixed_lane_objects(), mixed_lane_sections(),
+                            groups_file="[filament_group T0]\n"
+                                        "group: oams1-0,belay-0\n")
+        calls = []
+        mgr.oams["oams1"].set_oams_follower = \
+            lambda e, d: calls.append(("oams1", e, d))
+        mgr.runtime.dispatch = lambda action: None
+        mgr._stop_followers(["fps1"])
+        self.assertIn(("oams1", 0, S.FOLLOWER_REVERSE), calls)
+        self.assertIn((0, S.FOLLOWER_REVERSE),
+                      mgr.oams["belay"].follower_calls)
 
 
 if __name__ == "__main__":

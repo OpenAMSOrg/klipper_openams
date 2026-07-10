@@ -15,6 +15,10 @@ def oams(name, idx, fps=None):
     return T.OamsSpec(name=name, idx=idx, fps=fps)
 
 
+def follower(name, idx, fps=None):
+    return T.OamsSpec(name=name, idx=idx, fps=fps, kind="follower")
+
+
 def single_lane():
     # One FPS, one OAMS (idx 1), four single-bay groups — the shipped layout.
     return T.build_topology(
@@ -66,12 +70,12 @@ class BuildErrorTests(unittest.TestCase):
 
     def test_duplicate_oams_idx(self):
         msg = self._err(["fps1"], [oams("oams1", 1), oams("oams2", 1)], [])
-        self.assertIn("unique oams_idx", msg)
+        self.assertIn("must be unique", msg)
 
     def test_group_unknown_oams(self):
         msg = self._err(["fps1"], [oams("oams1", 1)],
                         [("G", [("oams9", 0)])])
-        self.assertIn("unknown OAMS", msg)
+        self.assertIn("unknown unit", msg)
 
     def test_group_bay_out_of_range(self):
         msg = self._err(["fps1"], [oams("oams1", 1)],
@@ -94,6 +98,61 @@ class BuildErrorTests(unittest.TestCase):
         msg = self._err(["fps1"], [oams("oams1", 1)],
                         [("G", [("oams1", 0)]), ("G", [("oams1", 1)])])
         self.assertIn("must be unique", msg)
+
+
+class FollowerUnitTests(unittest.TestCase):
+    def _mixed(self):
+        # An OAMS and an inline follower sharing one lane, with a mixed group:
+        # the follower's single bay is the runout spare for oams1-0.
+        return T.build_topology(
+            ["fps1"],
+            [oams("oams1", 1), follower("belay", 9)],
+            [("T0", [("oams1", 0), ("belay", 0)])])
+
+    def test_mixed_group_valid_and_kind_aware(self):
+        t = self._mixed()
+        self.assertEqual(t.kind_of("belay"), "follower")
+        self.assertEqual(t.bays_of("belay"), 1)
+        self.assertEqual(t.kind_of("oams1"), "oams")
+        self.assertEqual(t.bays_of("oams1"), 4)
+        self.assertEqual(t.lane_of_group("T0"), "fps1")
+        self.assertEqual(t.group_bays_idx("T0"), ((1, 0), (9, 0)))
+        self.assertEqual(t.group_config_value("T0"), "oams1-0,belay-0")
+
+    def test_follower_bay_out_of_range(self):
+        with self.assertRaises(T.TopologyError) as cm:
+            T.build_topology(
+                ["fps1"], [follower("belay", 9)],
+                [("G", [("belay", 1)])])
+        self.assertIn("single bay", str(cm.exception))
+        self.assertIn("belay-0", str(cm.exception))
+
+    def test_idx_collision_across_kinds(self):
+        with self.assertRaises(T.TopologyError) as cm:
+            T.build_topology(
+                ["fps1"], [oams("oams1", 1), follower("belay", 1)], [])
+        self.assertIn("must be unique", str(cm.exception))
+
+    def test_name_collision_across_kinds(self):
+        with self.assertRaises(T.TopologyError) as cm:
+            T.build_topology(
+                ["fps1"], [oams("x", 1), follower("x", 2)], [])
+        self.assertIn("Duplicate unit name", str(cm.exception))
+
+    def test_unknown_kind_rejected(self):
+        with self.assertRaises(T.TopologyError):
+            T.build_topology(
+                ["fps1"],
+                [T.OamsSpec(name="b", idx=1, kind="bldc")], [])
+
+    def test_runtime_assign_respects_follower_bays(self):
+        t = self._mixed()
+        t2 = T.with_group(t, "SPARE")
+        # bay 0 moves fine; bay 1 does not exist on a follower
+        t3 = T.with_bay(t2, "SPARE", "belay", 0)
+        self.assertIn(("belay", 0), t3.groups["SPARE"])
+        with self.assertRaises(T.TopologyError):
+            T.with_bay(t2, "SPARE", "belay", 1)
 
 
 class MutationTests(unittest.TestCase):

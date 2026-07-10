@@ -46,30 +46,50 @@ def _check_group_name(name):
             " '_', '-' and '.'" % (name,))
 
 
+# Bay count per unit kind: a classic OAMS mainboard has four bays; an inline
+# [follower] is a single-bay unit.
+_KIND_BAYS = {"oams": 4, "follower": 1}
+
+
 @dataclass(frozen=True)
 class OamsSpec:
     name: str                   # short section name, e.g. "oams1"
-    idx: int                    # oams_idx
+    idx: int                    # oams_idx / unit_idx (one shared namespace)
     fps: Optional[str] = None   # explicit FPS lane, or None to default to the sole lane
+    kind: str = "oams"          # "oams" | "follower"
+
+
+@dataclass(frozen=True)
+class UnitInfo:
+    idx: int
+    lane: str
+    kind: str
+    bays: int
 
 
 @dataclass(frozen=True)
 class Topology:
     fps_names: Tuple[str, ...]
-    # oams short name -> (oams_idx, resolved fps lane)
-    oams: Mapping[str, Tuple[int, str]]
-    # group name -> tuple of (oams short name, bay index), in declared order
+    # unit short name -> UnitInfo (OAMS mainboards and followers alike)
+    oams: Mapping[str, UnitInfo]
+    # group name -> tuple of (unit short name, bay index), in declared order
     groups: Mapping[str, Tuple[Tuple[str, int], ...]]
 
     # ------------------------------------------------------------- accessors
     def idx_of(self, oams_name):
-        return self.oams[oams_name][0]
+        return self.oams[oams_name].idx
 
     def lane_of_oams(self, oams_name):
-        return self.oams[oams_name][1]
+        return self.oams[oams_name].lane
+
+    def kind_of(self, oams_name):
+        return self.oams[oams_name].kind
+
+    def bays_of(self, oams_name):
+        return self.oams[oams_name].bays
 
     def oams_on_lane(self, lane):
-        return tuple(n for n, (_idx, l) in self.oams.items() if l == lane)
+        return tuple(n for n, u in self.oams.items() if u.lane == lane)
 
     def lane_of_group(self, group):
         bays = self.groups[group]
@@ -108,22 +128,30 @@ def build_topology(fps_names, oams_specs, group_specs):
     oams = {}
     idx_owner = {}
     for spec in oams_specs:
+        if spec.kind not in _KIND_BAYS:
+            raise TopologyError(
+                "Unit '%s' has unknown kind '%s'." % (spec.name, spec.kind))
         if spec.name in oams:
-            raise TopologyError("Duplicate OAMS '%s'." % spec.name)
+            raise TopologyError(
+                "Duplicate unit name '%s'; [oams] and [follower] sections"
+                " share one namespace." % spec.name)
         lane = spec.fps or sole
         if lane is None:
             raise TopologyError(
-                "[oams %s] must set 'fps:' when several [fps] lanes are defined."
-                % spec.name)
+                "[%s %s] must set 'fps:' when several [fps] lanes are defined."
+                % (spec.kind, spec.name))
         if lane not in seen:
             raise TopologyError(
-                "[oams %s] references unknown fps '%s'." % (spec.name, lane))
+                "[%s %s] references unknown fps '%s'."
+                % (spec.kind, spec.name, lane))
         if spec.idx in idx_owner:
             raise TopologyError(
-                "oams_idx %d is shared by '%s' and '%s'; each OAMS needs a"
-                " unique oams_idx." % (spec.idx, idx_owner[spec.idx], spec.name))
+                "unit index %d is shared by '%s' and '%s'; oams_idx/unit_idx"
+                " values must be unique across every [oams] and [follower]."
+                % (spec.idx, idx_owner[spec.idx], spec.name))
         idx_owner[spec.idx] = spec.name
-        oams[spec.name] = (spec.idx, lane)
+        oams[spec.name] = UnitInfo(idx=spec.idx, lane=lane, kind=spec.kind,
+                                   bays=_KIND_BAYS[spec.kind])
 
     groups = {}
     for gname, bays in group_specs:
@@ -145,14 +173,20 @@ def _validate_groups(oams, groups):
         within = set()
         for entry in bays:
             oams_name, bay = entry
-            if not 0 <= bay <= 3:
-                raise TopologyError(
-                    "filament_group '%s': bay index %d out of range (0-3)."
-                    % (gname, bay))
             if oams_name not in oams:
                 raise TopologyError(
-                    "filament_group '%s' references unknown OAMS '%s'; define"
-                    " [oams %s] or fix the name." % (gname, oams_name, oams_name))
+                    "filament_group '%s' references unknown unit '%s'; define"
+                    " [oams %s] / [follower %s] or fix the name."
+                    % (gname, oams_name, oams_name, oams_name))
+            unit = oams[oams_name]
+            if not 0 <= bay < unit.bays:
+                if unit.bays == 1:
+                    raise TopologyError(
+                        "filament_group '%s': follower '%s' has a single bay;"
+                        " use %s-0." % (gname, oams_name, oams_name))
+                raise TopologyError(
+                    "filament_group '%s': bay index %d out of range (0-%d)."
+                    % (gname, bay, unit.bays - 1))
             if entry in within:
                 raise TopologyError(
                     "filament_group '%s' lists %s-%d twice."
@@ -164,13 +198,12 @@ def _validate_groups(oams, groups):
                     " only one filament_group." % (oams_name, bay,
                                                    bay_owner[entry], gname))
             bay_owner[entry] = gname
-            oam_lane = oams[oams_name][1]
             if lane is None:
-                lane = oam_lane
-            elif lane != oam_lane:
+                lane = unit.lane
+            elif lane != unit.lane:
                 raise TopologyError(
                     "filament_group '%s' spans FPS lanes %s and %s; a group's"
-                    " bays must share one FPS lane." % (gname, lane, oam_lane))
+                    " bays must share one FPS lane." % (gname, lane, unit.lane))
 
 
 # ================================================================== mutation

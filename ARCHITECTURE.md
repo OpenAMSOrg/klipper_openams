@@ -25,6 +25,7 @@ single coordinator and validator.
 | `oams_topology.py` | **pure** | Immutable config model: FPS lanes ↔ OAMS units ↔ filament groups, with all cross-section validation and the runtime group-edit operations. |
 | `oams_runtime.py`  | reactor  | The only place that executes effects: arms deadline timers, settles G-code waiters, runs the (legacy) stall watchdog. Holds the live `SystemState`. |
 | `oams.py`          | driver   | One per `[oams]`: sends firmware commands, mirrors telemetry, negotiates the protocol, turns firmware replies into `OpCompleted` actions. |
+| `follower.py`      | driver   | One per `[follower]`: an inline stepper as a SINGLE-BAY unit, closed-loop controlled by custom Klipper MCU firmware (see `FOLLOWER_PROTOCOL.md`). Hosts the FPS-forwarding and motion-queue feed-forward streams; PRE switch = "ready", POST switch = "loaded". |
 | `oams_manager.py`  | adapter  | Builds + validates the topology, owns the runtime, registers `OAMSM_*` commands and webhooks, drives the monitor tick, hosts runtime group editing. |
 | `fps.py`           | driver   | One feed-path pressure sensor; reads the FPS ADC (mainline or Kalico API, auto-detected). |
 | `filament_group.py`| config   | Thin holder: parses its own bay list only. All cross-validation is the manager's. |
@@ -61,6 +62,11 @@ All dispatch happens on the reactor thread (serial-thread replies are marshalled
 via `register_async_callback`), so the store needs no locks.
 
 ## 5. Firmware protocol contract
+
+Two firmware protocols exist: the OAMS mainboard protocol below, and the
+inline-follower protocol, which is fully specified in `FOLLOWER_PROTOCOL.md`
+(same op-code enum values, gen echo, one-terminal-status and firmware-owned
+liveness — mandatory from its v1, integer-only wire units).
 
 The firmware is the single runtime source of truth for the protocol and
 publishes it into the Klipper data dictionary; the host reads it at connect via
@@ -181,8 +187,11 @@ Config-exposed (all defaulted, so none are required in the config):
 
 Intentionally internal (safety-relevant timings, kept out of config to avoid
 foot-guns; change in `oams_state.py`/`oams_runtime.py` with care): the op
-deadline / disconnect backstop, `PAUSE_DISTANCE` and `FILAMENT_PATH_LENGTH_FACTOR`
-(runout geometry), and the host stall-detection thresholds (only used against
+deadline / disconnect backstop, `PAUSE_DISTANCE` (runout geometry; note
+`LaneWorld.path_len` is always MILLIMETRES — the OAMS driver converts its
+encoder clicks via `FILAMENT_PATH_LENGTH_FACTOR` in `oams.py`, the follower
+uses its `path_length` directly), and the host stall-detection thresholds
+(only used against
 pre-v3 firmware).
 
 ## 9. Validation

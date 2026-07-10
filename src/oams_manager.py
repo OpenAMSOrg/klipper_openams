@@ -81,6 +81,7 @@ class OAMSManager:
             name = section.get_name()
             if (name == "fps" or name.startswith("fps ")
                     or name.startswith("oams ")
+                    or name.startswith("follower ")
                     or name == "filament_group"
                     or name.startswith("filament_group ")):
                 self.printer.load_object(self.config, name)
@@ -88,11 +89,17 @@ class OAMSManager:
     def _build_topology(self):
         self._force_load_sections()
 
-        # Klipper object maps (objects can't live in the pure model).
+        # Klipper object maps (objects can't live in the pure model). self.oams
+        # is really "units by short name": OAMS mainboards AND inline followers
+        # present the same driver interface, so everything downstream (idx
+        # maps, world builder, effects) treats them uniformly.
         self.fpss = {fps.fps_name: fps
                      for _name, fps in self.printer.lookup_objects(module="fps")}
         self.oams = {full.split()[-1]: oam
                      for full, oam in self.printer.lookup_objects(module="oams")}
+        followers = {full.split()[-1]: f
+                     for full, f in self.printer.lookup_objects(
+                         module="follower")}
         self._groups = {full.split()[-1]: g
                         for full, g in self.printer.lookup_objects(
                             module="filament_group")}
@@ -101,6 +108,10 @@ class OAMSManager:
         # user-facing message that we surface as a Klipper config error).
         oams_specs = [T.OamsSpec(name=short, idx=oam.oams_idx, fps=oam.fps_name)
                       for short, oam in self.oams.items()]
+        oams_specs += [T.OamsSpec(name=short, idx=f.oams_idx, fps=f.fps_name,
+                                  kind="follower")
+                       for short, f in followers.items()]
+        self.oams.update(followers)
         group_specs = [(short, list(g.bay_specs))
                        for short, g in self._groups.items()]
         try:
@@ -146,7 +157,7 @@ class OAMSManager:
                     key = (oam.oams_idx, bay)
                     loaded[key] = bool(oam.hub_hes_value[bay])
                     ready[key] = bool(oam.f1s_hes_value[bay])
-                path_len[oam.oams_idx] = oam.filament_path_length
+                path_len[oam.oams_idx] = oam.path_length_mm
             epos = fps.extruder.last_position if fps.extruder is not None else 0.0
             lanes[fps_name] = S.LaneWorld(
                 extruder_pos=epos, printing=printing, loaded=loaded, ready=ready,
@@ -228,7 +239,8 @@ class OAMSManager:
         t = self.topo
         request.send({"topology": {
             "fps": list(t.fps_names),
-            "oams": {n: {"idx": t.idx_of(n), "lane": t.lane_of_oams(n)}
+            "oams": {n: {"idx": t.idx_of(n), "lane": t.lane_of_oams(n),
+                         "kind": t.kind_of(n), "bays": t.bays_of(n)}
                      for n in t.oams},
             "groups": {g: {"lane": t.lane_of_group(g),
                            "bays": ["%s-%d" % e for e in t.groups[g]]}
@@ -287,28 +299,37 @@ class OAMSManager:
                             getattr(fps, "extruder_name", "?")))
             if getattr(fps, "extruder", None) is None:
                 warns.append("FPS %s extruder unresolved" % name)
-        versions = set()
+        oams_versions = set()
         for short, oam in sorted(self.oams.items()):
-            connected = oam.oams_load_spool_cmd is not None
-            pv = oam.protocol_version
-            versions.add(pv)
-            ready = [b for b in range(4) if oam.f1s_hes_value[b]]
-            loaded = [b for b in range(4) if oam.hub_hes_value[b]]
+            kind = self.topo.kind_of(short)
+            bays = self.topo.bays_of(short)
+            connected = oam.connected
+            ready = [b for b in range(bays) if oam.f1s_hes_value[b]]
+            loaded = [b for b in range(bays) if oam.hub_hes_value[b]]
             lines.append(
-                "  OAMS %s (idx %s) lane %s: %s, protocol=%s%s%s"
-                % (short, oam.oams_idx, oam.fps_name,
+                "  %s %s (idx %s) lane %s: %s, %s"
+                % (kind.upper(), short, oam.oams_idx, oam.fps_name,
                    "connected" if connected else "NOT CONNECTED",
-                   pv if pv is not None else "legacy",
-                   ", gen-matched" if getattr(oam, "_use_gen_protocol", False)
-                   else "",
-                   ", fw-liveness" if oam.firmware_owns_liveness else ""))
-            lines.append("    bays ready=%s loaded=%s"
-                         % (ready or "-", loaded or "-"))
+                   oam.protocol_summary()))
+            if kind == "follower":
+                lines.append("    pre(ready)=%s post(loaded)=%s"
+                             " path_length=%.1fmm fps_stale=%s ff_underrun=%s"
+                             % (oam.f1s_hes_value[0], oam.hub_hes_value[0],
+                                oam.path_length_mm, oam.fps_stale,
+                                oam.ff_underrun))
+                if oam.path_length_mm <= 0:
+                    warns.append("follower %s path_length is 0 (runout will"
+                                 " pause instead of auto-reloading)" % short)
+            else:
+                oams_versions.add(oam.protocol_version)
+                lines.append("    bays ready=%s loaded=%s"
+                             % (ready or "-", loaded or "-"))
             if not connected:
-                warns.append("OAMS %s firmware commands not resolved" % short)
-        if len(versions) > 1:
-            warns.append("mixed firmware protocol versions %s"
-                         % sorted(str(v) for v in versions))
+                warns.append("%s %s firmware commands not resolved"
+                             % (kind, short))
+        if len(oams_versions) > 1:
+            warns.append("mixed OAMS firmware protocol versions %s"
+                         % sorted(str(v) for v in oams_versions))
         for g in self.topo.groups:
             bays = ",".join("%s-%d" % e for e in self.topo.groups[g])
             lines.append("  group %s: lane=%s bays=%s"

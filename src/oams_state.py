@@ -67,7 +67,6 @@ RUNOUT_LOADING = "loading"      # next-spool load in flight (non-blocking)
 
 # --- tunables (decision constants; shared with the runtime) ---
 PAUSE_DISTANCE = 60.0
-FILAMENT_PATH_LENGTH_FACTOR = 1.14
 # Authoritative per-op deadline used ONLY against firmware that makes no
 # liveness promise (protocol < 3 / legacy). Protocol >= 3 firmware runs its own
 # no-progress watchdog and always completes an op, so the host downgrades this
@@ -131,7 +130,10 @@ class LaneWorld:
     loaded: Mapping[Tuple[int, int], bool] = field(default_factory=dict)  # hub HES
     ready: Mapping[Tuple[int, int], bool] = field(default_factory=dict)   # f1s HES
     group_bays: Mapping[str, Tuple[Tuple[int, int], ...]] = field(default_factory=dict)
-    path_len: Mapping[int, float] = field(default_factory=dict)           # oams_idx -> clicks
+    path_len: Mapping[int, float] = field(default_factory=dict)           # unit idx -> mm
+    # path_len is the filament path from the unit's 'loaded' sensor to the
+    # extruder, in millimetres. Unit conversion (e.g. OAMS encoder clicks)
+    # happens in the drivers, so the reducer has exactly one unit to reason in.
     reload_before: float = 0.0
 
 
@@ -579,7 +581,7 @@ def _runout_tick(lane, lw, now, fps, deadline):
                               " auto-load the next spool. Run"
                               " OAMS_CALIBRATE_PTFE_LENGTH.")]
         consumed = lw.extruder_pos - lane.coast_origin
-        if consumed + PAUSE_DISTANCE + lw.reload_before > path_len / FILAMENT_PATH_LENGTH_FACTOR:
+        if consumed + PAUSE_DISTANCE + lw.reload_before > path_len:
             for unit in lw.group_bays.get(lane.group, ()):
                 if unit == lane.unit:
                     continue  # never reload the bay that just ran out

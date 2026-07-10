@@ -32,6 +32,12 @@ from .oams_state import (
     OAMS_ACTION_TIMEOUT,
 )
 
+# OAMS ptfe_length / encoder telemetry are in encoder clicks; this factor
+# converts clicks to filament millimetres. It is a property of the OAMS
+# hardware, so it lives here in the driver — the pure reducer reasons in mm
+# only (LaneWorld.path_len).
+FILAMENT_PATH_LENGTH_FACTOR = 1.14
+
 # Firmware "action" identifiers reported by oams_action_status. These are the
 # BUILT-IN FALLBACK values: when the firmware publishes the enum in the data
 # dictionary (OAMS_PROTOCOL_VERSION >= 1) the resolved values are read at
@@ -216,6 +222,29 @@ class OAMS:
         watchdog (protocol >= 3), so the host need not impose its own deadline."""
         return (self.protocol_version is not None
                 and self.protocol_version >= LIVENESS_PROTOCOL_VERSION)
+
+    @property
+    def connected(self):
+        """True once the firmware commands resolved at connect."""
+        return self.oams_load_spool_cmd is not None
+
+    @property
+    def path_length_mm(self):
+        """Filament path from the hub HES to the extruder in millimetres (the
+        unit LaneWorld.path_len carries). ptfe_length is calibrated in encoder
+        clicks; 0 stays 0 so the uncalibrated-runout guard still fires."""
+        return self.filament_path_length / FILAMENT_PATH_LENGTH_FACTOR
+
+    def protocol_summary(self):
+        """One-line protocol description for SELFTEST."""
+        parts = ["protocol=%s" % (self.protocol_version
+                                  if self.protocol_version is not None
+                                  else "legacy")]
+        if self._use_gen_protocol:
+            parts.append("gen-matched")
+        if self.firmware_owns_liveness:
+            parts.append("fw-liveness")
+        return ", ".join(parts)
 
     def is_bay_ready(self, bay_index):
         return bool(self.f1s_hes_value[bay_index])
