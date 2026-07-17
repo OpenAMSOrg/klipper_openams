@@ -35,7 +35,14 @@ class FPS:
         if self.use_kalico:
             self.adc.setup_minmax(self._sample_time, self._sample_count)
         else:
-            self.adc.setup_adc_sample(self._sample_time, self._sample_count)
+            # FPS is a prompt control input, but not a heater-safety ADC. Use
+            # the Helix merged DMA engine when available and retain MCU_adc's
+            # automatic legacy fallback for upstream/older firmware.
+            use_adc_stream = config.getboolean('use_adc_stream', True)
+            if use_adc_stream and hasattr(self.adc, 'setup_adc_stream'):
+                self.adc.setup_adc_stream(report_class=1)
+            self.adc.setup_adc_sample(
+                self._report_time, self._sample_time, self._sample_count)
         self.adc.setup_adc_callback(self._adc_callback)
         
         self.callbacks = []
