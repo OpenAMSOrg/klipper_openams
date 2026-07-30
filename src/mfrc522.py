@@ -321,15 +321,22 @@ class OpenAmsMfrc522:
         return bytes.fromhex(value)
 
     def _handle_ready(self):
+        # Klipper dispatches ready handlers with reactor pauses disabled. SPI
+        # query commands wait for an MCU response, so defer initialization to
+        # its own reactor callback/greenlet.
+        self.reactor.register_callback(self._handle_start)
+
+    def _handle_start(self, eventtime):
         try:
             self.version = self.reader.initialize()
             self.last_error = None
         except Exception as exc:
             self.last_read_status = "ERROR"
-            self.last_read_time = self.reactor.monotonic()
+            self.last_read_time = eventtime
             self.last_error = str(exc)
             logging.exception("MFRC522 %s initialization failed", self.name)
-        self.reactor.register_timer(self._poll, self.reactor.NOW)
+        self.reactor.register_timer(
+            self._poll, eventtime + self.poll_interval)
 
     def _read_card(self):
         uid = self.reader.read_uid()
