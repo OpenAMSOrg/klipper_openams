@@ -138,8 +138,8 @@ class OAMSManager:
                     logging.info("OAMS: Loading next spool in the filament group.")
                     for (oam, bay_index) in self.filament_groups[self.current_group].bays:
                         if oam.is_bay_ready(bay_index):
-                            success, message = oam.load_spool(bay_index)
-                            if success:
+                            code, message = oam.load_spool(bay_index)
+                            if code == OAMS_OP_CODE_SUCCESS:
                                 logging.info(f"OAMS: Successfully loaded spool in bay {bay_index} of OAM {oam.name}")
                                 self.current_spool = (oam, bay_index)
                                 self.runout_position = None
@@ -380,7 +380,7 @@ class OAMSManager:
                 code, message = oam.finish_load_spool(bay_index)
                 logging.info("OAMS[%d] Load Spool Result: code=%d message=%s" % (oam.oams_idx, code, message))
 
-                if code == OAMS_OP_CODE_SUCCESS or code == OAMS_OP_CODE_CANCEL:
+                if code == OAMS_OP_CODE_SUCCESS:
                     self.current_group = group_name
                     self.current_spool = (oam, bay_index)
 
@@ -396,6 +396,8 @@ class OAMSManager:
                 else:
                     self.current_state.name = "UNLOADED"
                     self.current_state.current_spool = None
+                    self.current_group = None
+                    self.current_spool = None
                     gcmd.respond_info(message)
                     return
         gcmd.respond_info(f"No spool available for group {group_name}")

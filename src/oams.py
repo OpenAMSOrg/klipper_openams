@@ -422,7 +422,6 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         elif self.action_status_code == OAMS_OP_CODE_ERROR_BUSY:
             return self.action_status_code, "OAMS is busy"
         elif self.action_status_code == OAMS_OP_CODE_CANCEL:
-            self.current_spool = spool_idx
             return self.action_status_code, "Spool loading cancelled"
         else:
             return self.action_status_code, "Unknown error from OAMS with code %d" % self.action_status_code
@@ -445,12 +444,12 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
         if spool_idx < 0 or spool_idx > 3:
             raise gcmd.error("Invalid SPOOL index")
         
-        success, message = self.load_spool(spool_idx)
-        
-        if success:
+        code, message = self.load_spool(spool_idx)
+
+        if code == OAMS_OP_CODE_SUCCESS:
             gcmd.respond_info(message)
         else:
-            gcmd.error(message)
+            raise gcmd.error(message)
             
     def unload_spool(self):
         self.action_status = OAMS_STATUS_UNLOADING
