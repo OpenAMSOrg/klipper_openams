@@ -61,9 +61,9 @@ class Mfrc522:
     PICC_MF_AUTH_KEY_B = 0x61
     PICC_MF_READ = 0x30
 
-    # FM17580 uses 0x37 as a production-test register; OpenAMS units
-    # consistently report 0xA1 there after a successful reset.
-    VALID_VERSIONS = (0x88, 0x90, 0x91, 0x92, 0xA1, 0xB2)
+    # FM17580 VersionReg is a production-version byte with no fixed reset
+    # value. OpenAMS hardware has been observed with both A1 and EE.
+    VALID_VERSIONS = (0x88, 0x90, 0x91, 0x92, 0xA1, 0xB2, 0xEE)
     HARD_RESET_LOW_TIME = 0.010
     HARD_RESET_SETTLE_TIME = 0.002
 

@@ -105,14 +105,16 @@ def test_ready_defers_blocking_spi_initialization():
     assert timers == [(reader._poll, 10.5)]
 
 
-def test_fm17580_version_a1_is_accepted():
-    reader = mfrc522.Mfrc522(FakeSpi())
-    writes = []
-    reader.reg_write = lambda reg, value: writes.append((reg, value))
-    reader.reg_read = lambda reg: 0xA1 if reg == reader.VERSION else 0
+def test_fm17580_production_versions_are_accepted():
+    for production_version in (0xA1, 0xEE):
+        reader = mfrc522.Mfrc522(FakeSpi())
+        writes = []
+        reader.reg_write = lambda reg, value: writes.append((reg, value))
+        reader.reg_read = lambda reg, version=production_version: (
+            version if reg == reader.VERSION else 0)
 
-    assert reader.initialize() == 0xA1
-    assert (reader.COMMAND, reader.CMD_SOFT_RESET) in writes
+        assert reader.initialize() == production_version
+        assert (reader.COMMAND, reader.CMD_SOFT_RESET) in writes
 
 
 def test_hardware_reset_precedes_soft_reset():
@@ -142,6 +144,6 @@ if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
     test_ready_defers_blocking_spi_initialization()
-    test_fm17580_version_a1_is_accepted()
+    test_fm17580_production_versions_are_accepted()
     test_hardware_reset_precedes_soft_reset()
     print("PASS: MFRC522/FM17580 initialization and RFID command")
