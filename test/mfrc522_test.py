@@ -237,15 +237,34 @@ def test_one_driver_owns_and_serializes_both_readers():
     initialize_operations = []
     for reader in driver.readers:
         card = reader.rfid_card
-        reader._initialize = lambda eventtime, card=card: (
-            initialize_operations.append((card, eventtime)))
+        reader.reader.initialize = lambda card=card: (
+            initialize_operations.append(card) or (0x91 + card))
     driver._initialize(9.0)
     assert reset_sends == [
         [7, 0, False], [7, 1, False],
-        [7, 0, True], [7, 1, True],
+        [7, 0, False], [7, 1, False], [7, 0, True],
+        [7, 0, False], [7, 1, False], [7, 1, True],
     ]
+    assert pauses == [100.010, 100.010, 100.002, 100.010, 100.002]
+    assert initialize_operations == [0, 1]
+    assert driver.active_reader == 1
+    assert [reader.version for reader in driver.readers] == [0x91, 0x92]
+
+    # Switching back disables both readers, then releases and initializes A.
+    reset_sends[:] = []
+    pauses[:] = []
+    initialize_operations[:] = []
+    assert driver.activate_reader(driver.readers[0]) == 0x91
+    assert reset_sends == [
+        [7, 0, False], [7, 1, False], [7, 0, True]]
     assert pauses == [100.010, 100.002]
-    assert initialize_operations == [(0, 9.0), (1, 9.0)]
+    assert initialize_operations == [0]
+    assert driver.active_reader == 0
+
+    # Reusing the already-active reader must not reset or initialize it again.
+    assert driver.activate_reader(driver.readers[0]) == 0x91
+    assert len(reset_sends) == 3
+    assert initialize_operations == [0]
 
     operations = []
     for reader in driver.readers:

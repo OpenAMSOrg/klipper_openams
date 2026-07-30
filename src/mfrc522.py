@@ -470,7 +470,7 @@ class OpenAmsMfrc522:
     def _initialize(self, eventtime):
         self.tag_processor = self.owner.tag_processor
         try:
-            self.version = self.reader.initialize()
+            self.version = self.owner.activate_reader(self, force=True)
             self.last_error = None
         except Exception as exc:
             self.last_read_status = "ERROR"
@@ -500,8 +500,7 @@ class OpenAmsMfrc522:
     def _sample(self, eventtime, debounce_removal):
         self.last_read_time = eventtime
         try:
-            if self.version is None:
-                self.version = self.reader.initialize()
+            self.version = self.owner.activate_reader(self)
             uid, data, tag_data = self._read_card()
             changed = (uid != self.uid or data != self.block_data
                        or tag_data != self.tag_data)
@@ -590,6 +589,7 @@ class OpenAmsMfrc522Pair:
             config.get("key", "FFFFFFFFFFFF"))
         self.key_b = config.getboolean("key_b", False)
         self.tag_processor = None
+        self.active_reader = None
 
         spi = bus.MCU_SPI_from_config(
             config, mode=0, pin_option="cs_pin", default_speed=750000)
@@ -609,18 +609,41 @@ class OpenAmsMfrc522Pair:
             self.printer.add_object("oamsm_rfid_registry", registry)
         registry.add_driver(self, config)
 
+    def _hold_both_readers_in_reset(self):
+        self.shared_bus.set_reset(0, False)
+        self.shared_bus.set_reset(1, False)
+        self.active_reader = None
+
+    def activate_reader(self, reader, force=False):
+        """Release one reader from reset while keeping its peer disabled."""
+        reader_index = reader.rfid_card
+        if (not force and self.active_reader == reader_index
+                and reader.version is not None):
+            return reader.version
+
+        # NPD is active low. Reset both first so the reader being deselected
+        # cannot drive shared MISO while its peer starts up.
+        self._hold_both_readers_in_reset()
+        self.reactor.pause(
+            self.reactor.monotonic() + self.RESET_LOW_TIME)
+        self.shared_bus.set_reset(reader_index, True)
+        self.reactor.pause(
+            self.reactor.monotonic() + self.RESET_SETTLE_TIME)
+
+        # A reset discards the MFRC522 register configuration, so each switch
+        # must run the normal host-side initialization before card access.
+        reader.version = None
+        self.active_reader = reader_index
+        reader.version = reader.reader.initialize()
+        return reader.version
+
     def _initialize(self, eventtime):
         self.tag_processor = self.printer.lookup_object(
             "bambu_lab_tag_processor", None)
         try:
-            self.shared_bus.set_reset(0, False)
-            self.shared_bus.set_reset(1, False)
+            self._hold_both_readers_in_reset()
             self.reactor.pause(
                 self.reactor.monotonic() + self.RESET_LOW_TIME)
-            self.shared_bus.set_reset(0, True)
-            self.shared_bus.set_reset(1, True)
-            self.reactor.pause(
-                self.reactor.monotonic() + self.RESET_SETTLE_TIME)
         except Exception as exc:
             logging.exception("OpenAMS RFID hard reset failed")
             for reader in self.readers:
