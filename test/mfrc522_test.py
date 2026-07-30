@@ -86,13 +86,10 @@ def test_ready_serializes_shared_bus_initialization():
     poll_b = lambda eventtime: eventtime
 
     def fake_reader(name, poll):
-        chip = types.SimpleNamespace(
-            antenna_off=lambda: operations.append((name, "off")),
-            antenna_on=lambda: operations.append((name, "on")))
         return types.SimpleNamespace(
             _initialize=lambda eventtime: operations.append(
                 (name, "initialize", eventtime)),
-            reader=chip, version=0xA1, _poll=poll, poll_interval=0.5)
+            _poll=poll, poll_interval=0.5)
 
     reader_a = fake_reader("a", poll_a)
     reader_b = fake_reader("b", poll_b)
@@ -107,10 +104,70 @@ def test_ready_serializes_shared_bus_initialization():
 
     callbacks[0](10.0)
     assert operations == [
-        ("a", "initialize", 10.0), ("a", "off"),
-        ("b", "initialize", 10.0), ("b", "off"),
-        ("a", "on"), ("b", "on")]
+        ("a", "initialize", 10.0),
+        ("b", "initialize", 10.0)]
     assert timers == [(poll_a, 20.5), (poll_b, 20.5)]
+
+
+def test_shared_bus_switch_holds_inactive_reader_in_reset():
+    operations = []
+    pauses = []
+    reset_states = {"a": False, "b": False}
+    reactor = types.SimpleNamespace(
+        monotonic=lambda: 10.0,
+        pause=lambda deadline: pauses.append(deadline))
+
+    def fake_reader(name):
+        obj = types.SimpleNamespace(
+            oams_index=1, version=None, reset_pin=object())
+
+        def set_reset(enabled):
+            reset_states[name] = bool(enabled)
+            operations.append((name, "reset", bool(enabled)))
+            assert sum(reset_states.values()) <= 1
+
+        def initialize():
+            operations.append((name, "initialize"))
+            assert reset_states[name]
+            assert sum(reset_states.values()) == 1
+            return 0xA1 if name == "a" else 0xEE
+
+        obj._set_reset = set_reset
+        obj.reader = types.SimpleNamespace(initialize=initialize)
+        return obj
+
+    reader_a = fake_reader("a")
+    reader_b = fake_reader("b")
+    registry = mfrc522.OpenAmsRfidRegistry.__new__(
+        mfrc522.OpenAmsRfidRegistry)
+    registry.reactor = reactor
+    registry.readers = {(1, 0): reader_a, (1, 1): reader_b}
+    registry.active_readers = {}
+
+    assert registry.activate_reader(reader_a) == 0xA1
+    first_activation = list(operations)
+    assert first_activation == [
+        ("a", "reset", False), ("b", "reset", False),
+        ("a", "reset", True), ("a", "initialize")]
+    assert pauses == [10.010, 10.002, 10.005]
+
+    # Reusing the current reader must not reset it between register accesses.
+    assert registry.activate_reader(reader_a) == 0xA1
+    assert operations == first_activation
+
+    assert registry.activate_reader(reader_b) == 0xEE
+    assert operations[-4:] == [
+        ("a", "reset", False), ("b", "reset", False),
+        ("b", "reset", True), ("b", "initialize")]
+    assert reset_states == {"a": False, "b": True}
+
+    # Switching back must hard-reset and reinitialize A because NPD erased its
+    # register configuration while B owned the bus.
+    assert registry.activate_reader(reader_a) == 0xA1
+    assert operations[-4:] == [
+        ("a", "reset", False), ("b", "reset", False),
+        ("a", "reset", True), ("a", "initialize")]
+    assert reset_states == {"a": True, "b": False}
 
 
 def test_soft_reset_timeout_reports_command_register():
@@ -141,7 +198,7 @@ def test_fm17580_production_versions_are_accepted():
 def test_hardware_reset_precedes_soft_reset():
     pin_values = []
     pauses = []
-    times = iter((1.0, 1.010))
+    times = iter((1.0, 1.0, 1.010, 1.010))
     mcu = types.SimpleNamespace(estimated_print_time=lambda when: when + 100.0)
     reset_pin = types.SimpleNamespace(
         get_mcu=lambda: mcu,
@@ -210,6 +267,7 @@ if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
     test_ready_serializes_shared_bus_initialization()
+    test_shared_bus_switch_holds_inactive_reader_in_reset()
     test_soft_reset_timeout_reports_command_register()
     test_fm17580_production_versions_are_accepted()
     test_hardware_reset_precedes_soft_reset()

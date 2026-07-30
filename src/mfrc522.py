@@ -72,6 +72,7 @@ class Mfrc522:
     VALID_VERSIONS = (0x88, 0x90, 0x91, 0x92, 0xA1, 0xB2, 0xEE)
     HARD_RESET_LOW_TIME = 0.010
     HARD_RESET_SETTLE_TIME = 0.002
+    RF_FIELD_SETTLE_TIME = 0.005
 
     def __init__(self, spi, reactor=None):
         self.spi = spi
@@ -262,6 +263,7 @@ class OpenAmsRfidRegistry:
         self.printer = printer
         self.reactor = printer.get_reactor()
         self.readers = {}
+        self.active_readers = {}
         printer.lookup_object("gcode").register_command(
             "OAMSM_RFID_READ", self.cmd_RFID_READ,
             desc="Read an OpenAMS RFID card reader")
@@ -272,7 +274,50 @@ class OpenAmsRfidRegistry:
         if key in self.readers:
             raise config.error(
                 "duplicate MFRC522 mapping for OAMS=%d RFID_CARD=%d" % key)
+        siblings = [item for item in self.readers.values()
+                    if item.oams_index == reader.oams_index]
+        if siblings and (reader.reset_pin is None
+                         or any(item.reset_pin is None for item in siblings)):
+            raise config.error(
+                "all MFRC522 readers sharing OAMS=%d require reset_pin"
+                % reader.oams_index)
         self.readers[key] = reader
+        reader.registry = self
+
+    def activate_reader(self, reader, force=False):
+        """Give one reader exclusive ownership of its shared SPI bus."""
+        oams_index = reader.oams_index
+        if (not force
+                and self.active_readers.get(oams_index) is reader
+                and reader.version is not None):
+            return reader.version
+
+        siblings = [item for item in self.readers.values()
+                    if item.oams_index == oams_index]
+        self.active_readers.pop(oams_index, None)
+
+        # FM17580 readers on OpenAMS share MISO, but an awake reader may keep
+        # driving it even while CS is high. Hold the whole pair in NPD first,
+        # then wake only the reader whose CS Klipper is about to use.
+        for item in siblings:
+            item._set_reset(False)
+        now = self.reactor.monotonic()
+        self.reactor.pause(now + Mfrc522.HARD_RESET_LOW_TIME)
+
+        reader._set_reset(True)
+        now = self.reactor.monotonic()
+        self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
+
+        try:
+            version = reader.reader.initialize()
+            now = self.reactor.monotonic()
+            self.reactor.pause(now + Mfrc522.RF_FIELD_SETTLE_TIME)
+        except Exception:
+            reader.version = None
+            raise
+        reader.version = version
+        self.active_readers[oams_index] = reader
+        return version
 
     def _handle_ready(self):
         # SPI queries wait for MCU responses, so defer them out of Klippy's
@@ -284,13 +329,6 @@ class OpenAmsRfidRegistry:
         readers = list(self.readers.values())
         for reader in readers:
             reader._initialize(eventtime)
-            if reader.version is not None:
-                # Avoid loading the shared reader supply while the next chip
-                # is reset and waits for its oscillator to become ready.
-                reader.reader.antenna_off()
-        for reader in readers:
-            if reader.version is not None:
-                reader.reader.antenna_on()
         start_time = self.reactor.monotonic()
         for reader in readers:
             self.reactor.register_timer(
@@ -325,7 +363,9 @@ class OpenAmsMfrc522:
         if reset_pin is not None:
             ppins = self.printer.lookup_object("pins")
             self.reset_pin = ppins.setup_pin("digital_out", reset_pin)
-            self.reset_pin.setup_start_value(1, 1)
+            # Keep every reader electrically quiet until the registry grants
+            # it ownership of the shared MISO line.
+            self.reset_pin.setup_start_value(0, 0)
         self.reader = Mfrc522(self.spi, self.reactor)
         self.poll_interval = config.getfloat(
             "poll_interval", 0.5, minval=0.1)
@@ -411,18 +451,32 @@ class OpenAmsMfrc522:
             logging.info("MFRC522 %s firmware RFID diagnostics unavailable: %s",
                          self.name, exc)
 
-    def _reset_and_initialize(self):
+    def _set_reset(self, enabled):
         if self.reset_pin is not None:
             mcu = self.reset_pin.get_mcu()
             now = self.reactor.monotonic()
             print_time = mcu.estimated_print_time(now)
-            self.reset_pin.set_digital(print_time, 0)
-            self.reactor.pause(now + Mfrc522.HARD_RESET_LOW_TIME)
-            now = self.reactor.monotonic()
-            print_time = mcu.estimated_print_time(now)
-            self.reset_pin.set_digital(print_time, 1)
-            self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
+            self.reset_pin.set_digital(print_time, bool(enabled))
+
+    def _reset_and_initialize(self):
+        registry = getattr(self, "registry", None)
+        if registry is not None:
+            return registry.activate_reader(self, force=True)
+        self._set_reset(False)
+        now = self.reactor.monotonic()
+        self.reactor.pause(now + Mfrc522.HARD_RESET_LOW_TIME)
+        self._set_reset(True)
+        now = self.reactor.monotonic()
+        self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
         return self.reader.initialize()
+
+    def _ensure_active(self):
+        registry = getattr(self, "registry", None)
+        if registry is None:
+            if self.version is None:
+                return self._reset_and_initialize()
+            return self.version
+        return registry.activate_reader(self)
 
     def _initialize(self, eventtime):
         self.tag_processor = self.printer.lookup_object(
@@ -458,8 +512,7 @@ class OpenAmsMfrc522:
     def _sample(self, eventtime, debounce_removal):
         self.last_read_time = eventtime
         try:
-            if self.version is None:
-                self.version = self._reset_and_initialize()
+            self.version = self._ensure_active()
             uid, data, tag_data = self._read_card()
             changed = (uid != self.uid or data != self.block_data
                        or tag_data != self.tag_data)
