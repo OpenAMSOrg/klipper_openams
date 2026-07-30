@@ -42,6 +42,7 @@ key: <32_HEX_CHARACTERS>
 oams: 1
 # Firmware directly owns PA8/PA9/PA10, CS (PB3/PB2), and NPD (PD2/PB0).
 mcu: oams_mcu1
+spi_speed: 100000
 ```
 
 `OAMSM_RFID_READ OAMS=1 RFID_CARD=0` performs an immediate read and reports the current card data plus `LAST_READ_STATUS`. `MFRC522_QUERY READER=rfid_a` remains available as a reader-name diagnostic. Optional

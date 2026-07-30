@@ -175,6 +175,7 @@ def test_one_driver_owns_and_serializes_both_readers():
     values = {
         "oams": 1,
         "mcu": "oams_mcu1",
+        "spi_speed": 100000,
     }
     config = types.SimpleNamespace(
         get_printer=lambda: printer,
@@ -187,7 +188,7 @@ def test_one_driver_owns_and_serializes_both_readers():
 
     driver = mfrc522.OpenAmsMfrc522Pair(config)
 
-    assert config_commands == ["config_oams_rfid oid=7"]
+    assert config_commands == ["config_oams_rfid oid=7 rate=100000"]
     assert [reader.rfid_card for reader in driver.readers] == [0, 1]
     assert mux_readers == ["rfid_a", "rfid_b"]
     assert all(reader.spi.shared_bus is driver.shared_bus

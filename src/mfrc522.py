@@ -263,11 +263,13 @@ class OpenAmsRfidSpiBus:
     def __init__(self, config, oams_index):
         printer = config.get_printer()
         mcu_name = config.get("mcu", "oams_mcu%d" % oams_index).strip()
+        speed = config.getint(
+            "spi_speed", 100000, minval=10000, maxval=1000000)
         self.mcu = printer.lookup_object("mcu " + mcu_name)
         self.oid = self.mcu.create_oid()
         self.command_queue = self.mcu.alloc_command_queue()
         self.mcu.add_config_cmd(
-            "config_oams_rfid oid=%d" % self.oid)
+            "config_oams_rfid oid=%d rate=%d" % (self.oid, speed))
         self.transfer_command = None
         self.reset_command = None
 
