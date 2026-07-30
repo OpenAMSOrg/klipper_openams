@@ -5,7 +5,6 @@ import types
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-sys.modules.setdefault("bus", types.SimpleNamespace())
 sys.path.insert(0, str(ROOT / "src"))
 import mfrc522
 
@@ -151,31 +150,12 @@ def test_one_driver_owns_and_serializes_both_readers():
             return transfer_query
         return reset_query
 
-    class PairSpi:
-        def __init__(self, oid, mcu, queue):
-            self.oid = oid
-            self.mcu = mcu
-            self.cmd_queue = queue
-
-        def get_oid(self):
-            return self.oid
-
-        def get_mcu(self):
-            return self.mcu
-
-        def get_command_queue(self):
-            return self.cmd_queue
-
+    config_commands = []
     common_mcu = types.SimpleNamespace(
-        lookup_query_command=lookup_query)
-    spi = PairSpi(7, common_mcu, "shared-queue")
-    spi_options = []
-    original_spi_factory = getattr(
-        mfrc522.bus, "MCU_SPI_from_config", None)
-
-    def make_spi(config, **kwargs):
-        spi_options.append(kwargs["pin_option"])
-        return spi
+        lookup_query_command=lookup_query,
+        create_oid=lambda: 7,
+        alloc_command_queue=lambda: "shared-queue",
+        add_config_cmd=lambda command: config_commands.append(command))
 
     mux_readers = []
     gcode = types.SimpleNamespace(
@@ -186,7 +166,7 @@ def test_one_driver_owns_and_serializes_both_readers():
     reactor = types.SimpleNamespace(
         monotonic=lambda: 100.0,
         pause=lambda when: pauses.append(when))
-    objects = {"gcode": gcode}
+    objects = {"gcode": gcode, "mcu oams_mcu1": common_mcu}
     printer = types.SimpleNamespace(
         get_reactor=lambda: reactor,
         lookup_object=lambda name, default=None: objects.get(name, default),
@@ -194,7 +174,7 @@ def test_one_driver_owns_and_serializes_both_readers():
         register_event_handler=lambda *args: None)
     values = {
         "oams": 1,
-        "cs_pin": "oams_mcu1:None",
+        "mcu": "oams_mcu1",
     }
     config = types.SimpleNamespace(
         get_printer=lambda: printer,
@@ -205,16 +185,9 @@ def test_one_driver_owns_and_serializes_both_readers():
         get=lambda name, default=None: values.get(name, default),
         error=lambda message: RuntimeError(message))
 
-    try:
-        mfrc522.bus.MCU_SPI_from_config = make_spi
-        driver = mfrc522.OpenAmsMfrc522Pair(config)
-    finally:
-        if original_spi_factory is None:
-            del mfrc522.bus.MCU_SPI_from_config
-        else:
-            mfrc522.bus.MCU_SPI_from_config = original_spi_factory
+    driver = mfrc522.OpenAmsMfrc522Pair(config)
 
-    assert spi_options == ["cs_pin"]
+    assert config_commands == ["config_oams_rfid oid=7"]
     assert [reader.rfid_card for reader in driver.readers] == [0, 1]
     assert mux_readers == ["rfid_a", "rfid_b"]
     assert all(reader.spi.shared_bus is driver.shared_bus

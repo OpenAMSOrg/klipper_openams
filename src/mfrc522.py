@@ -8,11 +8,6 @@ import json
 import logging
 import re
 
-try:
-    from . import bus
-except (ImportError, ValueError):
-    import bus
-
 
 _RFID_DEBUG_RESPONSE = (
     "oams_rfid_debug_response gpiob_moder=%u gpiob_levels=%u "
@@ -263,13 +258,16 @@ class Mfrc522:
 
 
 class OpenAmsRfidSpiBus:
-    """One no-CS Klipper SPI object with firmware-controlled reader selection."""
+    """Dedicated firmware GPIO transport for the fixed OpenAMS RFID bus."""
 
-    def __init__(self, spi):
-        self.spi = spi
-        self.oid = spi.get_oid()
-        self.mcu = spi.get_mcu()
-        self.command_queue = spi.get_command_queue()
+    def __init__(self, config, oams_index):
+        printer = config.get_printer()
+        mcu_name = config.get("mcu", "oams_mcu%d" % oams_index).strip()
+        self.mcu = printer.lookup_object("mcu " + mcu_name)
+        self.oid = self.mcu.create_oid()
+        self.command_queue = self.mcu.alloc_command_queue()
+        self.mcu.add_config_cmd(
+            "config_oams_rfid oid=%d" % self.oid)
         self.transfer_command = None
         self.reset_command = None
 
@@ -591,9 +589,7 @@ class OpenAmsMfrc522Pair:
         self.tag_processor = None
         self.active_reader = None
 
-        spi = bus.MCU_SPI_from_config(
-            config, mode=0, pin_option="cs_pin", default_speed=750000)
-        self.shared_bus = OpenAmsRfidSpiBus(spi)
+        self.shared_bus = OpenAmsRfidSpiBus(config, self.oams_index)
         self.readers = (
             OpenAmsMfrc522(
                 self, "rfid_a", 0,

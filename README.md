@@ -40,13 +40,8 @@ key: <32_HEX_CHARACTERS>
 
 [mfrc522 openams]
 oams: 1
-# The firmware directly multiplexes CS (PB3/PB2) and NPD (PD2/PB0).
-# Klipper configures exactly one shared SPI object without a generic CS pin.
-cs_pin: oams_mcu1:None
-spi_software_sclk_pin: oams_mcu1:PA8
-spi_software_mosi_pin: oams_mcu1:PA9
-spi_software_miso_pin: oams_mcu1:PA10
-spi_speed: 750000
+# Firmware directly owns PA8/PA9/PA10, CS (PB3/PB2), and NPD (PD2/PB0).
+mcu: oams_mcu1
 ```
 
 `OAMSM_RFID_READ OAMS=1 RFID_CARD=0` performs an immediate read and reports the current card data plus `LAST_READ_STATUS`. `MFRC522_QUERY READER=rfid_a` remains available as a reader-name diagnostic. Optional
