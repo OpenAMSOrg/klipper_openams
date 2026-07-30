@@ -250,10 +250,13 @@ class Mfrc522:
 
 class OpenAmsRfidRegistry:
     def __init__(self, printer):
+        self.printer = printer
+        self.reactor = printer.get_reactor()
         self.readers = {}
         printer.lookup_object("gcode").register_command(
             "OAMSM_RFID_READ", self.cmd_RFID_READ,
             desc="Read an OpenAMS RFID card reader")
+        printer.register_event_handler("klippy:ready", self._handle_ready)
 
     def add_reader(self, reader, config):
         key = (reader.oams_index, reader.rfid_card)
@@ -261,6 +264,21 @@ class OpenAmsRfidRegistry:
             raise config.error(
                 "duplicate MFRC522 mapping for OAMS=%d RFID_CARD=%d" % key)
         self.readers[key] = reader
+
+    def _handle_ready(self):
+        # SPI queries wait for MCU responses, so defer them out of Klippy's
+        # pause-disabled ready handler. A single callback serializes startup for
+        # every reader sharing the software-SPI pins.
+        self.reactor.register_callback(self._handle_start)
+
+    def _handle_start(self, eventtime):
+        readers = list(self.readers.values())
+        for reader in readers:
+            reader._initialize(eventtime)
+        start_time = self.reactor.monotonic()
+        for reader in readers:
+            self.reactor.register_timer(
+                reader._poll, start_time + reader.poll_interval)
 
     def cmd_RFID_READ(self, gcmd):
         oams_index = gcmd.get_int("OAMS", None, minval=0)
@@ -318,7 +336,6 @@ class OpenAmsMfrc522:
             registry = OpenAmsRfidRegistry(self.printer)
             self.printer.add_object("oamsm_rfid_registry", registry)
         registry.add_reader(self, config)
-        self.printer.register_event_handler("klippy:ready", self._handle_ready)
 
     @staticmethod
     def _parse_key(value):
@@ -326,12 +343,6 @@ class OpenAmsMfrc522:
         if len(value) != 12:
             raise Mfrc522Error("key must contain exactly six hexadecimal bytes")
         return bytes.fromhex(value)
-
-    def _handle_ready(self):
-        # Klipper dispatches ready handlers with reactor pauses disabled. SPI
-        # query commands wait for an MCU response, so defer initialization to
-        # its own reactor callback/greenlet.
-        self.reactor.register_callback(self._handle_start)
 
     def _reset_and_initialize(self):
         if self.reset_pin is not None:
@@ -346,7 +357,7 @@ class OpenAmsMfrc522:
             self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
         return self.reader.initialize()
 
-    def _handle_start(self, eventtime):
+    def _initialize(self, eventtime):
         self.tag_processor = self.printer.lookup_object(
             "bambu_lab_tag_processor", None)
         try:
@@ -357,8 +368,6 @@ class OpenAmsMfrc522:
             self.last_read_time = eventtime
             self.last_error = str(exc)
             logging.exception("MFRC522 %s initialization failed", self.name)
-        self.reactor.register_timer(
-            self._poll, eventtime + self.poll_interval)
 
     def _read_card(self):
         uid = self.reader.read_uid()

@@ -74,35 +74,34 @@ def test_oamsm_rfid_read_command():
     assert "UID=01020304" in gcmd.responses[0]
 
 
-def test_ready_defers_blocking_spi_initialization():
+def test_ready_serializes_shared_bus_initialization():
     callbacks = []
     timers = []
+    initialized = []
     reactor = types.SimpleNamespace(
         register_callback=lambda cb: callbacks.append(cb),
-        register_timer=lambda cb, when: timers.append((cb, when)))
-    initialized = []
-    reader = mfrc522.OpenAmsMfrc522.__new__(mfrc522.OpenAmsMfrc522)
-    reader.reactor = reactor
-    reader.reader = types.SimpleNamespace(
-        initialize=lambda: initialized.append(True) or 0x92)
-    reader.name = "rfid_a"
-    reader.printer = types.SimpleNamespace(
-        lookup_object=lambda name, default=None: default)
-    reader.reset_pin = None
-    reader.poll_interval = 0.5
-    reader.version = None
-    reader.last_error = None
-    reader.last_read_status = "NOT_READ"
-    reader.last_read_time = None
+        register_timer=lambda cb, when: timers.append((cb, when)),
+        monotonic=lambda: 20.0)
+    poll_a = lambda eventtime: eventtime
+    poll_b = lambda eventtime: eventtime
+    reader_a = types.SimpleNamespace(
+        _initialize=lambda eventtime: initialized.append(("a", eventtime)),
+        _poll=poll_a, poll_interval=0.5)
+    reader_b = types.SimpleNamespace(
+        _initialize=lambda eventtime: initialized.append(("b", eventtime)),
+        _poll=poll_b, poll_interval=0.5)
+    registry = mfrc522.OpenAmsRfidRegistry.__new__(
+        mfrc522.OpenAmsRfidRegistry)
+    registry.reactor = reactor
+    registry.readers = {(1, 0): reader_a, (1, 1): reader_b}
 
-    reader._handle_ready()
+    registry._handle_ready()
     assert initialized == []
     assert len(callbacks) == 1
 
     callbacks[0](10.0)
-    assert initialized == [True]
-    assert reader.version == 0x92
-    assert timers == [(reader._poll, 10.5)]
+    assert initialized == [("a", 10.0), ("b", 10.0)]
+    assert timers == [(poll_a, 20.5), (poll_b, 20.5)]
 
 
 def test_fm17580_production_versions_are_accepted():
@@ -143,7 +142,7 @@ def test_hardware_reset_precedes_soft_reset():
 if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
-    test_ready_defers_blocking_spi_initialization()
+    test_ready_serializes_shared_bus_initialization()
     test_fm17580_production_versions_are_accepted()
     test_hardware_reset_precedes_soft_reset()
     print("PASS: MFRC522/FM17580 initialization and RFID command")
