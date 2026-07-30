@@ -77,30 +77,39 @@ def test_oamsm_rfid_read_command():
 def test_ready_serializes_shared_bus_initialization():
     callbacks = []
     timers = []
-    initialized = []
+    operations = []
     reactor = types.SimpleNamespace(
         register_callback=lambda cb: callbacks.append(cb),
         register_timer=lambda cb, when: timers.append((cb, when)),
         monotonic=lambda: 20.0)
     poll_a = lambda eventtime: eventtime
     poll_b = lambda eventtime: eventtime
-    reader_a = types.SimpleNamespace(
-        _initialize=lambda eventtime: initialized.append(("a", eventtime)),
-        _poll=poll_a, poll_interval=0.5)
-    reader_b = types.SimpleNamespace(
-        _initialize=lambda eventtime: initialized.append(("b", eventtime)),
-        _poll=poll_b, poll_interval=0.5)
+
+    def fake_reader(name, poll):
+        chip = types.SimpleNamespace(
+            antenna_off=lambda: operations.append((name, "off")),
+            antenna_on=lambda: operations.append((name, "on")))
+        return types.SimpleNamespace(
+            _initialize=lambda eventtime: operations.append(
+                (name, "initialize", eventtime)),
+            reader=chip, version=0xA1, _poll=poll, poll_interval=0.5)
+
+    reader_a = fake_reader("a", poll_a)
+    reader_b = fake_reader("b", poll_b)
     registry = mfrc522.OpenAmsRfidRegistry.__new__(
         mfrc522.OpenAmsRfidRegistry)
     registry.reactor = reactor
     registry.readers = {(1, 0): reader_a, (1, 1): reader_b}
 
     registry._handle_ready()
-    assert initialized == []
+    assert operations == []
     assert len(callbacks) == 1
 
     callbacks[0](10.0)
-    assert initialized == [("a", 10.0), ("b", 10.0)]
+    assert operations == [
+        ("a", "initialize", 10.0), ("a", "off"),
+        ("b", "initialize", 10.0), ("b", "off"),
+        ("a", "on"), ("b", "on")]
     assert timers == [(poll_a, 20.5), (poll_b, 20.5)]
 
 

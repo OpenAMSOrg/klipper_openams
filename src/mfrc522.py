@@ -278,6 +278,13 @@ class OpenAmsRfidRegistry:
         readers = list(self.readers.values())
         for reader in readers:
             reader._initialize(eventtime)
+            if reader.version is not None:
+                # Avoid loading the shared reader supply while the next chip
+                # is reset and waits for its oscillator to become ready.
+                reader.reader.antenna_off()
+        for reader in readers:
+            if reader.version is not None:
+                reader.reader.antenna_on()
         start_time = self.reactor.monotonic()
         for reader in readers:
             self.reactor.register_timer(
