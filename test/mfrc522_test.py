@@ -5,6 +5,7 @@ import types
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.modules.setdefault("bus", types.SimpleNamespace())
 sys.path.insert(0, str(ROOT / "src"))
 import mfrc522
 
@@ -134,39 +135,46 @@ def test_fm17580_production_versions_are_accepted():
 
 
 def test_one_driver_owns_and_serializes_both_readers():
-    transfer_sends = []
-    reset_sends = []
+    class PairSpi:
+        def __init__(self, mcu, queue):
+            self.mcu = mcu
+            self.queue = queue
 
-    transfer_query = types.SimpleNamespace(
-        send=lambda args: transfer_sends.append(args) or {
-            "ok": 1, "response": b"\x00\x92"})
-    reset_query = types.SimpleNamespace(
-        send=lambda args: reset_sends.append(args) or {"ok": 1})
-    lookups = []
+        def get_mcu(self):
+            return self.mcu
 
-    def lookup_query(command, response, **kwargs):
-        lookups.append((command, response, kwargs))
-        if command.startswith("oams_rfid_transfer "):
-            return transfer_query
-        return reset_query
+        def get_command_queue(self):
+            return self.queue
 
-    config_commands = []
-    common_mcu = types.SimpleNamespace(
-        lookup_query_command=lookup_query,
-        create_oid=lambda: 7,
-        alloc_command_queue=lambda: "shared-queue",
-        add_config_cmd=lambda command: config_commands.append(command))
+    class ResetPin:
+        def __init__(self):
+            self.start_values = []
+
+        def setup_start_value(self, value, shutdown_value):
+            self.start_values.append((value, shutdown_value))
+
+    common_mcu = object()
+    spis = [PairSpi(common_mcu, "queue-a"),
+            PairSpi(common_mcu, "queue-b")]
+    spi_options = []
+    original_spi_factory = getattr(
+        mfrc522.bus, "MCU_SPI_from_config", None)
+
+    def make_spi(config, **kwargs):
+        spi_options.append(kwargs["pin_option"])
+        return spis[len(spi_options) - 1]
 
     mux_readers = []
     gcode = types.SimpleNamespace(
         register_command=lambda *args, **kwargs: None,
         register_mux_command=lambda command, key, value, callback, **kwargs:
             mux_readers.append(value))
-    pauses = []
-    reactor = types.SimpleNamespace(
-        monotonic=lambda: 100.0,
-        pause=lambda when: pauses.append(when))
-    objects = {"gcode": gcode, "mcu oams_mcu1": common_mcu}
+    reactor = types.SimpleNamespace(monotonic=lambda: 100.0)
+    reset_pins = {}
+    pins = types.SimpleNamespace(
+        setup_pin=lambda pin_type, name: reset_pins.setdefault(
+            name, ResetPin()))
+    objects = {"gcode": gcode, "pins": pins}
     printer = types.SimpleNamespace(
         get_reactor=lambda: reactor,
         lookup_object=lambda name, default=None: objects.get(name, default),
@@ -174,7 +182,10 @@ def test_one_driver_owns_and_serializes_both_readers():
         register_event_handler=lambda *args: None)
     values = {
         "oams": 1,
-        "mcu": "oams_mcu1",
+        "cs_pin_a": "oams_mcu1:PB3",
+        "reset_pin_a": "oams_mcu1:PD2",
+        "cs_pin_b": "oams_mcu1:PB2",
+        "reset_pin_b": "oams_mcu1:PB0",
         "spi_speed": 100000,
     }
     config = types.SimpleNamespace(
@@ -186,59 +197,48 @@ def test_one_driver_owns_and_serializes_both_readers():
         get=lambda name, default=None: values.get(name, default),
         error=lambda message: RuntimeError(message))
 
-    driver = mfrc522.OpenAmsMfrc522Pair(config)
+    try:
+        mfrc522.bus.MCU_SPI_from_config = make_spi
+        driver = mfrc522.OpenAmsMfrc522Pair(config)
+    finally:
+        if original_spi_factory is None:
+            del mfrc522.bus.MCU_SPI_from_config
+        else:
+            mfrc522.bus.MCU_SPI_from_config = original_spi_factory
 
-    assert config_commands == ["config_oams_rfid oid=7 rate=100000"]
+    assert spi_options == ["cs_pin_a", "cs_pin_b"]
     assert [reader.rfid_card for reader in driver.readers] == [0, 1]
     assert mux_readers == ["rfid_a", "rfid_b"]
-    assert all(reader.spi.shared_bus is driver.shared_bus
-               for reader in driver.readers)
+    assert [reader.spi for reader in driver.readers] == spis
+    assert reset_pins["oams_mcu1:PD2"].start_values == [(1, 1)]
+    assert reset_pins["oams_mcu1:PB0"].start_values == [(1, 1)]
     registry = objects["oamsm_rfid_registry"]
     assert registry.drivers == {1: driver}
     assert sorted(registry.readers) == [(1, 0), (1, 1)]
 
-    params = driver.readers[0].spi.spi_transfer([0xEE, 0x00])
-    driver.readers[1].spi.spi_send([0x28, 0x03])
-    assert params["response"] == b"\x00\x92"
-    assert transfer_sends == [
-        [7, 0, [0xEE, 0x00]],
-        [7, 1, [0x28, 0x03]],
-    ]
-    assert len(lookups) == 2
-    assert all(item[2] == {"oid": 7, "cq": "shared-queue"}
-               for item in lookups)
-
-    initialize_operations = []
+    field_operations = []
     for reader in driver.readers:
         card = reader.rfid_card
         reader.reader.initialize = lambda card=card: (
-            initialize_operations.append(card) or (0x91 + card))
+            field_operations.append(("init", card)) or (0x91 + card))
+        reader.reader.antenna_on = lambda card=card: (
+            field_operations.append(("on", card)))
+        reader.reader.antenna_off = lambda card=card: (
+            field_operations.append(("off", card)))
     driver._initialize(9.0)
-    assert reset_sends == [
-        [7, 0, False], [7, 1, False],
-        [7, 0, False], [7, 1, False], [7, 0, True],
-        [7, 0, False], [7, 1, False], [7, 1, True],
-    ]
-    assert pauses == [100.010, 100.010, 100.002, 100.010, 100.002]
-    assert initialize_operations == [0, 1]
+    assert field_operations == [("init", 0), ("off", 0), ("init", 1)]
     assert driver.active_reader == 1
     assert [reader.version for reader in driver.readers] == [0x91, 0x92]
 
-    # Switching back disables both readers, then releases and initializes A.
-    reset_sends[:] = []
-    pauses[:] = []
-    initialize_operations[:] = []
+    # Switching readers disables the old RF field before enabling the new one.
+    field_operations[:] = []
     assert driver.activate_reader(driver.readers[0]) == 0x91
-    assert reset_sends == [
-        [7, 0, False], [7, 1, False], [7, 0, True]]
-    assert pauses == [100.010, 100.002]
-    assert initialize_operations == [0]
+    assert field_operations == [("off", 1), ("on", 0)]
     assert driver.active_reader == 0
 
-    # Reusing the already-active reader must not reset or initialize it again.
+    # Reusing the active reader does not touch CS, reset, or its RF field.
     assert driver.activate_reader(driver.readers[0]) == 0x91
-    assert len(reset_sends) == 3
-    assert initialize_operations == [0]
+    assert field_operations == [("off", 1), ("on", 0)]
 
     operations = []
     for reader in driver.readers:
@@ -256,31 +256,32 @@ def test_firmware_debug_decodes_shared_bus_state():
     d_moder = 1 << 4
     d_levels = (0x0004 << 16) | 0x0004
 
-    def spi_config(oid):
-        return oid | (0xFF << 8) | (1 << 16) | (64 << 21)
+    def spi_config(oid, encoded_cs):
+        return (oid | (encoded_cs << 8) | (1 << 16) | (1 << 17)
+                | (480 << 21))
 
-    def spi_last(tx, rx, reader):
+    def spi_last(tx, rx, bus_index):
         return (tx | (0xFF << 8) | (rx << 16) | (1 << 25)
-                | (1 << 26) | (reader << 31))
+                | (1 << 26) | (bus_index << 31))
 
     params = {
         "gpiob_moder": b_moder, "gpiob_levels": b_levels,
         "gpiod_moder": d_moder, "gpiod_levels": d_levels,
-        "spi0_config": spi_config(3),
-        "spi0_last": spi_last(0x82, 0xA1, 1),
-        "spi1_config": 0,
-        "spi1_last": 0,
+        "spi0_config": spi_config(3, 0x13),
+        "spi0_last": spi_last(0xEE, 0xA1, 0),
+        "spi1_config": spi_config(5, 0x12),
+        "spi1_last": spi_last(0x82, 0xFF, 0),
     }
     report = mfrc522.OpenAmsMfrc522._format_firmware_debug(params)
     assert "PB0(mode=1 in=1 out=1)" in report
     assert "PB2(mode=1 in=1 out=1)" in report
     assert "PB3(mode=1 in=1 out=1)" in report
     assert "PD2(mode=1 in=1 out=1)" in report
-    assert "spi0(oid=3 cs=NONE configured=1 active_high=0" in report
-    assert "spi1(unused)" in report
-    assert "period_ticks=64" in report
-    assert "tx0=0x82 rx0=0xff rx_last=0xa1" in report
-    assert "selected_cs=0 idle_cs=1 other_cs_idle=1 reader=1" in report
+    assert "spi0(oid=3 cs=PB3 configured=1 active_high=0" in report
+    assert "spi1(oid=5 cs=PB2 configured=1 active_high=0" in report
+    assert "period_ticks=480" in report
+    assert "tx0=0x82 rx0=0xff rx_last=0xff" in report
+    assert "selected_cs=0 idle_cs=1 other_cs_idle=1 bus=0" in report
 
     sends = []
     command = types.SimpleNamespace(
