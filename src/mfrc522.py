@@ -1,4 +1,4 @@
-# OpenAMS MFRC522 reader over Klipper's standard MCU SPI transport.
+# OpenAMS dual MFRC522 reader over one Klipper software-SPI bus.
 # Copyright (C) 2026 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
@@ -18,6 +18,14 @@ _RFID_DEBUG_RESPONSE = (
     "oams_rfid_debug_response gpiob_moder=%u gpiob_levels=%u "
     "gpiod_moder=%u gpiod_levels=%u spi0_config=%u spi0_last=%u "
     "spi1_config=%u spi1_last=%u")
+_RFID_TRANSFER_COMMAND = (
+    "oams_rfid_transfer oid=%c reader=%c data=%*s")
+_RFID_TRANSFER_RESPONSE = (
+    "oams_rfid_transfer_response oid=%c reader=%c ok=%c response=%*s")
+_RFID_RESET_COMMAND = (
+    "oams_rfid_reset oid=%c reader=%c enabled=%c")
+_RFID_RESET_RESPONSE = (
+    "oams_rfid_reset_response oid=%c reader=%c enabled=%c ok=%c")
 
 
 class Mfrc522Error(Exception):
@@ -70,10 +78,6 @@ class Mfrc522:
     # FM17580 VersionReg is a production-version byte with no fixed reset
     # value. OpenAMS hardware has been observed with both A1 and EE.
     VALID_VERSIONS = (0x88, 0x90, 0x91, 0x92, 0xA1, 0xB2, 0xEE)
-    HARD_RESET_LOW_TIME = 0.010
-    HARD_RESET_SETTLE_TIME = 0.002
-    RF_FIELD_SETTLE_TIME = 0.005
-
     def __init__(self, spi, reactor=None):
         self.spi = spi
         self.reactor = reactor
@@ -258,81 +262,102 @@ class Mfrc522:
             self.stop_crypto()
 
 
+class OpenAmsRfidSpiBus:
+    """One no-CS Klipper SPI object with firmware-controlled reader selection."""
+
+    def __init__(self, spi):
+        self.spi = spi
+        self.oid = spi.get_oid()
+        self.mcu = spi.get_mcu()
+        self.command_queue = spi.get_command_queue()
+        self.transfer_command = None
+        self.reset_command = None
+
+    def _lookup_commands(self):
+        if self.transfer_command is not None:
+            return
+        self.transfer_command = self.mcu.lookup_query_command(
+            _RFID_TRANSFER_COMMAND, _RFID_TRANSFER_RESPONSE,
+            oid=self.oid, cq=self.command_queue)
+        self.reset_command = self.mcu.lookup_query_command(
+            _RFID_RESET_COMMAND, _RFID_RESET_RESPONSE,
+            oid=self.oid, cq=self.command_queue)
+
+    def transfer(self, reader, data):
+        self._lookup_commands()
+        params = self.transfer_command.send(
+            [self.oid, int(reader), list(data)])
+        if not params.get("ok", 0):
+            raise Mfrc522Error(
+                "firmware rejected RFID transfer for reader %d" % reader)
+        return params
+
+    def set_reset(self, reader, enabled):
+        self._lookup_commands()
+        params = self.reset_command.send(
+            [self.oid, int(reader), bool(enabled)])
+        if not params.get("ok", 0):
+            raise Mfrc522Error(
+                "firmware rejected RFID reset for reader %d" % reader)
+
+
+class OpenAmsRfidSpiEndpoint:
+    """Reader-indexed view of the one shared OpenAMS SPI transport."""
+
+    def __init__(self, shared_bus, reader):
+        self.shared_bus = shared_bus
+        self.reader = reader
+
+    def spi_transfer(self, data):
+        return self.shared_bus.transfer(self.reader, data)
+
+    def spi_send(self, data):
+        self.shared_bus.transfer(self.reader, data)
+
+    def get_mcu(self):
+        return self.shared_bus.mcu
+
+    def get_command_queue(self):
+        return self.shared_bus.command_queue
+
+
 class OpenAmsRfidRegistry:
     def __init__(self, printer):
         self.printer = printer
         self.reactor = printer.get_reactor()
         self.readers = {}
-        self.active_readers = {}
+        self.drivers = {}
         printer.lookup_object("gcode").register_command(
             "OAMSM_RFID_READ", self.cmd_RFID_READ,
             desc="Read an OpenAMS RFID card reader")
         printer.register_event_handler("klippy:ready", self._handle_ready)
 
-    def add_reader(self, reader, config):
-        key = (reader.oams_index, reader.rfid_card)
-        if key in self.readers:
+    def add_driver(self, driver, config):
+        if driver.oams_index in self.drivers:
             raise config.error(
-                "duplicate MFRC522 mapping for OAMS=%d RFID_CARD=%d" % key)
-        siblings = [item for item in self.readers.values()
-                    if item.oams_index == reader.oams_index]
-        if siblings and (reader.reset_pin is None
-                         or any(item.reset_pin is None for item in siblings)):
-            raise config.error(
-                "all MFRC522 readers sharing OAMS=%d require reset_pin"
-                % reader.oams_index)
-        self.readers[key] = reader
-        reader.registry = self
-
-    def activate_reader(self, reader, force=False):
-        """Give one reader exclusive ownership of its shared SPI bus."""
-        oams_index = reader.oams_index
-        if (not force
-                and self.active_readers.get(oams_index) is reader
-                and reader.version is not None):
-            return reader.version
-
-        siblings = [item for item in self.readers.values()
-                    if item.oams_index == oams_index]
-        self.active_readers.pop(oams_index, None)
-
-        # FM17580 readers on OpenAMS share MISO, but an awake reader may keep
-        # driving it even while CS is high. Hold the whole pair in NPD first,
-        # then wake only the reader whose CS Klipper is about to use.
-        for item in siblings:
-            item._set_reset(False)
-        now = self.reactor.monotonic()
-        self.reactor.pause(now + Mfrc522.HARD_RESET_LOW_TIME)
-
-        reader._set_reset(True)
-        now = self.reactor.monotonic()
-        self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
-
-        try:
-            version = reader.reader.initialize()
-            now = self.reactor.monotonic()
-            self.reactor.pause(now + Mfrc522.RF_FIELD_SETTLE_TIME)
-        except Exception:
-            reader.version = None
-            raise
-        reader.version = version
-        self.active_readers[oams_index] = reader
-        return version
+                "duplicate MFRC522 driver for OAMS=%d" % driver.oams_index)
+        self.drivers[driver.oams_index] = driver
+        for reader in driver.readers:
+            key = (reader.oams_index, reader.rfid_card)
+            if key in self.readers:
+                raise config.error(
+                    "duplicate MFRC522 mapping for OAMS=%d RFID_CARD=%d" % key)
+            self.readers[key] = reader
 
     def _handle_ready(self):
         # SPI queries wait for MCU responses, so defer them out of Klippy's
-        # pause-disabled ready handler. A single callback serializes startup for
-        # every reader sharing the software-SPI pins.
+        # pause-disabled ready handler. Each dual-reader driver owns one callback
+        # and one poll timer for its shared bus.
         self.reactor.register_callback(self._handle_start)
 
     def _handle_start(self, eventtime):
-        readers = list(self.readers.values())
-        for reader in readers:
-            reader._initialize(eventtime)
+        drivers = list(self.drivers.values())
+        for driver in drivers:
+            driver._initialize(eventtime)
         start_time = self.reactor.monotonic()
-        for reader in readers:
+        for driver in drivers:
             self.reactor.register_timer(
-                reader._poll, start_time + reader.poll_interval)
+                driver._poll, start_time + driver.poll_interval)
 
     def cmd_RFID_READ(self, gcmd):
         oams_index = gcmd.get_int("OAMS", None, minval=0)
@@ -350,29 +375,22 @@ class OpenAmsRfidRegistry:
 
 
 class OpenAmsMfrc522:
-    def __init__(self, config):
-        self.printer = config.get_printer()
-        self.reactor = self.printer.get_reactor()
-        self.name = config.get_name().split()[-1]
-        self.oams_index = config.getint("oams", minval=0)
-        self.rfid_card = config.getint("rfid_card", minval=0, maxval=1)
-        self.spi = bus.MCU_SPI_from_config(
-            config, mode=0, default_speed=750000)
-        self.reset_pin = None
-        reset_pin = config.get("reset_pin", None)
-        if reset_pin is not None:
-            ppins = self.printer.lookup_object("pins")
-            self.reset_pin = ppins.setup_pin("digital_out", reset_pin)
-            # Keep every reader electrically quiet until the registry grants
-            # it ownership of the shared MISO line.
-            self.reset_pin.setup_start_value(0, 0)
+    """State and MFRC522 operations for one endpoint of a dual-reader driver."""
+
+    def __init__(self, owner, name, rfid_card, spi, reset_pin):
+        self.owner = owner
+        self.printer = owner.printer
+        self.reactor = owner.reactor
+        self.name = name
+        self.oams_index = owner.oams_index
+        self.rfid_card = rfid_card
+        self.spi = spi
+        self.reset_pin = reset_pin
         self.reader = Mfrc522(self.spi, self.reactor)
-        self.poll_interval = config.getfloat(
-            "poll_interval", 0.5, minval=0.1)
-        self.read_block_number = config.getint(
-            "read_block", None, minval=0, maxval=255)
-        self.key = self._parse_key(config.get("key", "FFFFFFFFFFFF"))
-        self.key_b = config.getboolean("key_b", False)
+        self.poll_interval = owner.poll_interval
+        self.read_block_number = owner.read_block_number
+        self.key = owner.key
+        self.key_b = owner.key_b
         self.version = None
         self.uid = None
         self.block_data = None
@@ -388,11 +406,6 @@ class OpenAmsMfrc522:
         gcode.register_mux_command(
             "MFRC522_QUERY", "READER", self.name, self.cmd_QUERY,
             desc="Read an OpenAMS MFRC522 reader")
-        registry = self.printer.lookup_object("oamsm_rfid_registry", None)
-        if registry is None:
-            registry = OpenAmsRfidRegistry(self.printer)
-            self.printer.add_object("oamsm_rfid_registry", registry)
-        registry.add_reader(self, config)
 
     @staticmethod
     def _parse_key(value):
@@ -412,18 +425,21 @@ class OpenAmsMfrc522:
         def spi_state(index):
             config = params.get("spi%d_config" % index, 0)
             last = params.get("spi%d_last" % index, 0)
+            if not config:
+                return "spi%d(unused)" % index
             encoded = (config >> 8) & 0xFF
             cs = ("NONE" if encoded == 0xFF else "P%s%d" % (
                 chr(ord("A") + (encoded >> 4)), encoded & 0x0F))
             return (
                 "spi%d(oid=%d cs=%s configured=%d active_high=%d mode=%d "
-                "half_us=%d tx0=0x%02x rx0=0x%02x rx_last=0x%02x "
-                "selected_cs=%d idle_cs=%d other_cs_idle=%d count_mod32=%d)"
+                "period_ticks=%d tx0=0x%02x rx0=0x%02x rx_last=0x%02x "
+                "selected_cs=%d idle_cs=%d other_cs_idle=%d reader=%d count_mod16=%d)"
                 % (index, config & 0xFF, cs, (config >> 16) & 1,
                    (config >> 18) & 1, (config >> 19) & 3, config >> 21,
                    last & 0xFF, (last >> 8) & 0xFF, (last >> 16) & 0xFF,
                    (last >> 24) & 1, (last >> 25) & 1,
-                   (last >> 26) & 1, (last >> 27) & 0x1F))
+                   (last >> 26) & 1, (last >> 31) & 1,
+                   (last >> 27) & 0x0F))
 
         b_moder = params.get("gpiob_moder", 0)
         b_levels = params.get("gpiob_levels", 0)
@@ -451,38 +467,10 @@ class OpenAmsMfrc522:
             logging.info("MFRC522 %s firmware RFID diagnostics unavailable: %s",
                          self.name, exc)
 
-    def _set_reset(self, enabled):
-        if self.reset_pin is not None:
-            mcu = self.reset_pin.get_mcu()
-            now = self.reactor.monotonic()
-            print_time = mcu.estimated_print_time(now)
-            self.reset_pin.set_digital(print_time, bool(enabled))
-
-    def _reset_and_initialize(self):
-        registry = getattr(self, "registry", None)
-        if registry is not None:
-            return registry.activate_reader(self, force=True)
-        self._set_reset(False)
-        now = self.reactor.monotonic()
-        self.reactor.pause(now + Mfrc522.HARD_RESET_LOW_TIME)
-        self._set_reset(True)
-        now = self.reactor.monotonic()
-        self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
-        return self.reader.initialize()
-
-    def _ensure_active(self):
-        registry = getattr(self, "registry", None)
-        if registry is None:
-            if self.version is None:
-                return self._reset_and_initialize()
-            return self.version
-        return registry.activate_reader(self)
-
     def _initialize(self, eventtime):
-        self.tag_processor = self.printer.lookup_object(
-            "bambu_lab_tag_processor", None)
+        self.tag_processor = self.owner.tag_processor
         try:
-            self.version = self._reset_and_initialize()
+            self.version = self.reader.initialize()
             self.last_error = None
         except Exception as exc:
             self.last_read_status = "ERROR"
@@ -512,7 +500,8 @@ class OpenAmsMfrc522:
     def _sample(self, eventtime, debounce_removal):
         self.last_read_time = eventtime
         try:
-            self.version = self._ensure_active()
+            if self.version is None:
+                self.version = self.reader.initialize()
             uid, data, tag_data = self._read_card()
             changed = (uid != self.uid or data != self.block_data
                        or tag_data != self.tag_data)
@@ -582,5 +571,81 @@ class OpenAmsMfrc522:
         gcmd.respond_info(self.format_last_read())
 
 
+class OpenAmsMfrc522Pair:
+    """One Klipper object that owns and serializes both OpenAMS readers."""
+
+    RESET_LOW_TIME = 0.010
+    RESET_SETTLE_TIME = 0.002
+
+    def __init__(self, config):
+        self.printer = config.get_printer()
+        self.reactor = self.printer.get_reactor()
+        self.name = config.get_name().split()[-1]
+        self.oams_index = config.getint("oams", minval=0)
+        self.poll_interval = config.getfloat(
+            "poll_interval", 0.5, minval=0.1)
+        self.read_block_number = config.getint(
+            "read_block", None, minval=0, maxval=255)
+        self.key = OpenAmsMfrc522._parse_key(
+            config.get("key", "FFFFFFFFFFFF"))
+        self.key_b = config.getboolean("key_b", False)
+        self.tag_processor = None
+
+        spi = bus.MCU_SPI_from_config(
+            config, mode=0, pin_option="cs_pin", default_speed=750000)
+        self.shared_bus = OpenAmsRfidSpiBus(spi)
+        self.readers = (
+            OpenAmsMfrc522(
+                self, "rfid_a", 0,
+                OpenAmsRfidSpiEndpoint(self.shared_bus, 0), None),
+            OpenAmsMfrc522(
+                self, "rfid_b", 1,
+                OpenAmsRfidSpiEndpoint(self.shared_bus, 1), None),
+        )
+
+        registry = self.printer.lookup_object("oamsm_rfid_registry", None)
+        if registry is None:
+            registry = OpenAmsRfidRegistry(self.printer)
+            self.printer.add_object("oamsm_rfid_registry", registry)
+        registry.add_driver(self, config)
+
+    def _initialize(self, eventtime):
+        self.tag_processor = self.printer.lookup_object(
+            "bambu_lab_tag_processor", None)
+        try:
+            self.shared_bus.set_reset(0, False)
+            self.shared_bus.set_reset(1, False)
+            self.reactor.pause(
+                self.reactor.monotonic() + self.RESET_LOW_TIME)
+            self.shared_bus.set_reset(0, True)
+            self.shared_bus.set_reset(1, True)
+            self.reactor.pause(
+                self.reactor.monotonic() + self.RESET_SETTLE_TIME)
+        except Exception as exc:
+            logging.exception("OpenAMS RFID hard reset failed")
+            for reader in self.readers:
+                reader.last_read_status = "ERROR"
+                reader.last_read_time = eventtime
+                reader.last_error = str(exc)
+            return
+        for reader in self.readers:
+            reader._initialize(eventtime)
+
+    def _poll(self, eventtime):
+        for reader in self.readers:
+            reader._sample(eventtime, debounce_removal=True)
+        return eventtime + self.poll_interval
+
+    def get_status(self, eventtime):
+        return {
+            "oams": self.oams_index,
+            "readers": [reader.get_status(eventtime) for reader in self.readers],
+        }
+
+
+def load_config(config):
+    return OpenAmsMfrc522Pair(config)
+
+
 def load_config_prefix(config):
-    return OpenAmsMfrc522(config)
+    return OpenAmsMfrc522Pair(config)

@@ -1,5 +1,5 @@
 # Driver for the Texas Instruments HDC1080 temperature and humidity sensor
-# Copyright (C) 2024 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
+# Copyright (C) 2024-2026 JR Lomas (discord:knight_rad.iant) <lomas.jr@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 

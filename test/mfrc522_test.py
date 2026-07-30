@@ -74,7 +74,7 @@ def test_oamsm_rfid_read_command():
     assert "UID=01020304" in gcmd.responses[0]
 
 
-def test_ready_serializes_shared_bus_initialization():
+def test_ready_serializes_dual_reader_drivers():
     callbacks = []
     timers = []
     operations = []
@@ -85,18 +85,18 @@ def test_ready_serializes_shared_bus_initialization():
     poll_a = lambda eventtime: eventtime
     poll_b = lambda eventtime: eventtime
 
-    def fake_reader(name, poll):
+    def fake_driver(name, poll):
         return types.SimpleNamespace(
             _initialize=lambda eventtime: operations.append(
                 (name, "initialize", eventtime)),
             _poll=poll, poll_interval=0.5)
 
-    reader_a = fake_reader("a", poll_a)
-    reader_b = fake_reader("b", poll_b)
+    driver_a = fake_driver("a", poll_a)
+    driver_b = fake_driver("b", poll_b)
     registry = mfrc522.OpenAmsRfidRegistry.__new__(
         mfrc522.OpenAmsRfidRegistry)
     registry.reactor = reactor
-    registry.readers = {(1, 0): reader_a, (1, 1): reader_b}
+    registry.drivers = {1: driver_a, 2: driver_b}
 
     registry._handle_ready()
     assert operations == []
@@ -107,67 +107,6 @@ def test_ready_serializes_shared_bus_initialization():
         ("a", "initialize", 10.0),
         ("b", "initialize", 10.0)]
     assert timers == [(poll_a, 20.5), (poll_b, 20.5)]
-
-
-def test_shared_bus_switch_holds_inactive_reader_in_reset():
-    operations = []
-    pauses = []
-    reset_states = {"a": False, "b": False}
-    reactor = types.SimpleNamespace(
-        monotonic=lambda: 10.0,
-        pause=lambda deadline: pauses.append(deadline))
-
-    def fake_reader(name):
-        obj = types.SimpleNamespace(
-            oams_index=1, version=None, reset_pin=object())
-
-        def set_reset(enabled):
-            reset_states[name] = bool(enabled)
-            operations.append((name, "reset", bool(enabled)))
-            assert sum(reset_states.values()) <= 1
-
-        def initialize():
-            operations.append((name, "initialize"))
-            assert reset_states[name]
-            assert sum(reset_states.values()) == 1
-            return 0xA1 if name == "a" else 0xEE
-
-        obj._set_reset = set_reset
-        obj.reader = types.SimpleNamespace(initialize=initialize)
-        return obj
-
-    reader_a = fake_reader("a")
-    reader_b = fake_reader("b")
-    registry = mfrc522.OpenAmsRfidRegistry.__new__(
-        mfrc522.OpenAmsRfidRegistry)
-    registry.reactor = reactor
-    registry.readers = {(1, 0): reader_a, (1, 1): reader_b}
-    registry.active_readers = {}
-
-    assert registry.activate_reader(reader_a) == 0xA1
-    first_activation = list(operations)
-    assert first_activation == [
-        ("a", "reset", False), ("b", "reset", False),
-        ("a", "reset", True), ("a", "initialize")]
-    assert pauses == [10.010, 10.002, 10.005]
-
-    # Reusing the current reader must not reset it between register accesses.
-    assert registry.activate_reader(reader_a) == 0xA1
-    assert operations == first_activation
-
-    assert registry.activate_reader(reader_b) == 0xEE
-    assert operations[-4:] == [
-        ("a", "reset", False), ("b", "reset", False),
-        ("b", "reset", True), ("b", "initialize")]
-    assert reset_states == {"a": False, "b": True}
-
-    # Switching back must hard-reset and reinitialize A because NPD erased its
-    # register configuration while B owned the bus.
-    assert registry.activate_reader(reader_a) == 0xA1
-    assert operations[-4:] == [
-        ("a", "reset", False), ("b", "reset", False),
-        ("a", "reset", True), ("a", "initialize")]
-    assert reset_states == {"a": True, "b": False}
 
 
 def test_soft_reset_timeout_reports_command_register():
@@ -195,27 +134,126 @@ def test_fm17580_production_versions_are_accepted():
         assert (reader.COMMAND, reader.CMD_SOFT_RESET) in writes
 
 
-def test_hardware_reset_precedes_soft_reset():
-    pin_values = []
-    pauses = []
-    times = iter((1.0, 1.0, 1.010, 1.010))
-    mcu = types.SimpleNamespace(estimated_print_time=lambda when: when + 100.0)
-    reset_pin = types.SimpleNamespace(
-        get_mcu=lambda: mcu,
-        set_digital=lambda when, value: pin_values.append((when, value)))
-    reader = mfrc522.OpenAmsMfrc522.__new__(mfrc522.OpenAmsMfrc522)
-    reader.reset_pin = reset_pin
-    reader.reactor = types.SimpleNamespace(
-        monotonic=lambda: next(times),
-        pause=lambda deadline: pauses.append(deadline))
-    initialized = []
-    reader.reader = types.SimpleNamespace(
-        initialize=lambda: initialized.append(True) or 0xA1)
+def test_one_driver_owns_and_serializes_both_readers():
+    transfer_sends = []
+    reset_sends = []
 
-    assert reader._reset_and_initialize() == 0xA1
-    assert pin_values == [(101.0, 0), (101.01, 1)]
-    assert pauses == [1.01, 1.012]
-    assert initialized == [True]
+    transfer_query = types.SimpleNamespace(
+        send=lambda args: transfer_sends.append(args) or {
+            "ok": 1, "response": b"\x00\x92"})
+    reset_query = types.SimpleNamespace(
+        send=lambda args: reset_sends.append(args) or {"ok": 1})
+    lookups = []
+
+    def lookup_query(command, response, **kwargs):
+        lookups.append((command, response, kwargs))
+        if command.startswith("oams_rfid_transfer "):
+            return transfer_query
+        return reset_query
+
+    class PairSpi:
+        def __init__(self, oid, mcu, queue):
+            self.oid = oid
+            self.mcu = mcu
+            self.cmd_queue = queue
+
+        def get_oid(self):
+            return self.oid
+
+        def get_mcu(self):
+            return self.mcu
+
+        def get_command_queue(self):
+            return self.cmd_queue
+
+    common_mcu = types.SimpleNamespace(
+        lookup_query_command=lookup_query)
+    spi = PairSpi(7, common_mcu, "shared-queue")
+    spi_options = []
+    original_spi_factory = getattr(
+        mfrc522.bus, "MCU_SPI_from_config", None)
+
+    def make_spi(config, **kwargs):
+        spi_options.append(kwargs["pin_option"])
+        return spi
+
+    mux_readers = []
+    gcode = types.SimpleNamespace(
+        register_command=lambda *args, **kwargs: None,
+        register_mux_command=lambda command, key, value, callback, **kwargs:
+            mux_readers.append(value))
+    pauses = []
+    reactor = types.SimpleNamespace(
+        monotonic=lambda: 100.0,
+        pause=lambda when: pauses.append(when))
+    objects = {"gcode": gcode}
+    printer = types.SimpleNamespace(
+        get_reactor=lambda: reactor,
+        lookup_object=lambda name, default=None: objects.get(name, default),
+        add_object=lambda name, value: objects.__setitem__(name, value),
+        register_event_handler=lambda *args: None)
+    values = {
+        "oams": 1,
+        "cs_pin": "oams_mcu1:None",
+    }
+    config = types.SimpleNamespace(
+        get_printer=lambda: printer,
+        get_name=lambda: "mfrc522 openams",
+        getint=lambda name, default=None, **kwargs: values.get(name, default),
+        getfloat=lambda name, default=None, **kwargs: values.get(name, default),
+        getboolean=lambda name, default=None, **kwargs: values.get(name, default),
+        get=lambda name, default=None: values.get(name, default),
+        error=lambda message: RuntimeError(message))
+
+    try:
+        mfrc522.bus.MCU_SPI_from_config = make_spi
+        driver = mfrc522.OpenAmsMfrc522Pair(config)
+    finally:
+        if original_spi_factory is None:
+            del mfrc522.bus.MCU_SPI_from_config
+        else:
+            mfrc522.bus.MCU_SPI_from_config = original_spi_factory
+
+    assert spi_options == ["cs_pin"]
+    assert [reader.rfid_card for reader in driver.readers] == [0, 1]
+    assert mux_readers == ["rfid_a", "rfid_b"]
+    assert all(reader.spi.shared_bus is driver.shared_bus
+               for reader in driver.readers)
+    registry = objects["oamsm_rfid_registry"]
+    assert registry.drivers == {1: driver}
+    assert sorted(registry.readers) == [(1, 0), (1, 1)]
+
+    params = driver.readers[0].spi.spi_transfer([0xEE, 0x00])
+    driver.readers[1].spi.spi_send([0x28, 0x03])
+    assert params["response"] == b"\x00\x92"
+    assert transfer_sends == [
+        [7, 0, [0xEE, 0x00]],
+        [7, 1, [0x28, 0x03]],
+    ]
+    assert len(lookups) == 2
+    assert all(item[2] == {"oid": 7, "cq": "shared-queue"}
+               for item in lookups)
+
+    initialize_operations = []
+    for reader in driver.readers:
+        card = reader.rfid_card
+        reader._initialize = lambda eventtime, card=card: (
+            initialize_operations.append((card, eventtime)))
+    driver._initialize(9.0)
+    assert reset_sends == [
+        [7, 0, False], [7, 1, False],
+        [7, 0, True], [7, 1, True],
+    ]
+    assert pauses == [100.010, 100.002]
+    assert initialize_operations == [(0, 9.0), (1, 9.0)]
+
+    operations = []
+    for reader in driver.readers:
+        card = reader.rfid_card
+        reader._sample = lambda eventtime, debounce_removal, card=card: (
+            operations.append((card, eventtime, debounce_removal)))
+    assert driver._poll(10.0) == 10.5
+    assert operations == [(0, 10.0, True), (1, 10.0, True)]
 
 
 def test_firmware_debug_decodes_shared_bus_state():
@@ -225,29 +263,31 @@ def test_firmware_debug_decodes_shared_bus_state():
     d_moder = 1 << 4
     d_levels = (0x0004 << 16) | 0x0004
 
-    def spi_config(oid, encoded_cs):
-        return oid | (encoded_cs << 8) | (1 << 16) | (1 << 17) | (1 << 21)
+    def spi_config(oid):
+        return oid | (0xFF << 8) | (1 << 16) | (64 << 21)
 
-    def spi_last(tx, rx):
-        return tx | (0xFF << 8) | (rx << 16) | (1 << 25) | (1 << 26)
+    def spi_last(tx, rx, reader):
+        return (tx | (0xFF << 8) | (rx << 16) | (1 << 25)
+                | (1 << 26) | (reader << 31))
 
     params = {
         "gpiob_moder": b_moder, "gpiob_levels": b_levels,
         "gpiod_moder": d_moder, "gpiod_levels": d_levels,
-        "spi0_config": spi_config(3, 0x13),
-        "spi0_last": spi_last(0xEE, 0xA1),
-        "spi1_config": spi_config(5, 0x12),
-        "spi1_last": spi_last(0x82, 0xFF),
+        "spi0_config": spi_config(3),
+        "spi0_last": spi_last(0x82, 0xA1, 1),
+        "spi1_config": 0,
+        "spi1_last": 0,
     }
     report = mfrc522.OpenAmsMfrc522._format_firmware_debug(params)
     assert "PB0(mode=1 in=1 out=1)" in report
     assert "PB2(mode=1 in=1 out=1)" in report
     assert "PB3(mode=1 in=1 out=1)" in report
     assert "PD2(mode=1 in=1 out=1)" in report
-    assert "spi0(oid=3 cs=PB3 configured=1 active_high=0" in report
-    assert "spi1(oid=5 cs=PB2 configured=1 active_high=0" in report
-    assert "tx0=0x82 rx0=0xff rx_last=0xff" in report
-    assert "selected_cs=0 idle_cs=1 other_cs_idle=1" in report
+    assert "spi0(oid=3 cs=NONE configured=1 active_high=0" in report
+    assert "spi1(unused)" in report
+    assert "period_ticks=64" in report
+    assert "tx0=0x82 rx0=0xff rx_last=0xa1" in report
+    assert "selected_cs=0 idle_cs=1 other_cs_idle=1 reader=1" in report
 
     sends = []
     command = types.SimpleNamespace(
@@ -266,10 +306,9 @@ def test_firmware_debug_decodes_shared_bus_state():
 if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
-    test_ready_serializes_shared_bus_initialization()
-    test_shared_bus_switch_holds_inactive_reader_in_reset()
+    test_ready_serializes_dual_reader_drivers()
     test_soft_reset_timeout_reports_command_register()
     test_fm17580_production_versions_are_accepted()
-    test_hardware_reset_precedes_soft_reset()
+    test_one_driver_owns_and_serializes_both_readers()
     test_firmware_debug_decodes_shared_bus_state()
     print("PASS: MFRC522/FM17580 initialization and RFID command")
