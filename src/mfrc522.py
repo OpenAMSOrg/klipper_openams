@@ -101,12 +101,15 @@ class Mfrc522:
 
     def initialize(self):
         self.reg_write(self.COMMAND, self.CMD_SOFT_RESET)
+        command_value = None
         for _ in range(50):
-            if not self.reg_read(self.COMMAND) & (1 << 4):
+            command_value = self.reg_read(self.COMMAND)
+            if not command_value & (1 << 4):
                 break
             self._pause(0.001)
         else:
-            raise Mfrc522Error("soft reset timed out")
+            raise Mfrc522Error(
+                "soft reset timed out (CommandReg=0x%02x)" % command_value)
 
         # Proven FM17580/MFRC522 timer setup used by the AFC reader stack.
         self.reg_write(self.T_MODE, 0x8D)

@@ -104,6 +104,19 @@ def test_ready_serializes_shared_bus_initialization():
     assert timers == [(poll_a, 20.5), (poll_b, 20.5)]
 
 
+def test_soft_reset_timeout_reports_command_register():
+    reader = mfrc522.Mfrc522(FakeSpi())
+    reader.reg_write = lambda reg, value: None
+    reader.reg_read = lambda reg: 0x10
+
+    try:
+        reader.initialize()
+    except mfrc522.Mfrc522Error as exc:
+        assert str(exc) == "soft reset timed out (CommandReg=0x10)"
+    else:
+        raise AssertionError("soft reset timeout was not reported")
+
+
 def test_fm17580_production_versions_are_accepted():
     for production_version in (0xA1, 0xEE):
         reader = mfrc522.Mfrc522(FakeSpi())
@@ -143,6 +156,7 @@ if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
     test_ready_serializes_shared_bus_initialization()
+    test_soft_reset_timeout_reports_command_register()
     test_fm17580_production_versions_are_accepted()
     test_hardware_reset_precedes_soft_reset()
     print("PASS: MFRC522/FM17580 initialization and RFID command")
