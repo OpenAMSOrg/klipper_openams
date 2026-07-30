@@ -30,9 +30,13 @@ Firmware 2.0.25 exposes Klipper standard software-SPI commands. Both readers
 share SCK `PA8`, MOSI `PA9`, and MISO `PA10`; RFID A uses CS `PB3` and
 reset/NPD `PD2`, while RFID B uses CS `PB2` and reset/NPD `PB0`.
 
-Standalone reader sections use the `mfrc522.py` driver:
+Standalone reader sections use the `mfrc522.py` driver. Configure the Bambu
+master key locally to enable per-sector authentication and filament decoding:
 
 ```ini
+[bambu_lab_tag_processor]
+key: <32_HEX_CHARACTERS>
+
 [mfrc522 rfid_a]
 oams: 1
 rfid_card: 0

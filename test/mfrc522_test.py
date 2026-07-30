@@ -86,6 +86,9 @@ def test_ready_defers_blocking_spi_initialization():
     reader.reader = types.SimpleNamespace(
         initialize=lambda: initialized.append(True) or 0x92)
     reader.name = "rfid_a"
+    reader.printer = types.SimpleNamespace(
+        lookup_object=lambda name, default=None: default)
+    reader.reset_pin = None
     reader.poll_interval = 0.5
     reader.version = None
     reader.last_error = None
@@ -102,8 +105,43 @@ def test_ready_defers_blocking_spi_initialization():
     assert timers == [(reader._poll, 10.5)]
 
 
+def test_fm17580_version_a1_is_accepted():
+    reader = mfrc522.Mfrc522(FakeSpi())
+    writes = []
+    reader.reg_write = lambda reg, value: writes.append((reg, value))
+    reader.reg_read = lambda reg: 0xA1 if reg == reader.VERSION else 0
+
+    assert reader.initialize() == 0xA1
+    assert (reader.COMMAND, reader.CMD_SOFT_RESET) in writes
+
+
+def test_hardware_reset_precedes_soft_reset():
+    pin_values = []
+    pauses = []
+    times = iter((1.0, 1.010))
+    mcu = types.SimpleNamespace(estimated_print_time=lambda when: when + 100.0)
+    reset_pin = types.SimpleNamespace(
+        get_mcu=lambda: mcu,
+        set_digital=lambda when, value: pin_values.append((when, value)))
+    reader = mfrc522.OpenAmsMfrc522.__new__(mfrc522.OpenAmsMfrc522)
+    reader.reset_pin = reset_pin
+    reader.reactor = types.SimpleNamespace(
+        monotonic=lambda: next(times),
+        pause=lambda deadline: pauses.append(deadline))
+    initialized = []
+    reader.reader = types.SimpleNamespace(
+        initialize=lambda: initialized.append(True) or 0xA1)
+
+    assert reader._reset_and_initialize() == 0xA1
+    assert pin_values == [(101.0, 0), (101.01, 1)]
+    assert pauses == [1.01, 1.012]
+    assert initialized == [True]
+
+
 if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
     test_ready_defers_blocking_spi_initialization()
-    print("PASS: MFRC522 SPI framing, CRC-A, and OAMSM RFID command")
+    test_fm17580_version_a1_is_accepted()
+    test_hardware_reset_precedes_soft_reset()
+    print("PASS: MFRC522/FM17580 initialization and RFID command")

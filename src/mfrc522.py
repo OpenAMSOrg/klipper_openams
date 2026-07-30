@@ -4,6 +4,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 
 
+import json
 import logging
 import re
 
@@ -60,7 +61,11 @@ class Mfrc522:
     PICC_MF_AUTH_KEY_B = 0x61
     PICC_MF_READ = 0x30
 
-    VALID_VERSIONS = (0x88, 0x90, 0x91, 0x92, 0xB2)
+    # FM17580 uses 0x37 as a production-test register; OpenAMS units
+    # consistently report 0xA1 there after a successful reset.
+    VALID_VERSIONS = (0x88, 0x90, 0x91, 0x92, 0xA1, 0xB2)
+    HARD_RESET_LOW_TIME = 0.010
+    HARD_RESET_SETTLE_TIME = 0.002
 
     def __init__(self, spi, reactor=None):
         self.spi = spi
@@ -297,6 +302,8 @@ class OpenAmsMfrc522:
         self.version = None
         self.uid = None
         self.block_data = None
+        self.tag_data = None
+        self.tag_processor = None
         self.last_error = None
         self.last_read_status = "NOT_READ"
         self.last_read_time = None
@@ -326,9 +333,24 @@ class OpenAmsMfrc522:
         # its own reactor callback/greenlet.
         self.reactor.register_callback(self._handle_start)
 
+    def _reset_and_initialize(self):
+        if self.reset_pin is not None:
+            mcu = self.reset_pin.get_mcu()
+            now = self.reactor.monotonic()
+            print_time = mcu.estimated_print_time(now)
+            self.reset_pin.set_digital(print_time, 0)
+            self.reactor.pause(now + Mfrc522.HARD_RESET_LOW_TIME)
+            now = self.reactor.monotonic()
+            print_time = mcu.estimated_print_time(now)
+            self.reset_pin.set_digital(print_time, 1)
+            self.reactor.pause(now + Mfrc522.HARD_RESET_SETTLE_TIME)
+        return self.reader.initialize()
+
     def _handle_start(self, eventtime):
+        self.tag_processor = self.printer.lookup_object(
+            "bambu_lab_tag_processor", None)
         try:
-            self.version = self.reader.initialize()
+            self.version = self._reset_and_initialize()
             self.last_error = None
         except Exception as exc:
             self.last_read_status = "ERROR"
@@ -344,23 +366,27 @@ class OpenAmsMfrc522:
         if self.read_block_number is not None:
             data = self.reader.read_block(
                 self.read_block_number, self.key, uid, self.key_b)
-        return uid, data
+        tag_data = self.tag_data if uid == self.uid else None
+        if self.tag_processor is not None and tag_data is None:
+            tag_data = self.tag_processor.read_tag(self.reader, uid)
+        return uid, data, tag_data
 
     def _remove_cached_card(self):
         if self.uid is None:
             return
         old_uid = self.uid
-        self.uid = self.block_data = None
+        self.uid = self.block_data = self.tag_data = None
         self.printer.send_event("mfrc522:removed", self, old_uid)
 
     def _sample(self, eventtime, debounce_removal):
         self.last_read_time = eventtime
         try:
             if self.version is None:
-                self.version = self.reader.initialize()
-            uid, data = self._read_card()
-            changed = uid != self.uid or data != self.block_data
-            self.uid, self.block_data = uid, data
+                self.version = self._reset_and_initialize()
+            uid, data, tag_data = self._read_card()
+            changed = (uid != self.uid or data != self.block_data
+                       or tag_data != self.tag_data)
+            self.uid, self.block_data, self.tag_data = uid, data, tag_data
             self.last_read_status = "PRESENT"
             self.last_error = None
             self.misses = 0
@@ -398,6 +424,7 @@ class OpenAmsMfrc522:
             "present": self.uid is not None,
             "uid": None if self.uid is None else self.uid.hex(),
             "block": None if self.block_data is None else self.block_data.hex(),
+            "filament": self.tag_data,
             "version": self.version,
             "last_read_status": self.last_read_status,
             "last_read_time": self.last_read_time,
@@ -411,12 +438,14 @@ class OpenAmsMfrc522:
                  else self.block_data.hex().upper())
         version = ("UNKNOWN" if self.version is None
                    else "0x%02X" % self.version)
+        filament = ("NONE" if self.tag_data is None else
+                    json.dumps(self.tag_data, sort_keys=True, separators=(",", ":")))
         error = "NONE" if self.last_error is None else self.last_error
         return (
             "OAMSM_RFID_READ OAMS=%d RFID_CARD=%d STATUS=%s "
-            "LAST_READ_STATUS=%s UID=%s BLOCK=%s VERSION=%s ERROR=%s"
+            "LAST_READ_STATUS=%s UID=%s BLOCK=%s VERSION=%s FILAMENT=%s ERROR=%s"
             % (self.oams_index, self.rfid_card, current_status,
-               self.last_read_status, uid, block, version, error))
+               self.last_read_status, uid, block, version, filament, error))
 
     def cmd_QUERY(self, gcmd):
         self.read_now()
