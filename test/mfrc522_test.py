@@ -161,6 +161,51 @@ def test_hardware_reset_precedes_soft_reset():
     assert initialized == [True]
 
 
+def test_firmware_debug_decodes_shared_bus_state():
+    # PB0 (B NPD), PB2 (B CS), and PB3 (A CS) are outputs and high.
+    b_moder = (1 << 0) | (1 << 4) | (1 << 6)
+    b_levels = (0x000D << 16) | 0x000D
+    d_moder = 1 << 4
+    d_levels = (0x0004 << 16) | 0x0004
+
+    def spi_config(oid, encoded_cs):
+        return oid | (encoded_cs << 8) | (1 << 16) | (1 << 17) | (1 << 21)
+
+    def spi_last(tx, rx):
+        return tx | (0xFF << 8) | (rx << 16) | (1 << 25) | (1 << 26)
+
+    params = {
+        "gpiob_moder": b_moder, "gpiob_levels": b_levels,
+        "gpiod_moder": d_moder, "gpiod_levels": d_levels,
+        "spi0_config": spi_config(3, 0x13),
+        "spi0_last": spi_last(0xEE, 0xA1),
+        "spi1_config": spi_config(5, 0x12),
+        "spi1_last": spi_last(0x82, 0xFF),
+    }
+    report = mfrc522.OpenAmsMfrc522._format_firmware_debug(params)
+    assert "PB0(mode=1 in=1 out=1)" in report
+    assert "PB2(mode=1 in=1 out=1)" in report
+    assert "PB3(mode=1 in=1 out=1)" in report
+    assert "PD2(mode=1 in=1 out=1)" in report
+    assert "spi0(oid=3 cs=PB3 configured=1 active_high=0" in report
+    assert "spi1(oid=5 cs=PB2 configured=1 active_high=0" in report
+    assert "tx0=0x82 rx0=0xff rx_last=0xff" in report
+    assert "selected_cs=0 idle_cs=1 other_cs_idle=1" in report
+
+    sends = []
+    command = types.SimpleNamespace(
+        send=lambda args: sends.append(args) or params)
+    mcu = types.SimpleNamespace(lookup_query_command=lambda *args, **kwargs: command)
+    obj = mfrc522.OpenAmsMfrc522.__new__(mfrc522.OpenAmsMfrc522)
+    obj.name = "rfid_b"
+    obj._firmware_debug_reported = False
+    obj.spi = types.SimpleNamespace(
+        get_mcu=lambda: mcu, get_command_queue=lambda: "rfid_queue")
+    obj._log_firmware_debug()
+    obj._log_firmware_debug()
+    assert sends == [[]]
+
+
 if __name__ == "__main__":
     test_register_framing_and_crc()
     test_oamsm_rfid_read_command()
@@ -168,4 +213,5 @@ if __name__ == "__main__":
     test_soft_reset_timeout_reports_command_register()
     test_fm17580_production_versions_are_accepted()
     test_hardware_reset_precedes_soft_reset()
+    test_firmware_debug_decodes_shared_bus_state()
     print("PASS: MFRC522/FM17580 initialization and RFID command")

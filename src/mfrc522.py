@@ -14,6 +14,12 @@ except (ImportError, ValueError):
     import bus
 
 
+_RFID_DEBUG_RESPONSE = (
+    "oams_rfid_debug_response gpiob_moder=%u gpiob_levels=%u "
+    "gpiod_moder=%u gpiod_levels=%u spi0_config=%u spi0_last=%u "
+    "spi1_config=%u spi1_last=%u")
+
+
 class Mfrc522Error(Exception):
     pass
 
@@ -336,6 +342,7 @@ class OpenAmsMfrc522:
         self.last_read_status = "NOT_READ"
         self.last_read_time = None
         self.misses = 0
+        self._firmware_debug_reported = False
 
         gcode = self.printer.lookup_object("gcode")
         gcode.register_mux_command(
@@ -353,6 +360,56 @@ class OpenAmsMfrc522:
         if len(value) != 12:
             raise Mfrc522Error("key must contain exactly six hexadecimal bytes")
         return bytes.fromhex(value)
+
+    @staticmethod
+    def _format_firmware_debug(params):
+        def pin_state(port, pin, moder, levels):
+            mode = (moder >> (pin * 2)) & 3
+            idr = (levels >> pin) & 1
+            odr = (levels >> (16 + pin)) & 1
+            return "%s%d(mode=%d in=%d out=%d)" % (port, pin, mode, idr, odr)
+
+        def spi_state(index):
+            config = params.get("spi%d_config" % index, 0)
+            last = params.get("spi%d_last" % index, 0)
+            encoded = (config >> 8) & 0xFF
+            cs = ("NONE" if encoded == 0xFF else "P%s%d" % (
+                chr(ord("A") + (encoded >> 4)), encoded & 0x0F))
+            return (
+                "spi%d(oid=%d cs=%s configured=%d active_high=%d mode=%d "
+                "half_us=%d tx0=0x%02x rx0=0x%02x rx_last=0x%02x "
+                "selected_cs=%d idle_cs=%d other_cs_idle=%d count_mod32=%d)"
+                % (index, config & 0xFF, cs, (config >> 16) & 1,
+                   (config >> 18) & 1, (config >> 19) & 3, config >> 21,
+                   last & 0xFF, (last >> 8) & 0xFF, (last >> 16) & 0xFF,
+                   (last >> 24) & 1, (last >> 25) & 1,
+                   (last >> 26) & 1, (last >> 27) & 0x1F))
+
+        b_moder = params.get("gpiob_moder", 0)
+        b_levels = params.get("gpiob_levels", 0)
+        d_moder = params.get("gpiod_moder", 0)
+        d_levels = params.get("gpiod_levels", 0)
+        return " ".join((
+            pin_state("PB", 0, b_moder, b_levels),
+            pin_state("PB", 2, b_moder, b_levels),
+            pin_state("PB", 3, b_moder, b_levels),
+            pin_state("PD", 2, d_moder, d_levels),
+            spi_state(0), spi_state(1)))
+
+    def _log_firmware_debug(self):
+        if self._firmware_debug_reported:
+            return
+        self._firmware_debug_reported = True
+        try:
+            command = self.spi.get_mcu().lookup_query_command(
+                "oams_rfid_debug", _RFID_DEBUG_RESPONSE,
+                cq=self.spi.get_command_queue())
+            params = command.send([])
+            logging.error("MFRC522 %s firmware RFID debug: %s",
+                          self.name, self._format_firmware_debug(params))
+        except Exception as exc:
+            logging.info("MFRC522 %s firmware RFID diagnostics unavailable: %s",
+                         self.name, exc)
 
     def _reset_and_initialize(self):
         if self.reset_pin is not None:
@@ -378,6 +435,7 @@ class OpenAmsMfrc522:
             self.last_read_time = eventtime
             self.last_error = str(exc)
             logging.exception("MFRC522 %s initialization failed", self.name)
+            self._log_firmware_debug()
 
     def _read_card(self):
         uid = self.reader.read_uid()
