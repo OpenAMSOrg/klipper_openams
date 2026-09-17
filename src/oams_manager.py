@@ -11,6 +11,7 @@ from functools import partial
 from collections import deque
 
 from .oams import OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL
+from . import openams_api
 
 PAUSE_DISTANCE = 60
 ENCODER_SAMPLES = 2
@@ -81,10 +82,89 @@ class OAMSManager:
                 "bays": len(group.bays),
                 "spools": ["oams" + str(oam.oams_idx) + "-" + str(bay_index) for (oam, bay_index) in group.bays]
             }
+        # Preserve the original webhook fields while publishing the same
+        # versioned contract Moonraker exposes through oams_manager.get_status.
+        status["api"] = self._build_api_status()
         request.send({"status" : {"openams": status}})
 
     def get_status(self, eventtime):
-        return {"current_group": self.current_group}
+        status = self._build_api_status()
+        # Kept at the top level for existing macros and clients.
+        status["current_group"] = self.current_group
+        return status
+
+    @staticmethod
+    def _unit_sort_key(oam):
+        return (int(oam.oams_idx), str(oam.name))
+
+    def _ordered_units(self):
+        return sorted(self.oams.values(), key=self._unit_sort_key)
+
+    def _slot_entries(self):
+        """Return [(global slot, unit, bay)] in stable physical order."""
+        entries = []
+        slot_id = 0
+        for oam in self._ordered_units():
+            bay_count = min(len(oam.f1s_hes_value), len(oam.hub_hes_value))
+            for bay in range(bay_count):
+                entries.append((slot_id, oam, bay))
+                slot_id += 1
+        return entries
+
+    def _slot_id_for(self, target_oam, target_bay):
+        for slot_id, oam, bay in self._slot_entries():
+            if oam is target_oam and bay == target_bay:
+                return slot_id
+        return None
+
+    def _build_api_status(self):
+        entries = self._slot_entries()
+        slot_ids = {(id(oam), bay): slot_id for slot_id, oam, bay in entries}
+
+        units = []
+        for oam in self._ordered_units():
+            slots = []
+            for slot_id, entry_oam, bay in entries:
+                if entry_oam is not oam:
+                    continue
+                slots.append(openams_api.make_slot(
+                    slot_id,
+                    bay,
+                    oam.is_bay_ready(bay),
+                    oam.is_bay_loaded(bay),
+                ))
+            units.append(openams_api.make_unit(
+                oam.oams_idx,
+                str(oam.name).split()[-1],
+                "oams",
+                "fps",
+                self.ready,
+                slots,
+            ))
+
+        groups = []
+        for group_name in sorted(self.filament_groups):
+            group = self.filament_groups[group_name]
+            group_slots = []
+            for oam, bay in group.bays:
+                slot_id = slot_ids.get((id(oam), bay))
+                if slot_id is not None:
+                    group_slots.append(slot_id)
+            groups.append(openams_api.make_group(group_name, "fps", group_slots))
+
+        current_slot = None
+        if self.current_spool is not None:
+            current_slot = self._slot_id_for(*self.current_spool)
+        state = (self.current_state.name or "UNLOADED").lower()
+        lane = openams_api.make_lane(
+            "fps",
+            state,
+            current_group=self.current_group,
+            current_slot=current_slot,
+            following=self.current_state.following,
+            direction=self.current_state.direction,
+        )
+        return openams_api.build_status(self.ready, [lane], units, groups)
     
     def determine_state(self):
         self.current_group, current_oam, current_spool_idx = self.determine_current_loaded_group()
@@ -340,8 +420,7 @@ class OAMSManager:
                     self.current_spool = None
                     return
                 else:
-                    gcmd.respond_info(message)
-                    return
+                    raise gcmd.error(message)
         gcmd.respond_info("No spool is loaded in any of the OAMS")
         self.current_group = None
         return
@@ -353,9 +432,23 @@ class OAMSManager:
             return
         group_name = gcmd.get('GROUP')
         if group_name not in self.filament_groups:
-            gcmd.respond_info(f"Group {group_name} does not exist")
-            return
-        for (oam, bay_index) in self.filament_groups[group_name].bays:
+            raise gcmd.error(f"Group {group_name} does not exist")
+        requested_slot = gcmd.get_int('SLOT', None)
+        candidates = list(self.filament_groups[group_name].bays)
+        if requested_slot is not None:
+            selected = [
+                (oam, bay)
+                for slot_id, oam, bay in self._slot_entries()
+                if slot_id == requested_slot
+            ]
+            if not selected:
+                raise gcmd.error(f"OpenAMS slot {requested_slot} does not exist")
+            if selected[0] not in candidates:
+                raise gcmd.error(
+                    f"OpenAMS slot {requested_slot} is not assigned to group {group_name}"
+                )
+            candidates = selected
+        for (oam, bay_index) in candidates:
             if oam.is_bay_ready(bay_index):
                 self.current_state.name = "LOADING"
                 self.current_state.encoder = oam.encoder_clicks
@@ -398,10 +491,10 @@ class OAMSManager:
                     self.current_state.current_spool = None
                     self.current_group = None
                     self.current_spool = None
-                    gcmd.respond_info(message)
-                    return
-        gcmd.respond_info(f"No spool available for group {group_name}")
-        return
+                    raise gcmd.error(message)
+        if requested_slot is not None:
+            raise gcmd.error(f"OpenAMS slot {requested_slot} is not ready")
+        raise gcmd.error(f"No spool available for group {group_name}")
         
     def _pause_printer_message(self, message):
         logging.info(f"OAMS: {message}")

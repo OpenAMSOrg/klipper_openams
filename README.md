@@ -1,6 +1,9 @@
 # OpenAMS for Klipper  
 OpenAMS Klipper Plugin
 
+Native UI integrations can use the versioned, AFC-independent
+[OpenAMS UI API](docs/UI_API.md) exposed by `oams_manager`.
+
 ## Installation  
 
 ### Automatic Installation  
