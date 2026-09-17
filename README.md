@@ -3,6 +3,12 @@ OpenAMS Klipper Plugin
 
 Native UI integrations can use the versioned, AFC-independent
 [OpenAMS UI API](docs/UI_API.md) exposed by `oams_manager`.
+This adds the Klipper-side contract for **HelixScreen** touchscreen support
+([HelixScreen draft PR #1691](https://github.com/prestonbrown/helixscreen/pull/1691)).
+Existing installations retain their configuration, macros, firmware protocol,
+and legacy command behavior. See [upgrading and enabling the UI](docs/UI_API.md#upgrading-existing-installations)
+before enabling the new touchscreen commands. HelixScreen and KlipperScreen are
+separate projects; this change integrates with HelixScreen.
 
 ## Installation  
 

@@ -11,7 +11,6 @@ from functools import partial
 from collections import deque
 
 from .oams import OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL
-from . import openams_api
 
 PAUSE_DISTANCE = 60
 ENCODER_SAMPLES = 2
@@ -118,6 +117,9 @@ class OAMSManager:
         return None
 
     def _build_api_status(self):
+        # Keep the wire-format builder in this already-installed module.
+        # Existing installations symlink individual extras; a git update does
+        # not install links for newly added Python modules.
         entries = self._slot_entries()
         slot_ids = {(id(oam), bay): slot_id for slot_id, oam, bay in entries}
 
@@ -127,20 +129,17 @@ class OAMSManager:
             for slot_id, entry_oam, bay in entries:
                 if entry_oam is not oam:
                     continue
-                slots.append(openams_api.make_slot(
-                    slot_id,
-                    bay,
-                    oam.is_bay_ready(bay),
-                    oam.is_bay_loaded(bay),
-                ))
-            units.append(openams_api.make_unit(
-                oam.oams_idx,
-                str(oam.name).split()[-1],
-                "oams",
-                "fps",
-                self.ready,
-                slots,
-            ))
+                slots.append({
+                    "id": slot_id, "bay": bay,
+                    "ready": bool(oam.is_bay_ready(bay)),
+                    "loaded": bool(oam.is_bay_loaded(bay)),
+                })
+            units.append({
+                "id": str(oam.oams_idx),
+                "name": str(oam.name).split()[-1],
+                "kind": "oams", "topology": "hub", "lane": "fps",
+                "connected": self.ready, "slots": slots,
+            })
 
         groups = []
         for group_name in sorted(self.filament_groups):
@@ -150,21 +149,33 @@ class OAMSManager:
                 slot_id = slot_ids.get((id(oam), bay))
                 if slot_id is not None:
                     group_slots.append(slot_id)
-            groups.append(openams_api.make_group(group_name, "fps", group_slots))
+            groups.append({"name": group_name, "lane": "fps",
+                           "slots": group_slots})
 
         current_slot = None
         if self.current_spool is not None:
             current_slot = self._slot_id_for(*self.current_spool)
         state = (self.current_state.name or "UNLOADED").lower()
-        lane = openams_api.make_lane(
-            "fps",
-            state,
-            current_group=self.current_group,
-            current_slot=current_slot,
-            following=self.current_state.following,
-            direction=self.current_state.direction,
-        )
-        return openams_api.build_status(self.ready, [lane], units, groups)
+        lane = {
+            "id": "fps", "state": state,
+            "current_group": self.current_group, "current_slot": current_slot,
+            "following": bool(self.current_state.following),
+            "direction": int(self.current_state.direction), "message": None,
+        }
+        # Do not advertise new macros until the user has installed them.
+        # Querying gcode status is cached and does not communicate with an MCU.
+        available = self.printer.lookup_object("gcode").get_status(
+            self.reactor.monotonic())["commands"]
+        commands = {key: command for key, command in (
+            ("load", "OPENAMS_LOAD"), ("unload", "OPENAMS_UNLOAD"),
+            ("cancel", "OAMSM_LOAD_FILAMENT_CANCEL"),
+            ("reset", "OAMSM_CLEAR_ERRORS"),
+        ) if command in available}
+        return {
+            "api_version": 1, "schema": "openams.manager",
+            "ready": self.ready, "commands": commands,
+            "lanes": [lane], "units": units, "groups": groups,
+        }
     
     def determine_state(self):
         self.current_group, current_oam, current_spool_idx = self.determine_current_loaded_group()
@@ -337,6 +348,11 @@ class OAMSManager:
             desc=self.cmd_LOAD_FILAMENT_CANCEL_help,
         )
 
+        gcode.register_command(
+            "OAMSM_VALIDATE_LOAD", self.cmd_VALIDATE_LOAD,
+            desc="Validate a UI load target without moving filament",
+        )
+
     
     cmd_LOAD_FILAMENT_CANCEL_help = "Cancel the current load filament operation"
     def cmd_LOAD_FILAMENT_CANCEL(self, gcmd):
@@ -399,6 +415,7 @@ class OAMSManager:
     
     cmd_UNLOAD_FILAMENT_help = "Unload a spool from any of the OAMS if any is loaded"
     def cmd_UNLOAD_FILAMENT(self, gcmd):
+        strict = gcmd.get_int('STRICT', 0, minval=0, maxval=1)
         for _, oam in self.oams.items():
             if oam.current_spool is not None:
                 self.current_state.name = "UNLOADING"
@@ -420,34 +437,57 @@ class OAMSManager:
                     self.current_spool = None
                     return
                 else:
-                    raise gcmd.error(message)
+                    if strict:
+                        raise gcmd.error(message)
+                    gcmd.respond_info(message)
+                    return
         gcmd.respond_info("No spool is loaded in any of the OAMS")
         self.current_group = None
         return
         
+    def _validate_load_target(self, gcmd, group_name, requested_slot):
+        """Validate before the UI macro homes, cuts, or unloads anything."""
+        if not self.ready:
+            raise gcmd.error("OpenAMS is not ready")
+        if group_name not in self.filament_groups:
+            raise gcmd.error(f"Group {group_name} does not exist")
+        selected = next(((oam, bay) for slot_id, oam, bay in self._slot_entries()
+                         if slot_id == requested_slot), None)
+        if selected is None:
+            raise gcmd.error(f"OpenAMS slot {requested_slot} does not exist")
+        if selected not in self.filament_groups[group_name].bays:
+            raise gcmd.error(
+                f"OpenAMS slot {requested_slot} is not assigned to group {group_name}"
+            )
+        oam, bay = selected
+        if not oam.is_bay_ready(bay) and oam.current_spool != bay:
+            raise gcmd.error(f"OpenAMS slot {requested_slot} is not ready")
+        return selected
+
+    def cmd_VALIDATE_LOAD(self, gcmd):
+        self._validate_load_target(gcmd, gcmd.get('GROUP'),
+                                   gcmd.get_int('SLOT', minval=0))
+
     cmd_LOAD_FILAMENT_help = "Load a spool from an specific group"
     def cmd_LOAD_FILAMENT(self, gcmd):
+        requested_slot = gcmd.get_int('SLOT', None)
+        selected = None
+        if requested_slot is not None:
+            selected = self._validate_load_target(
+                gcmd, gcmd.get('GROUP'), requested_slot)
         if self.is_printer_loaded():
+            if selected is not None and (
+                    self.current_group != gcmd.get('GROUP')
+                    or self.current_spool != selected):
+                raise gcmd.error("Unload the current spool before loading another slot")
             gcmd.respond_info("Printer is already loaded with a spool")
             return
         group_name = gcmd.get('GROUP')
         if group_name not in self.filament_groups:
-            raise gcmd.error(f"Group {group_name} does not exist")
-        requested_slot = gcmd.get_int('SLOT', None)
-        candidates = list(self.filament_groups[group_name].bays)
-        if requested_slot is not None:
-            selected = [
-                (oam, bay)
-                for slot_id, oam, bay in self._slot_entries()
-                if slot_id == requested_slot
-            ]
-            if not selected:
-                raise gcmd.error(f"OpenAMS slot {requested_slot} does not exist")
-            if selected[0] not in candidates:
-                raise gcmd.error(
-                    f"OpenAMS slot {requested_slot} is not assigned to group {group_name}"
-                )
-            candidates = selected
+            gcmd.respond_info(f"Group {group_name} does not exist")
+            return
+        candidates = ([selected] if selected is not None
+                      else self.filament_groups[group_name].bays)
         for (oam, bay_index) in candidates:
             if oam.is_bay_ready(bay_index):
                 self.current_state.name = "LOADING"
@@ -491,10 +531,14 @@ class OAMSManager:
                     self.current_state.current_spool = None
                     self.current_group = None
                     self.current_spool = None
-                    raise gcmd.error(message)
+                    if requested_slot is not None:
+                        raise gcmd.error(message)
+                    gcmd.respond_info(message)
+                    return
         if requested_slot is not None:
             raise gcmd.error(f"OpenAMS slot {requested_slot} is not ready")
-        raise gcmd.error(f"No spool available for group {group_name}")
+        gcmd.respond_info(f"No spool available for group {group_name}")
+        return
         
     def _pause_printer_message(self, message):
         logging.info(f"OAMS: {message}")
