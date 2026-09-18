@@ -86,8 +86,48 @@ def test_cancel_does_not_mark_requested_spool_loaded():
     assert unit.current_spool is None
 
 
+def make_calibration_unit(code, value=0):
+    unit = oams.OAMS.__new__(oams.OAMS)
+    unit.oams_idx = 1
+    unit.action_status_code = code
+    unit.action_status_value = value
+    return unit
+
+
+def test_ptfe_calibration_no_filament_message():
+    unit = make_calibration_unit(oams.OAMS_OP_CODE_NO_SPOOL_IN_BAY)
+    message = unit._ptfe_calibration_error_message(2)
+    assert "no filament was detected in bay 2" in message
+
+
+def test_ptfe_calibration_loaded_message_recommends_unload():
+    unit = make_calibration_unit(oams.OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY)
+    message = unit._ptfe_calibration_error_message(0)
+    assert "already loaded at the hub or follower mode is active" in message
+    assert "OAMS_UNLOAD_SPOOL OAMS=1" in message
+
+
+def test_ptfe_calibration_timeout_reports_distance_and_recovery():
+    unit = make_calibration_unit(oams.OAMS_OP_CODE_TIMEOUT, 114)
+    message = unit._ptfe_calibration_error_message(0)
+    assert "timed out in firmware after 60 s" in message
+    assert "approximately 100.0 mm (114 encoder clicks)" in message
+    assert "filament position is unknown" in message
+    assert "OAMS_UNLOAD_SPOOL OAMS=1" in message
+
+
+def test_ptfe_calibration_unknown_code_is_reported():
+    unit = make_calibration_unit(99)
+    message = unit._ptfe_calibration_error_message(0)
+    assert message == "PTFE calibration failed with firmware error code 99."
+
+
 if __name__ == "__main__":
     test_success_zero_is_success()
     test_nonzero_code_is_not_success()
     test_cancel_does_not_mark_requested_spool_loaded()
+    test_ptfe_calibration_no_filament_message()
+    test_ptfe_calibration_loaded_message_recommends_unload()
+    test_ptfe_calibration_timeout_reports_distance_and_recovery()
+    test_ptfe_calibration_unknown_code_is_reported()
     print("PASS: OAMS firmware return-code handling")

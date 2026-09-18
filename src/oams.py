@@ -25,6 +25,10 @@ OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY  = 3
 OAMS_OP_CODE_NO_SPOOL_IN_BAY = 4
 OAMS_OP_CODE_ERROR_KLIPPER_CALL  = 5
 OAMS_OP_CODE_CANCEL = 6
+OAMS_OP_CODE_TIMEOUT = 7
+
+FILAMENT_PATH_LENGTH_FACTOR = 1.14
+OAMS_FIRMWARE_OPERATION_TIMEOUT_SECONDS = 60
 
 
 class OAMS:
@@ -389,6 +393,49 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
 
     cmd_OAMS_CALIBRATE_PTFE_LENGTH_help = "Calibrate the length of the PTFE tube"
 
+    def _ptfe_calibration_error_message(self, spool):
+        code = self.action_status_code
+        if code == OAMS_OP_CODE_ERROR_BUSY:
+            return "Cannot calibrate PTFE length: OAMS is busy with another operation."
+        if code == OAMS_OP_CODE_SPOOL_ALREADY_IN_BAY:
+            return (
+                "Cannot calibrate PTFE length: filament is already loaded at "
+                "the hub or follower mode is active. Run "
+                "OAMS_UNLOAD_SPOOL OAMS=%d before retrying." % self.oams_idx
+            )
+        if code == OAMS_OP_CODE_NO_SPOOL_IN_BAY:
+            return (
+                "Cannot calibrate PTFE length: no filament was detected in "
+                "bay %d. Insert filament in that bay and retry." % spool
+            )
+        if code == OAMS_OP_CODE_ERROR_KLIPPER_CALL:
+            return "PTFE calibration was stopped by Klipper."
+        if code == OAMS_OP_CODE_CANCEL:
+            return "PTFE calibration was cancelled."
+        if code == OAMS_OP_CODE_TIMEOUT:
+            clicks = self.action_status_value or 0
+            if clicks > 0:
+                distance_mm = clicks / FILAMENT_PATH_LENGTH_FACTOR
+                travel = " after feeding approximately %.1f mm (%d encoder clicks)" % (
+                    distance_mm,
+                    clicks,
+                )
+            else:
+                travel = " with no forward travel reported"
+            return (
+                "PTFE calibration timed out in firmware after %d s%s. The "
+                "filament did not reach the expected sensor state. Check the "
+                "filament path and PTFE tube, then run OAMS_UNLOAD_SPOOL "
+                "OAMS=%d before retrying because the filament position is "
+                "unknown."
+                % (
+                    OAMS_FIRMWARE_OPERATION_TIMEOUT_SECONDS,
+                    travel,
+                    self.oams_idx,
+                )
+            )
+        return "PTFE calibration failed with firmware error code %s." % code
+
     def cmd_OAMS_CALIBRATE_PTFE_LENGTH(self, gcmd):
         self.action_status = OAMS_STATUS_CALIBRATING
         spool = gcmd.get_int("SPOOL", None)
@@ -403,7 +450,7 @@ OAMS[%s]: current_spool=%s fps_value=%s f1s_hes_value_0=%d f1s_hes_value_1=%d f1
             configfile.set(self.name, "ptfe_length", "%d" % (self.action_status_value,))
             gcmd.respond_info("Done calibrating clicks, please note this value and update parameter ptfe_length in the configuration")
         else:
-            gcmd.error("Calibration of PTFE length failed")
+            raise gcmd.error(self._ptfe_calibration_error_message(spool))
 
     def start_load_spool(self, spool_idx):
         """Send load command to firmware and return immediately.

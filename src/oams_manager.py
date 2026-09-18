@@ -10,12 +10,15 @@ import time
 from functools import partial
 from collections import deque
 
-from .oams import OAMS_OP_CODE_SUCCESS, OAMS_OP_CODE_CANCEL
+from .oams import (
+    FILAMENT_PATH_LENGTH_FACTOR,
+    OAMS_OP_CODE_CANCEL,
+    OAMS_OP_CODE_SUCCESS,
+)
 
 PAUSE_DISTANCE = 60
 ENCODER_SAMPLES = 2
 MIN_ENCODER_DIFF = 1
-FILAMENT_PATH_LENGTH_FACTOR = 1.14  # Replace magic number with a named constant
 MONITOR_ENCODER_LOADING_SPEED_AFTER = 2.0 # in seconds
 MONITOR_ENCODER_UNLOADING_SPEED_AFTER = 2.0 # in seconds
 
