@@ -3,6 +3,7 @@
 set -e
 
 KLIPPER_PATH="${HOME}/klipper"
+GCO_ROUTINES_PATH="${HOME}/gco-routines"
 KLIPPER_SERVICE_NAME=klipper
 SYSTEMDDIR="/etc/systemd/system"
 MOONRAKER_CONFIG_DIR="${HOME}/printer_data/config"
@@ -13,13 +14,14 @@ if [ ! -d "${MOONRAKER_CONFIG_DIR}" ]; then
     MOONRAKER_CONFIG_DIR="${HOME}/klipper_config"
 fi
 
-usage(){ echo "Usage: $0 [-k <klipper path>] [-s <klipper service name>] [-c <configuration path>] [-u]" 1>&2; exit 1; }
+usage(){ echo "Usage: $0 [-k <klipper path>] [-s <klipper service name>] [-c <configuration path>] [-r <gco-routines checkout>] [-u]" 1>&2; exit 1; }
 # Parse command line arguments
-while getopts "k:s:c:uh" arg; do
+while getopts "k:s:c:r:uh" arg; do
     case $arg in
         k) KLIPPER_PATH=$OPTARG;;
         s) KLIPPER_SERVICE_NAME=$OPTARG;;
         c) MOONRAKER_CONFIG_DIR=$OPTARG;;
+        r) GCO_ROUTINES_PATH=$OPTARG;;
         u) UNINSTALL=1;;
         h) usage;;
     esac
@@ -29,6 +31,7 @@ done
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 SRCDIR="$SCRIPT_DIR/src"
 SCRIPTSDIR="$SCRIPT_DIR/scripts"
+source "$SCRIPT_DIR/install_helpers/gco-routines.sh"
 
 # Verify Klipper has been installed
 check_klipper()
@@ -231,21 +234,21 @@ remove_updater()
 restart_klipper()
 {
     echo -n "Restarting Klipper... "
-    sudo systemctl restart $KLIPPER_SERVICE_NAME
+    sudo systemctl restart "$KLIPPER_SERVICE_NAME"
     echo "[OK]"
 }
 
 start_klipper()
 {
     echo -n "Starting Klipper... "
-    sudo systemctl start $KLIPPER_SERVICE_NAME
+    sudo systemctl start "$KLIPPER_SERVICE_NAME" || return $?
     echo "[OK]"
 }
 
 stop_klipper()
 {
     echo -n "Stopping Klipper... "
-    sudo systemctl stop $KLIPPER_SERVICE_NAME
+    sudo systemctl stop "$KLIPPER_SERVICE_NAME"
     echo "[OK]"
 }
 
@@ -288,8 +291,25 @@ verify_ready()
 verify_ready
 check_klipper
 check_folders
-stop_klipper
+# Network/ownership checks must succeed before we interrupt the service.
 if [[ -z "${UNINSTALL:-}" ]]; then
+    prepare_gco_routines
+fi
+KLIPPER_STOPPED=0
+restore_klipper_on_exit()
+{
+    local result=$?
+    if [[ "$KLIPPER_STOPPED" == 1 ]]; then
+        echo "Installation failed; attempting to restore the Klipper service."
+        start_klipper || echo "[ERROR] Could not start Klipper; inspect its service logs." >&2
+    fi
+    return "$result"
+}
+trap restore_klipper_on_exit EXIT
+stop_klipper
+KLIPPER_STOPPED=1
+if [[ -z "${UNINSTALL:-}" ]]; then
+    install_gco_routines
     link_extension
     link_scripts
     add_updater
@@ -300,4 +320,5 @@ else
     remove_printer_includes
     remove_updater
 fi
+KLIPPER_STOPPED=0
 start_klipper

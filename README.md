@@ -26,8 +26,44 @@ cd klipper_openams
 If your directory structure differs, you can configure the installation script with additional parameters:  
 
 ```bash  
-./install-openams.sh [-k <klipper path>] [-s <klipper service name>] [-c <configuration path>]  
+./install-openams.sh [-k <klipper path>] [-s <klipper service name>] [-c <configuration path>] [-r <gco-routines checkout>]
 ```
+
+### gco-routines dependency
+
+The installer also clones [OpenAMSOrg/gco-routines](https://github.com/OpenAMSOrg/gco-routines)
+to `~/gco-routines` and installs its package as one symlink under
+`klippy/extras/gco_routines`. Use `-r` to choose a different checkout directory.
+On subsequent installer runs, a clean `main` checkout is updated by fast-forward
+only. No tracked Klipper source or firmware is patched, and no Python dependencies
+are upgraded. Network, repository ownership, and destination checks happen before
+the installer stops Klipper.
+
+**Installation does not enable concurrent execution or change existing macros.**
+The extension deliberately accepts only tested Klipper baselines and requires
+Python 3.9 or newer in Klipper's environment. Follow its README before adding
+`[gco_routines]` ahead of all macro sections. Opt individual macros in with
+`render_mode: ordered`; unspecified macros keep stock whole-template rendering.
+The sample single-FPS macros in that repository include printer-specific cutter
+geometry and must be adapted, not copied over a working printer configuration.
+
+Existing non-Git directories, modified/diverged checkouts, other branches, and
+foreign extras paths are rejected rather than overwritten. A previous manually
+copied installation therefore needs an explicit, backed-up migration. The helper
+does not change active `[gco_routines]` configurations: already-enabled printers
+keep their selected modes. Run the installer only while the printer is idle.
+
+OpenAMS `-u` leaves the independent gco-routines checkout, symlink and activation
+configuration intact, since other macros may rely on them. To remove the extra,
+first remove its activation/ordered-only configuration and then run:
+
+```bash
+python3 ~/gco-routines/tools/install_gco_routines.py --klipper ~/klipper --uninstall
+```
+
+Restart Klipper while idle after changing its configuration. Rerun the OpenAMS
+installer to update gco-routines; it is not silently added to Moonraker's update
+configuration.
 
 ## Configuration notes
 
