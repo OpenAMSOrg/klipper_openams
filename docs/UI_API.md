@@ -23,11 +23,14 @@ sections from `oams_macros.cfg` into your printer's customized macro file:
 `OPENAMS_LOAD`, `OPENAMS_UNLOAD`, `_TX`, `SAFE_UNLOAD_FILAMENT`, `CUT_FILAMENT`,
 `_LOAD_FS_IN`, `_LOAD_FS_OUT`, `_UNLOAD_FS_OUT`, and every `_OAMS_...` helper
 macro they call. Preserve your calibrated variables and printer-specific
-cutter, parking, and nozzle-cleaning changes. The updated `_TX` also stops
-untargeted toolchanges (`T0`...) on a failed load, unload or enabled sensor
-check: it pauses and raises an error instead of continuing. Restart Klipper
-after reviewing the merged macros. The installer deliberately does not replace
-an existing macro file, even when rerun.
+cutter, parking, and nozzle-cleaning changes. The updated macros also change
+untargeted toolchanges (`T0`...) and `SAFE_UNLOAD_FILAMENT`: on a failed load,
+failed unload, enabled sensor failure, or a pause arriving mid-toolchange they
+turn the follower off, pause, and raise an error, which ends an SD print. UI
+(`STRICT`) requests raise without pausing. See
+[Changes from the previous oams_macros.cfg](../README.md#changes-from-the-previous-oams_macroscfg)
+for the complete list. Restart Klipper after reviewing the merged macros. The
+installer deliberately does not replace an existing macro file, even when rerun.
 
 Until those macros are present, status remains available but `commands` omits
 the unavailable load/unload operations. Clients must disable an operation if

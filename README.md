@@ -46,6 +46,24 @@ The extension deliberately accepts only tested Klipper baselines and requires
 Python 3.9 or newer in Klipper's environment; read its README before enabling
 it. Macros that do not opt in keep stock whole-template rendering.
 
+Existing non-Git directories, modified/diverged checkouts, other branches, and
+foreign extras paths are rejected rather than overwritten. A previous manually
+copied installation therefore needs an explicit, backed-up migration. The helper
+does not change active `[gco_routines]` configurations: already-enabled printers
+keep their selected modes. Run the installer only while the printer is idle.
+
+OpenAMS `-u` leaves the independent gco-routines checkout, symlink and activation
+configuration intact, since other macros may rely on them. To remove the extra,
+first remove its activation/ordered-only configuration and then run:
+
+```bash
+python3 ~/gco-routines/tools/install_gco_routines.py --klipper ~/klipper --uninstall
+```
+
+Restart Klipper while idle after changing its configuration. Rerun the OpenAMS
+installer to update gco-routines; it is not silently added to Moonraker's update
+configuration.
+
 #### Enabling concurrent toolchanges
 
 `oams_macros.cfg` in this repository already contains the concurrent workflow.
@@ -79,23 +97,40 @@ step serially (load, inlet check, `CLEAN_NOZZLE`, reload) and never renders
 `oams_macros_ordered.cfg` only together with `[gco_routines]`. To turn the
 feature off, comment out both lines again.
 
-Existing non-Git directories, modified/diverged checkouts, other branches, and
-foreign extras paths are rejected rather than overwritten. A previous manually
-copied installation therefore needs an explicit, backed-up migration. The helper
-does not change active `[gco_routines]` configurations: already-enabled printers
-keep their selected modes. Run the installer only while the printer is idle.
+#### Changes from the previous oams_macros.cfg
 
-OpenAMS `-u` leaves the independent gco-routines checkout, symlink and activation
-configuration intact, since other macros may rely on them. To remove the extra,
-first remove its activation/ordered-only configuration and then run:
+These apply with or without gco-routines. If you keep a customized
+`oams_macros.cfg`, merge them by hand:
 
-```bash
-python3 ~/gco-routines/tools/install_gco_routines.py --klipper ~/klipper --uninstall
-```
-
-Restart Klipper while idle after changing its configuration. Rerun the OpenAMS
-installer to update gco-routines; it is not silently added to Moonraker's update
-configuration.
+- New `_OAMS_*` helper macros (`_OAMS_FINISH_UNLOAD`, `_OAMS_CONFIRM_UNLOADED`,
+  `_OAMS_CONTINUE_AFTER_UNLOAD`, `_OAMS_CONTINUE_AFTER_LOAD`,
+  `_OAMS_CONTINUE_AFTER_INLET`, `_OAMS_FINISH_TOOLCHANGE`,
+  `_OAMS_FAIL_TOOLCHANGE`, `_OAMS_ABORT`, `_OAMS_RAISE`). Stock Klipper renders
+  a whole macro before running it; each helper renders fresh, so every safety
+  decision sees the result of the step before it. `_TX` and
+  `SAFE_UNLOAD_FILAMENT` call them, so copy all of them.
+- Failure handling: on a failed load, failed unload, enabled sensor failure, or
+  a pause arriving mid-toolchange, `T0`-`T19` and `SAFE_UNLOAD_FILAMENT` turn
+  the follower off, `PAUSE`, and raise a G-code error. In an SD print the print
+  therefore ends through `on_error_gcode` instead of continuing. UI (`STRICT`)
+  requests (`OPENAMS_LOAD`, `OPENAMS_UNLOAD`) raise without `PAUSE`.
+- `CLEAN_NOZZLE` runs after the OpenAMS load and before the toolhead reload
+  (previously after the reload). There is no `G0 Z15` before it, so
+  `CLEAN_NOZZLE` must provide its own Z clearance.
+- The toolchange is wrapped in one `SAVE_GCODE_STATE` / `RESTORE_GCODE_STATE`
+  (`NAME=oams_toolchange`). On success it returns to the starting position at
+  100 mm/s and restores the positioning and extrusion modes.
+- A cold-extruder guard (`can_extrude` false or below
+  `minimum_extrude_temperature`) and, for `T0`-`T19`, an unknown filament group
+  check fail before any motion, including homing.
+- `SAFE_UNLOAD_FILAMENT` sets `M83` before the first retract and retracts at
+  `unload_speed`. `CUT_FILAMENT` issues `G90` before the cutter moves.
+- Four new variables in `[gcode_macro _oams_macro_variables]`, with these
+  defaults when absent: `unload_speed: 1000`,
+  `extrusion_unload_additional_length: 250`, `additional_unload_speed: 5000`,
+  `minimum_extrude_temperature: 0`.
+- The macros require `[pause_resume]` and read the `extruder` and `configfile`
+  status objects.
 
 ## Configuration notes
 
