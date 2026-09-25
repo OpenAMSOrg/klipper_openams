@@ -309,6 +309,8 @@ def test_current_macros_preserve_master_outcomes(setup, case):
     assert all(feeds and index > feeds[-1] for index in reloads)
     assert trace.count("CLEAN_NOZZLE") == (1 if loads else 0)
     if loads:
+        # Master's settle dwell still precedes the inlet check.
+        assert trace[feeds[-1] + 1:feeds[-1] + 3] == ["M400", "G4 P1000"]
         assert feeds[-1] < trace.index("CLEAN_NOZZLE") < reloads[0]
         assert trace[reloads[0] - 1] == "M83"
         assert trace[0] == "SAVE_GCODE_STATE NAME=oams_toolchange"
