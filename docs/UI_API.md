@@ -28,8 +28,9 @@ an existing macro file, even when rerun.
 
 Until those macros are present, status remains available but `commands` omits
 the unavailable load/unload operations. Clients must disable an operation if
-its advertised command is missing. The HelixScreen v1 adapter requires all
-four commands and fails closed on an incomplete command map.
+its advertised command is missing, and only that operation: HelixScreen keeps
+showing status and offering the advertised operations, and refuses load (and
+tool changes) or unload until the matching command appears.
 
 This is the Klipper-side support for HelixScreen, tracked in
 [HelixScreen PR #1691](https://github.com/prestonbrown/helixscreen/pull/1691).
@@ -37,9 +38,18 @@ It does not add a KlipperScreen plugin or an AFC dependency.
 
 ## Discovery and subscription
 
-A client discovers OpenAMS when `printer.objects.list` contains
-`oams_manager`. It then subscribes to the `oams_manager` object. The status
-object has this shape:
+`oams_manager` in `printer.objects.list` is not enough to identify this API:
+a manager from before it registers the same object and publishes only
+`current_group`. A client therefore queries `oams_manager` for `api_version`
+and `schema` and treats OpenAMS as absent unless both are supported. It then
+subscribes to the `oams_manager` object.
+
+AFC drives OpenAMS hardware through its own objects and does not use
+`oams_manager`, so a leftover `[oams_manager]` section can coexist with a
+working AFC setup. A client that supports both must leave the printer to AFC
+whenever the `AFC` object is present. HelixScreen does.
+
+The status object has this shape:
 
 ```json
 {
@@ -96,7 +106,9 @@ unchanged and the v1 snapshot is available below its `api` key.
 - A **unit** is a physical feeder attached to one lane. `kind` is a stable
   machine identifier; `topology` is the hardware-neutral rendering/operation
   shape (`hub`, `linear`, `parallel`, or `mixed`). Clients must branch on
-  `topology`, not on a family name. A unit contains one or more slots.
+  `topology`, not on a family name. A client that meets a `topology` value it
+  does not know may draw that unit as a hub: slots are addressed by id, so
+  operations are unaffected. A unit contains one or more slots.
 - A **slot** has a manager-assigned integer `id` that is unique within the
   snapshot. Commands address this id; clients must not derive command
   addresses from unit names or array positions.
@@ -118,6 +130,10 @@ hard-coding lower-level device commands.
 ```gcode
 OPENAMS_LOAD GROUP=T0 SLOT=0
 ```
+
+To serve a tool or material, a client picks the slot from the group: the
+member already loaded if there is one, otherwise a member whose slot reports
+`ready`. HelixScreen does not send a load for a group with no ready member.
 
 `OPENAMS_LOAD` runs the complete configured toolchange sequence: homing when
 needed, safe unload/cut of the previous filament, targeted OpenAMS feed,
@@ -150,11 +166,25 @@ Cancel requests cancellation of an active hardware load. It does not promise
 that already queued physical toolhead moves have stopped. Reset clears OpenAMS
 errors and re-determines state.
 
+`OAMSM_LOAD_FILAMENT_CANCEL` is ordinary G-code, so it runs only once Klipper's
+G-code queue is free. It can reach a load the manager runs on its own, such as
+a runout reload. It cannot interrupt a load started with the advertised load
+command, because `OPENAMS_LOAD` holds the queue until the load completes or
+fails; by then there is nothing left to cancel. Clients must not offer cancel
+for a load they started. HelixScreen refuses it as busy and leaves its own
+record of the load in place until the command returns. The Klippy-side
+`openams/cancel_load` webhook can interrupt a load, but Moonraker does not
+proxy it to clients.
+
 ## Compatibility rules
 
-Clients must fail closed when `api_version` is absent or unsupported. They
-must ignore unknown fields and check command availability. A client may display all lanes, but it must not
-silently combine independent lanes into a single current-slot/action value.
+Clients must fail closed when `api_version` is absent or unsupported: they
+treat OpenAMS as absent rather than reporting an error. They must ignore
+unknown fields and check each command's availability separately. While `ready`
+is false, clients show status but send no command. A client may display all
+lanes, but it must not silently combine independent lanes into a single
+current-slot/action value. With several lanes loaded, `OPENAMS_UNLOAD` cannot
+say which lane it empties, so clients do not send it.
 
 Current master has a single FPS and therefore one active lane. The same API is
 designed for the future manager as follows:
