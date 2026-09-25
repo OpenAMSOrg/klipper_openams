@@ -40,12 +40,44 @@ are upgraded. Network, repository ownership, and destination checks happen befor
 the installer stops Klipper.
 
 **Installation does not enable concurrent execution or change existing macros.**
+The installer copies `oams_macros_ordered.cfg` into the configuration directory
+when it is absent, but nothing includes it and `[gco_routines]` is not added.
 The extension deliberately accepts only tested Klipper baselines and requires
-Python 3.9 or newer in Klipper's environment. Follow its README before adding
-`[gco_routines]` ahead of all macro sections. Opt individual macros in with
-`render_mode: ordered`; unspecified macros keep stock whole-template rendering.
-The sample single-FPS macros in that repository include printer-specific cutter
-geometry and must be adapted, not copied over a working printer configuration.
+Python 3.9 or newer in Klipper's environment; read its README before enabling
+it. Macros that do not opt in keep stock whole-template rendering.
+
+#### Enabling concurrent toolchanges
+
+`oams_macros.cfg` in this repository already contains the concurrent workflow.
+If you keep a customized copy, merge the updated macros first (the installer
+never replaces it). Then add two configuration lines and restart Klipper while
+the printer is idle:
+
+1. In `printer.cfg`, put `[gco_routines]` above `[include oams.cfg]` and
+   before any other `[gcode_macro ...]` section or include that defines macros.
+2. In `oams.cfg`, uncomment `[include oams_macros_ordered.cfg]`, directly after
+   `[include oams_macros.cfg]`. This file only sets `render_mode: ordered` on
+   `_TX`.
+
+What changes when both are present:
+
+- The cut, toolhead retraction and OpenAMS unload still finish first. The
+  OpenAMS load (`OAMSM_LOAD_FILAMENT`) then runs in a background routine while
+  `CLEAN_NOZZLE` runs, so the nozzle is cleaned during loading.
+- `M400` finishes the cleaning moves, and `WAIT` joins the load before the
+  load result and inlet sensor are checked and before the toolhead reload
+  extrusion.
+- A toolchange that starts while the printer is paused runs serially. A pause
+  during the overlap follows the extension's rules (no new routine starts while
+  paused); the toolchange then stops before the toolhead reload.
+- Call `T0`-`T19` and `OPENAMS_LOAD` from ordinary G-code only, never inside
+  another `START` block: they own their background routine.
+
+On stock Klipper, or without the overlay, the same `oams_macros.cfg` runs every
+step serially (load, inlet check, `CLEAN_NOZZLE`, reload) and never renders
+`START`, `END` or `WAIT`. Stock Klipper rejects `render_mode`, so include
+`oams_macros_ordered.cfg` only together with `[gco_routines]`. To turn the
+feature off, comment out both lines again.
 
 Existing non-Git directories, modified/diverged checkouts, other branches, and
 foreign extras paths are rejected rather than overwritten. A previous manually

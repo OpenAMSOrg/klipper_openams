@@ -20,9 +20,12 @@ a G-code error on failure so the new UI sequence cannot continue after it.
 
 To enable **HelixScreen** load/unload controls, manually merge the updated
 sections from `oams_macros.cfg` into your printer's customized macro file:
-`OPENAMS_LOAD`, `OPENAMS_UNLOAD`, `_TX`, `SAFE_UNLOAD_FILAMENT`, `_LOAD_FS_IN`,
-`_LOAD_FS_OUT`, and `_UNLOAD_FS_OUT`. Preserve your calibrated variables and
-printer-specific cutter, parking, and nozzle-cleaning changes. Restart Klipper
+`OPENAMS_LOAD`, `OPENAMS_UNLOAD`, `_TX`, `SAFE_UNLOAD_FILAMENT`, `CUT_FILAMENT`,
+`_LOAD_FS_IN`, `_LOAD_FS_OUT`, `_UNLOAD_FS_OUT`, and every `_OAMS_...` helper
+macro they call. Preserve your calibrated variables and printer-specific
+cutter, parking, and nozzle-cleaning changes. The updated `_TX` also stops
+untargeted toolchanges (`T0`...) on a failed load, unload or enabled sensor
+check: it pauses and raises an error instead of continuing. Restart Klipper
 after reviewing the merged macros. The installer deliberately does not replace
 an existing macro file, even when rerun.
 

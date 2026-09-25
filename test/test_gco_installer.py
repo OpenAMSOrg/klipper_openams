@@ -163,13 +163,13 @@ fi
         self.env.update(PATH=str(binary) + os.pathsep + self.env["PATH"],
                         OPENAMS_TEST_SERVICE_LOG=str(self.service_log))
 
-    def install(self, *extra):
+    def install(self, *extra, answer="n"):
         if os.geteuid() == 0:
             self.skipTest("The actual OpenAMS installer intentionally rejects root")
         return self.run_cmd("bash", str(ROOT / "install-openams.sh"),
                             "-k", str(self.klipper), "-c", str(self.config),
                             "-s", "klipper-test", "-r", str(self.checkout), *extra,
-                            check=False, input="n\n")
+                            check=False, input=answer + "\n")
 
     def test_full_install_preserves_macros_and_does_not_enable_extension(self):
         self.fake_services()
@@ -180,6 +180,26 @@ fi
         self.assertEqual((self.config / "oams_macros.cfg").read_text(), self.original_macros)
         self.assertEqual(self.service_log.read_text().count("systemctl stop klipper-test"), 1)
         self.assertEqual(self.service_log.read_text().count("systemctl start klipper-test"), 1)
+        # The ordered opt-in is copied for later use but never included.
+        self.assertEqual((self.config / "oams_macros_ordered.cfg").read_text(),
+                         (ROOT / "oams_macros_ordered.cfg").read_text())
+        self.assertNotIn("oams_macros_ordered", (self.config / "printer.cfg").read_text())
+
+    def test_existing_ordered_overlay_is_kept(self):
+        self.fake_services()
+        (self.config / "oams_macros_ordered.cfg").write_text("# customized\n")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.config / "oams_macros_ordered.cfg").read_text(), "# customized\n")
+
+    def test_uninstall_can_remove_all_openams_config_files(self):
+        self.fake_services()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = self.install("-u", answer="y")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        for name in ("oams.cfg", "oams_macros.cfg", "oams_macros_ordered.cfg"):
+            self.assertFalse((self.config / name).exists(), name)
 
     def test_prepare_failure_does_not_stop_service(self):
         self.fake_services()
@@ -222,6 +242,7 @@ fi
         self.assertTrue((self.klipper / "klippy/extras/gco_routines").is_symlink())
         self.assertTrue(self.checkout.exists())
         self.assertEqual((self.config / "oams_macros.cfg").read_text(), self.original_macros)
+        self.assertTrue((self.config / "oams_macros_ordered.cfg").exists())
 
 
 if __name__ == "__main__":

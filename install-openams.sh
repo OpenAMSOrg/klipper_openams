@@ -126,6 +126,15 @@ install_config()
         echo -n "oams_macros.cfg already exists [SKIPPED]... "
     fi
 
+    # Optional gco-routines opt-in. Copying it enables nothing: it only takes
+    # effect when included after [gco_routines] is added (see README).
+    if [ ! -f "${MOONRAKER_CONFIG_DIR}/oams_macros_ordered.cfg" ]; then
+        cp "${SCRIPT_DIR}/oams_macros_ordered.cfg" "${MOONRAKER_CONFIG_DIR}/oams_macros_ordered.cfg"
+        echo -n "oams_macros_ordered.cfg installed... "
+    else
+        echo -n "oams_macros_ordered.cfg already exists [SKIPPED]... "
+    fi
+
     echo "[OK]"
 }
 
@@ -263,10 +272,11 @@ uninstall()
             rm -f "${KLIPPER_PATH}/scripts/$(basename "$file")"
         done
         echo "[OK]"
-        read -p "Remove oams.cfg and oams_macros.cfg from ${MOONRAKER_CONFIG_DIR}? [y/N] " confirm
+        read -p "Remove oams.cfg, oams_macros.cfg and oams_macros_ordered.cfg from ${MOONRAKER_CONFIG_DIR}? [y/N] " confirm
         if [[ "$confirm" =~ ^[Yy]$ ]]; then
             rm -f "${MOONRAKER_CONFIG_DIR}/oams.cfg"
             rm -f "${MOONRAKER_CONFIG_DIR}/oams_macros.cfg"
+            rm -f "${MOONRAKER_CONFIG_DIR}/oams_macros_ordered.cfg"
             echo "Config files removed."
         else
             echo "Config files kept."
