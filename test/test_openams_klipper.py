@@ -18,6 +18,7 @@ from src import oams_manager
 ROOT = Path(__file__).resolve().parents[1]
 KLIPPER_REV = "57a018ad7bbacde28c35305fd79cb9488bd201db"
 LEGACY_REV = "01de61b6ccf406b8bd17e4ff8a5e1250ec942ac1"
+CONTROLS = ("START", "END", "WAIT")
 
 
 def committed_source(repo, revision, path):
@@ -95,6 +96,7 @@ class Printer:
         self.objects = {}
         self.events = {}
         self.trace = []
+        self.received_controls = []
         self.reactor = Reactor()
         self.command_error = klipper.gcode.CommandError
         self.gcode = klipper.gcode.GCodeDispatch(self)
@@ -105,16 +107,35 @@ class Printer:
         self.objects["exclude_object"] = Status(current_object=None, excluded_objects=[])
         self.objects["filament_switch_sensor extruder_in"] = Status(filament_detected=True)
         self.objects["filament_switch_sensor extruder_out"] = Status(filament_detected=False)
+        self.objects["extruder"] = Status(can_extrude=True, temperature=220.0)
+        self.objects["pause_resume"] = Status(is_paused=False)
+        # Klipper publishes lowercase section names with their accessed options.
+        self.objects["configfile"] = Status(settings={
+            "filament_group t0": {"group": "oams1-0, oams1-1"},
+            "filament_group t1": {"group": "oams1-2, oams1-3"},
+        })
         self.objects["fps"] = types.SimpleNamespace(get_value=lambda: 0.5)
         self.objects["webhooks"] = types.SimpleNamespace(register_endpoint=lambda *args: None)
-        for command in ("G0", "G1", "G28", "G4", "M400", "M83", "PAUSE",
+        for command in ("G0", "G1", "G28", "G4", "G90", "M400", "M83",
                         "SET_STEPPER_ENABLE", "SAVE_GCODE_STATE", "RESTORE_GCODE_STATE",
                         "CLEAN_NOZZLE"):
             self.gcode.register_command(command, self.record)
+        self.gcode.register_command("PAUSE", self.pause)
         self.gcode.register_command("RESPOND", lambda command: None)
+        # Stock Klipper has no routine controls. Any rendered control is a bug.
+        for command in CONTROLS:
+            self.gcode.register_command(command, self.control)
 
     def record(self, command):
         self.trace.append(command.get_commandline())
+
+    def pause(self, command):
+        self.record(command)
+        self.objects["pause_resume"].values["is_paused"] = True
+
+    def control(self, command):
+        self.received_controls.append(command.get_commandline())
+        raise AssertionError("stock Klipper received " + command.get_commandline())
 
     def get_start_args(self):
         return {}
@@ -194,33 +215,97 @@ def setup(klipper):
     return build
 
 
-@pytest.mark.parametrize("case", ["load", "same_group", "switch", "load_error", "empty",
-                                 "unload", "unload_error", "excluded", "sensor_error"])
-@pytest.mark.parametrize("legacy_macros", [True, False])
-def test_legacy_execution_matches_master(setup, case, legacy_macros):
-    traces = []
-    states = []
-    for old in (True, False):
-        loaded = 0 if case in ("same_group", "switch", "unload", "unload_error") else None
-        printer, manager, unit = setup(old, True if old else legacy_macros, loaded)
-        if case == "load_error":
-            unit.load_result = 2
-        if case == "empty":
-            unit.f1s_hes_value = [False] * 4
-        if case == "unload_error":
-            unit.unload_result = False
-        if case == "excluded":
-            printer.objects["exclude_object"].values.update(current_object="part", excluded_objects=["part"])
-        if case == "sensor_error":
-            printer.objects["gcode_macro _oams_macro_variables"].variables["fs_extruder_in"] = True
-            printer.objects["filament_switch_sensor extruder_in"].values["filament_detected"] = False
-        command = ("SAFE_UNLOAD_FILAMENT" if case.startswith("unload")
-                   else "_TX GROUP=" + ("T1" if case == "switch" else "T0"))
+CASES = ["load", "same_group", "switch", "load_error", "empty",
+         "unload", "unload_error", "excluded", "sensor_error"]
+
+
+def run_case(setup, case, legacy_manager, legacy_macros):
+    loaded = 0 if case in ("same_group", "switch", "unload", "unload_error") else None
+    printer, manager, unit = setup(legacy_manager, legacy_macros, loaded)
+    if case == "load_error":
+        unit.load_result = 2
+    if case == "empty":
+        unit.f1s_hes_value = [False] * 4
+    if case == "unload_error":
+        unit.unload_result = False
+    if case == "excluded":
+        printer.objects["exclude_object"].values.update(current_object="part", excluded_objects=["part"])
+    if case == "sensor_error":
+        printer.objects["gcode_macro _oams_macro_variables"].variables["fs_extruder_in"] = True
+        printer.objects["filament_switch_sensor extruder_in"].values["filament_detected"] = False
+    command = ("SAFE_UNLOAD_FILAMENT" if case.startswith("unload")
+               else "_TX GROUP=" + ("T1" if case == "switch" else "T0"))
+    error = None
+    try:
         printer.gcode.run_script(command)
-        traces.append(printer.trace)
-        states.append((manager.current_group, unit.current_spool, manager.current_state.name))
-    assert traces[0] == traces[1]
-    assert states[0] == states[1]
+    except printer.command_error as exc:
+        error = exc
+    state = (manager.current_group, unit.current_spool, manager.current_state.name)
+    return printer, state, error
+
+
+def is_reload(command):
+    return command.startswith("G1 E") and not command.startswith("G1 E-")
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_legacy_execution_matches_master(setup, case):
+    """The current manager runs the legacy macros exactly as the legacy manager."""
+    legacy, legacy_state, legacy_error = run_case(setup, case, True, True)
+    current, current_state, current_error = run_case(setup, case, False, True)
+    assert legacy_error is None and current_error is None
+    assert legacy.trace == current.trace
+    assert legacy_state == current_state
+
+
+@pytest.mark.parametrize("case", CASES)
+def test_current_macros_preserve_master_outcomes(setup, case):
+    """The shipped macros reach master's manager state through a safer sequence.
+
+    Exact trace equality with the legacy macros cannot hold, because the
+    toolchange sequence changed deliberately: G-code state is saved before and
+    restored after the change, the nozzle is cleaned after the OpenAMS load and
+    before the toolhead reload (so the concurrent path can overlap cleaning with
+    loading), there is no absolute G0 Z15 before cleaning, and every safety
+    decision is made in a fresh helper render. Master's legacy renders decided
+    from stale state, so they extruded and cleaned after a failed load or
+    sensor check; the new macros pause and raise instead. This test pins the
+    ordering and safety properties per case instead of the byte-for-byte trace.
+    """
+    _, legacy_state, _ = run_case(setup, case, True, True)
+    printer, state, error = run_case(setup, case, False, False)
+    trace = printer.trace
+    variables = printer.objects["gcode_macro _oams_macro_variables"].variables
+    cut = "G0 X%s Y%s F%s" % (variables["cut_x"], variables["cut_y"], variables["cut_speed"])
+    loads = case in ("load", "switch")
+    failures = ("load_error", "empty", "unload_error", "sensor_error")
+    feeds = [index for index, command in enumerate(trace) if command.startswith("feed:")]
+    reloads = [index for index, command in enumerate(trace) if is_reload(command)]
+
+    assert state == legacy_state
+    if case in failures:
+        assert error is not None and "PAUSE" in trace
+        assert not any("MOVE=1" in command for command in trace)
+    else:
+        assert error is None and "PAUSE" not in trace
+    if case in ("same_group", "excluded"):
+        assert trace == []
+    # Cut before unload; feed only after the unload finished.
+    if "unload" in trace:
+        assert trace.index(cut) < trace.index("unload")
+        assert all(index > trace.index("unload") for index in feeds)
+    if case == "unload_error":
+        assert feeds == []
+    # Reload extrusion only after a successful feed; none after a failure.
+    assert len(reloads) == (1 if loads else 0)
+    assert all(feeds and index > feeds[-1] for index in reloads)
+    assert trace.count("CLEAN_NOZZLE") == (1 if loads else 0)
+    if loads:
+        assert feeds[-1] < trace.index("CLEAN_NOZZLE") < reloads[0]
+        assert trace[reloads[0] - 1] == "M83"
+        assert trace[0] == "SAVE_GCODE_STATE NAME=oams_toolchange"
+        assert trace[-1] == "RESTORE_GCODE_STATE NAME=oams_toolchange MOVE=1 MOVE_SPEED=100"
+    assert not any(command.startswith("G0 Z") for command in trace)
 
 
 @pytest.mark.parametrize("target", ["GROUP=T1 SLOT=-1", "GROUP=T1 SLOT=99", "GROUP=T1 SLOT=0",
@@ -256,7 +341,7 @@ def test_ui_load_failure_stops_before_extruder_reload(setup):
     unit.load_result = 6
     with pytest.raises(printer.command_error, match="load failed"):
         printer.gcode.run_script("OPENAMS_LOAD GROUP=T1 SLOT=2")
-    assert printer.trace == ["feed:2"]
+    assert printer.trace == ["SAVE_GCODE_STATE NAME=oams_toolchange", "feed:2"]
 
 
 def test_ui_sensor_failure_aborts_outer_macro(setup):
@@ -279,7 +364,7 @@ def test_ui_unload_homes_before_extrusion_and_uses_relative_mode(setup):
     printer, _, _ = setup(loaded=0)
     printer.objects["toolhead"].values["homed_axes"] = ""
     printer.gcode.run_script("OPENAMS_UNLOAD")
-    assert printer.trace[0:2] == ["G28", "M83"]
+    assert printer.trace[0:3] == ["G28", "SAVE_GCODE_STATE NAME=oams_unload", "M83"]
     assert "unload" in printer.trace
 
 
