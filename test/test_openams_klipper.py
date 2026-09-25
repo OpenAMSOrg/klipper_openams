@@ -6,6 +6,7 @@ Sources are read from that commit, never from a user's modified working tree.
 import configparser
 import contextlib
 import os
+import re
 from pathlib import Path
 import subprocess
 import types
@@ -137,6 +138,12 @@ class Printer:
         self.received_controls.append(command.get_commandline())
         raise AssertionError("stock Klipper received " + command.get_commandline())
 
+    def enable_gco_routines(self):
+        """Advertise a live extension and an ordered _TX without providing it."""
+        self.objects["gco_routines"] = Status()
+        self.objects["configfile"].values["settings"]["gcode_macro _tx"] = {
+            "render_mode": "ordered"}
+
     def get_start_args(self):
         return {}
 
@@ -183,7 +190,7 @@ class Unit(FakeUnit):
 
 @pytest.fixture
 def setup(klipper):
-    def build(legacy_manager=False, legacy_macros=False, loaded=None):
+    def build(legacy_manager=False, legacy_macros=False, loaded=None, legacy_sample=False):
         printer = Printer(klipper)
         unit = Unit(printer)
         if loaded is not None:
@@ -199,7 +206,8 @@ def setup(klipper):
         manager = manager_module.OAMSManager(Config(printer, "oams_manager"))
         printer.objects["oams_manager"] = manager
         sample = configparser.RawConfigParser(inline_comment_prefixes=("#", ";"))
-        sample.read(ROOT / "oams_sample.cfg")
+        sample.read_string(committed_source(ROOT, LEGACY_REV, "oams_sample.cfg")
+                           if legacy_sample else (ROOT / "oams_sample.cfg").read_text())
         name = "gcode_macro _oams_macro_variables"
         printer.objects[name] = klipper.gcode_macro.GCodeMacro(
             Config(printer, name, dict(sample[name])))
@@ -402,3 +410,165 @@ def test_ui_not_ready_does_not_move(setup):
         printer.gcode.run_script("OPENAMS_LOAD GROUP=T1 SLOT=2")
     assert printer.trace == []
     assert unit.current_spool == 0
+
+
+def render(printer, macro, **params):
+    """Render a macro exactly as GCodeMacro.cmd would, without dispatching it."""
+    macro = printer.objects["gcode_macro " + macro]
+    context = dict(macro.variables)
+    context.update(macro.template.create_template_context())
+    context["params"] = params
+    context["rawparams"] = " ".join("%s=%s" % item for item in params.items())
+    return [line.strip() for line in macro.template.render(context).splitlines()
+            if line.strip()]
+
+
+@pytest.mark.parametrize("params, load", [
+    ({"GROUP": "T1"}, "OAMSM_LOAD_FILAMENT GROUP=T1"),
+    ({"GROUP": "T1", "SLOT": "2"}, "OAMSM_LOAD_FILAMENT GROUP=T1 SLOT=2"),
+])
+def test_concurrent_branch_renders_literal_controls_only_when_enabled(setup, params, load):
+    printer, _, _ = setup()
+    assert not set(CONTROLS) & set(render(printer, "_TX", **params))
+    printer.enable_gco_routines()
+    lines = render(printer, "_TX", **params)
+    start = lines.index("START")
+    strict = 1 if "SLOT" in params else 0
+    assert lines[start:] == [
+        "START", load, "END", "CLEAN_NOZZLE", "M400", "WAIT",
+        "_OAMS_CONTINUE_AFTER_LOAD GROUP=T1 SLOT=%s STRICT=%d STARTED_PAUSED=0"
+        % (params.get("SLOT", -1), strict)]
+    # Stock Klipper would receive the controls, which the fake rejects.
+    with pytest.raises(AssertionError):
+        printer.gcode.run_script("_TX " + " ".join("%s=%s" % item for item in params.items()))
+    assert printer.received_controls == ["START"]
+
+
+@pytest.mark.parametrize("loaded", [None, 0])
+@pytest.mark.parametrize("command", ["_TX GROUP=T1", "OPENAMS_LOAD GROUP=T1 SLOT=2"])
+def test_paused_toolchange_takes_serial_path_even_with_extension(setup, loaded, command):
+    printer, manager, unit = setup(loaded=loaded)
+    printer.enable_gco_routines()
+    printer.objects["pause_resume"].values["is_paused"] = True
+    printer.gcode.run_script(command)
+    assert (manager.current_group, unit.current_spool) == ("T1", 2)
+    trace = printer.trace
+    assert "PAUSE" not in trace
+    assert trace.index("feed:2") < trace.index("CLEAN_NOZZLE") < trace.index("G1 E31.2 F1000")
+    assert trace[-1] == "RESTORE_GCODE_STATE NAME=oams_toolchange MOVE=1 MOVE_SPEED=100"
+
+
+def test_pause_during_unload_stops_before_feed(setup):
+    printer, manager, unit = setup(loaded=0)
+    unload_spool = unit.unload_spool
+
+    def unload_then_pause():
+        printer.objects["pause_resume"].values["is_paused"] = True
+        return unload_spool()
+    unit.unload_spool = unload_then_pause
+    with pytest.raises(printer.command_error, match="printer was paused"):
+        printer.gcode.run_script("T1")
+    assert unit.loaded_bays == []
+    assert not any(is_reload(command) or command == "CLEAN_NOZZLE" for command in printer.trace)
+
+
+@pytest.mark.parametrize("variant", ["cannot_extrude", "below_minimum"])
+@pytest.mark.parametrize("command, loaded", [
+    ("T1", 0), ("T1", None), ("OPENAMS_LOAD GROUP=T1 SLOT=2", 0),
+    ("OPENAMS_LOAD GROUP=T1 SLOT=2", None), ("SAFE_UNLOAD_FILAMENT", 0), ("OPENAMS_UNLOAD", 0)])
+def test_cold_extruder_is_rejected_before_any_motion(setup, variant, command, loaded):
+    printer, manager, unit = setup(loaded=loaded)
+    printer.objects["toolhead"].values["homed_axes"] = ""
+    if variant == "cannot_extrude":
+        printer.objects["extruder"].values["can_extrude"] = False
+    else:
+        printer.objects["gcode_macro _oams_macro_variables"].variables[
+            "minimum_extrude_temperature"] = 230
+    with pytest.raises(printer.command_error, match="Heat the extruder"):
+        printer.gcode.run_script(command)
+    assert printer.trace == []
+    assert unit.current_spool == loaded and unit.unload_calls == 0
+
+
+def test_unknown_group_is_rejected_before_any_motion(setup):
+    printer, _, unit = setup(loaded=0)
+    printer.objects["toolhead"].values["homed_axes"] = ""
+    with pytest.raises(printer.command_error, match="Unknown OpenAMS filament group T7"):
+        printer.gcode.run_script("_TX GROUP=T7")
+    assert printer.trace == []
+    assert unit.current_spool == 0
+
+
+def test_existing_variable_sections_use_master_defaults(setup):
+    """oams.cfg files created from the previous sample lack the new variables."""
+    printer, manager, unit = setup(loaded=0, legacy_sample=True)
+    variables = printer.objects["gcode_macro _oams_macro_variables"].variables
+    assert not {"unload_speed", "extrusion_unload_additional_length",
+                "additional_unload_speed", "minimum_extrude_temperature"} & set(variables)
+    printer.gcode.run_script("T1")
+    assert (manager.current_group, unit.current_spool) == ("T1", 2)
+    assert "G1 E-%s F1000" % variables["extrusion_unload_length"] in printer.trace
+    # Master computed 5000 / 60 * (2 + 1) mm at 5000 mm/min.
+    assert "G1 E-250 F5000" in printer.trace
+
+
+EXPECTED_MACROS = {
+    "CUT_FILAMENT", "SAFE_UNLOAD_FILAMENT", "_OAMS_FINISH_UNLOAD", "_OAMS_CONFIRM_UNLOADED",
+    "_TX", "_OAMS_CONTINUE_AFTER_UNLOAD", "_OAMS_CONTINUE_AFTER_LOAD",
+    "_OAMS_CONTINUE_AFTER_INLET", "_OAMS_FINISH_TOOLCHANGE", "_OAMS_FAIL_TOOLCHANGE",
+    "_OAMS_ABORT", "_OAMS_RAISE", "OPENAMS_LOAD", "OPENAMS_UNLOAD",
+    "_LOAD_FS_IN", "_LOAD_FS_OUT", "_UNLOAD_FS_OUT",
+    "OAMS_TORTURE_TEST", "OAMS_TOOLCHANGE_TORTURE_TEST", "T0", "T1", "T2", "T3"}
+NEW_VARIABLES = {"extrusion_unload_additional_length": 250, "unload_speed": 1000,
+                 "additional_unload_speed": 5000, "minimum_extrude_temperature": 0}
+
+
+def parse_config(name):
+    config = configparser.RawConfigParser(inline_comment_prefixes=("#", ";"))
+    config.read_string((ROOT / name).read_text())
+    return config
+
+
+def test_macro_files_define_expected_sections_and_only_overlay_sets_render_mode():
+    macros = parse_config("oams_macros.cfg")
+    assert set(macros.sections()) == {"gcode_macro " + name for name in EXPECTED_MACROS}
+    for section in macros.sections():
+        assert macros[section]["gcode"].strip(), section
+        assert "render_mode" not in macros[section], section
+    overlay = parse_config("oams_macros_ordered.cfg")
+    assert overlay.sections() == ["gcode_macro _TX"]
+    assert dict(overlay["gcode_macro _TX"]) == {"render_mode": "ordered"}
+    sample = parse_config("oams_sample.cfg")
+    assert not any("render_mode" in sample[section] for section in sample.sections())
+
+
+def test_controls_are_literal_lines_inside_one_guarded_branch():
+    macros = parse_config("oams_macros.cfg")
+    for section in macros.sections():
+        lines = [line.strip() for line in macros[section]["gcode"].splitlines()]
+        if section != "gcode_macro _TX":
+            assert not any(line.split(" ")[0].upper() in CONTROLS for line in lines), section
+            continue
+        assert [line for line in lines if line in CONTROLS] == list(CONTROLS)
+        start, wait = lines.index("START"), lines.index("WAIT")
+        branch = [line for line in lines[:start] if line.startswith("{%")][-1]
+        assert branch.startswith("{% if HAS_GCO_ROUTINES and not printer.pause_resume.is_paused")
+        assert not any(line.startswith(("{% el", "{% endif")) for line in lines[start:wait])
+
+
+def test_new_variables_have_defaults_and_sample_values():
+    text = (ROOT / "oams_macros.cfg").read_text()
+    legacy = configparser.RawConfigParser(inline_comment_prefixes=("#", ";"))
+    legacy.read_string(committed_source(ROOT, LEGACY_REV, "oams_sample.cfg"))
+    known = {option[len("variable_"):] for option in legacy["gcode_macro _oams_macro_variables"]}
+    used = set(re.findall(r"\bv\.(\w+)", text))
+    assert set(NEW_VARIABLES) <= used
+    for name in used - known:
+        for match in re.finditer(r"\bv\.%s\b(.{0,9})" % name, text):
+            assert match.group(1).startswith("|default("), name
+        assert "v.%s|default(%s)" % (name, NEW_VARIABLES[name]) in text
+    sample = parse_config("oams_sample.cfg")["gcode_macro _oams_macro_variables"]
+    assert {name: int(sample["variable_" + name]) for name in NEW_VARIABLES} == NEW_VARIABLES
+    includes = (ROOT / "oams_sample.cfg").read_text().splitlines()
+    index = includes.index("[include oams_macros.cfg]")
+    assert includes[index + 1] == "#[include oams_macros_ordered.cfg]"
