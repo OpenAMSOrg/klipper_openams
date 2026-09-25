@@ -70,7 +70,9 @@ The status object has this shape:
       "current_slot": 0,
       "following": false,
       "direction": 0,
-      "message": null
+      "message": null,
+      "pressure": 0.48,
+      "set_point": 0.5
     }
   ],
   "units": [
@@ -102,7 +104,12 @@ unchanged and the v1 snapshot is available below its `api` key.
 ## Model
 
 - A **lane** is one independently operated filament path/FPS. Current master
-  publishes one lane named `fps`.
+  publishes one lane named `fps`. `pressure` is the lane's FPS reading, from
+  0.0 (no pressure) to 1.0 (fully compressed); the FPS measures compression
+  only, never tension. It is rounded to two decimals and republished only
+  once it moves by 0.02, so sensor noise does not resend the lanes on every
+  poll. `set_point` is the compression the feeding unit's hub motor regulates
+  to (its `fps_target`), or `null` when no unit reports one.
 - A **unit** is a physical feeder attached to one lane. `kind` is a stable
   machine identifier; `topology` is the hardware-neutral rendering/operation
   shape (`hub`, `linear`, `parallel`, or `mixed`). Clients must branch on

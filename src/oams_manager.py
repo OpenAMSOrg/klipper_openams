@@ -21,6 +21,7 @@ ENCODER_SAMPLES = 2
 MIN_ENCODER_DIFF = 1
 MONITOR_ENCODER_LOADING_SPEED_AFTER = 2.0 # in seconds
 MONITOR_ENCODER_UNLOADING_SPEED_AFTER = 2.0 # in seconds
+PRESSURE_DEADBAND = 0.02 # FPS change that republishes a lane's pressure
 
 class OAMSState:
     def __init__(self, name, since, current_spool):
@@ -164,6 +165,8 @@ class OAMSManager:
             "current_group": self.current_group, "current_slot": current_slot,
             "following": bool(self.current_state.following),
             "direction": int(self.current_state.direction), "message": None,
+            "pressure": self._lane_pressure(),
+            "set_point": self._lane_set_point(),
         }
         # Do not advertise new macros until the user has installed them.
         # Querying gcode status is cached and does not communicate with an MCU.
@@ -180,6 +183,28 @@ class OAMSManager:
             "lanes": [lane], "units": units, "groups": groups,
         }
     
+    def _lane_pressure(self):
+        """FPS compression, 0.0 (no pressure) to 1.0 (fully compressed).
+
+        The reading is republished only once it moves by PRESSURE_DEADBAND, so
+        ADC noise around one value does not resend the lanes on every poll.
+        """
+        value = float(self.fps.get_value())
+        published = getattr(self, "_published_pressure", None)
+        if published is None or abs(value - published) >= PRESSURE_DEADBAND:
+            self._published_pressure = published = value
+        return round(min(max(published, 0.0), 1.0), 2)
+
+    def _lane_set_point(self):
+        """The compression the feeding unit's hub motor regulates to."""
+        units = ([self.current_spool[0]] if self.current_spool is not None
+                 else self._ordered_units())
+        for oam in units:
+            target = getattr(oam, "fps_target", None)
+            if target is not None:
+                return round(float(target), 2)
+        return None
+
     def determine_state(self):
         self.current_group, current_oam, current_spool_idx = self.determine_current_loaded_group()
         if current_oam is not None and current_spool_idx is not None:

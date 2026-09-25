@@ -141,6 +141,8 @@ def test_status_contract_is_versioned_and_uses_stable_global_slots():
         "following": False,
         "direction": 0,
         "message": None,
+        "pressure": 0.5,
+        "set_point": None,
     }]
     groups = {group["name"]: group for group in status["groups"]}
     assert groups["T0"]["slots"] == [1, 4]
@@ -362,3 +364,25 @@ from extras.oams_manager import OAMSManager
 assert hasattr(OAMSManager, 'get_status')
 """], cwd=tmp_path, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
+
+
+def test_lane_pressure_follows_the_fps_past_a_deadband():
+    manager, unit1, _ = make_manager()
+    reading = {"value": 0.5}
+    manager.fps = types.SimpleNamespace(get_value=lambda: reading["value"])
+    unit1.fps_target = 0.45
+
+    lane = manager.get_status(1.)["lanes"][0]
+    assert lane["pressure"] == 0.5
+    assert lane["set_point"] == 0.45
+
+    # Noise inside the deadband keeps the published value still.
+    reading["value"] = 0.515
+    assert manager.get_status(2.)["lanes"][0]["pressure"] == 0.5
+
+    reading["value"] = 0.73
+    assert manager.get_status(3.)["lanes"][0]["pressure"] == 0.73
+
+    # Readings outside the rail are clamped to 0..1.
+    reading["value"] = 1.2
+    assert manager.get_status(4.)["lanes"][0]["pressure"] == 1.0
