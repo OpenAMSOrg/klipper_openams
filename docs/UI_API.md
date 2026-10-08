@@ -38,9 +38,12 @@ its advertised command is missing, and only that operation: HelixScreen keeps
 showing status and offering the advertised operations, and refuses load (and
 tool changes) or unload until the matching command appears.
 
-This is the Klipper-side support for HelixScreen, tracked in
-[HelixScreen PR #1691](https://github.com/prestonbrown/helixscreen/pull/1691).
-It does not add a KlipperScreen plugin or an AFC dependency.
+HelixScreen implements this API natively from v1.1.0-beta.1
+([prestonbrown/helixscreen#1691](https://github.com/prestonbrown/helixscreen/pull/1691)).
+Its `HELIX_MOCK_AMS=openams` test mode, proposed in
+[prestonbrown/helixscreen#1753](https://github.com/prestonbrown/helixscreen/pull/1753),
+runs HelixScreen's real OpenAMS backend against a mock `oams_manager`. The API
+does not add a KlipperScreen plugin or an AFC dependency.
 
 ## Discovery and subscription
 
@@ -132,6 +135,25 @@ This nesting is the forward-compatibility boundary for multi-FPS and
 multi-family support. A future manager may publish several lanes and mix unit
 kinds without changing the v1 meanings. Existing fields are additive within
 v1; a meaning change requires a new `api_version`.
+
+### Showing the FPS
+
+`pressure` is a one-sided reading. Draw it as a gauge from 0.0 (no pressure)
+to 1.0 (fully compressed), with `set_point` marked when it is not `null`. Do
+not present it as a two-sided tension/compression meter, and do not convert it
+into Happy Hare's `sync_feedback_bias`: the FPS has a single spring, so a
+reading below `set_point` is less compression, not tension.
+
+The hub motor keeps the pressure near `set_point` while the extruder pulls, so
+movement around the target is normal regulation, not a fault. Describe it
+relative to the target ("at", "above" or "below target") rather than as tight
+or loose. The readings worth flagging sit at the rails: pressure held near full
+compression means filament is not moving into the toolhead (a jam or a clog
+downstream), and pressure near zero while the lane is loaded means the feed is
+not engaging. Where those warnings start is the client's choice.
+
+Everything the gauge needs is already in v1: `pressure`, `set_point` and the
+lane's `state`.
 
 ## Commands
 
