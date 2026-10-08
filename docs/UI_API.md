@@ -160,6 +160,26 @@ lane's `state`.
 Clients must use the command names advertised in `commands` rather than
 hard-coding lower-level device commands.
 
+### Unified UI command contract
+
+Every OpenAMS plugin accepts the same arguments for the same actions, so a UI
+runs the same calls against any of them:
+
+- Load: run `commands.load` with `GROUP=<group> SLOT=<slot id>`, where the slot
+  id is a global `units[].slots[].id` (the same ids `groups[].slots` lists).
+- Unload: run `commands.unload` with `FPS=<lane id>`, where the lane id is a
+  `lanes[].id`.
+
+The advertised command names differ by plugin:
+
+| Plugin | `commands.load` | `commands.unload` |
+|--------|-----------------|-------------------|
+| `openams` (unified host) | `OAMSM_LOAD_TO_TOOLHEAD` | `OAMSM_UNLOAD_FROM_TOOLHEAD` |
+| `klipper_openams` | `OPENAMS_LOAD` | `OPENAMS_UNLOAD` |
+
+A UI must follow the map and never hard-code these names. `cancel` and `reset`
+are advertised as `OAMSM_LOAD_FILAMENT_CANCEL` and `OAMSM_CLEAR_ERRORS` by both.
+
 ### Load a selected slot
 
 ```gcode
@@ -183,7 +203,7 @@ remain the responsibility of the printer's configured macros.
 ### Unload
 
 ```gcode
-OPENAMS_UNLOAD
+OPENAMS_UNLOAD FPS=fps
 ```
 
 This runs the complete configured cutter and extruder unload sequence with
