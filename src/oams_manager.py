@@ -31,6 +31,13 @@ class OAMSState:
         self.following = False
         self.direction = 0
 
+DEPRECATION_NOTICE = (
+    "klipper_openams is deprecated and gets no further updates. Move to "
+    "OpenAMS, https://github.com/OpenAMSOrg/openams: one installer run keeps "
+    "your oams.cfg and every G-code command. How: https://github.com/OpenAMSOrg/"
+    "openams/blob/main/docs/guide/install.md#moving-from-klipper_openams")
+
+
 class OAMSManager:
     def __init__(self, config):
         self.config = config
@@ -214,7 +221,23 @@ class OAMSManager:
             self.current_spool = None
             self.current_state = OAMSState("UNLOADED", self.reactor.monotonic() , None)
         
+    def _warn_deprecated(self):
+        # Shown by Mainsail and Fluidd as a Klipper warning where Klipper has
+        # runtime_warning; klippy.log otherwise. Never in the way of startup.
+        try:
+            configfile = self.printer.lookup_object("configfile", None)
+            if configfile is not None and hasattr(configfile, "runtime_warning"):
+                configfile.runtime_warning(DEPRECATION_NOTICE)
+            else:
+                logging.warning(DEPRECATION_NOTICE)
+            gcode = self.printer.lookup_object("gcode", None)
+            if gcode is not None:
+                gcode.respond_info(DEPRECATION_NOTICE)
+        except Exception:
+            logging.exception("OAMS: could not show the deprecation notice")
+
     def handle_ready(self):
+        self._warn_deprecated()
         self.determine_state()
         self.start_monitors()
         self.ready = True
