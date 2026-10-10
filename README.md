@@ -1,5 +1,13 @@
-# OpenAMS for Klipper  
-OpenAMS Klipper Plugin
+# OpenAMS for Klipper (deprecated)
+
+> [!WARNING]
+> **klipper_openams is deprecated. Use [OpenAMSOrg/openams](https://github.com/OpenAMSOrg/openams) instead.**
+> All development continues there: it runs OpenAMS 1 mainboards as well as stock Bambu Lab AMS units behind a Cortex Bridge, and the OpenAMS display and Mainsail panel ([openams-ui](https://github.com/OpenAMSOrg/openams-ui)) only work with it. This repository gets no further updates.
+>
+> Moving over is one installer run. Your `oams.cfg` is kept and every G-code command keeps working: [Moving from klipper_openams](https://github.com/OpenAMSOrg/openams/blob/main/docs/guide/install.md#moving-from-klipper_openams).
+
+The rest of this page describes the old plugin, for existing installations.
+
 
 Native UI integrations can use the versioned, AFC-independent
 [OpenAMS UI API](docs/UI_API.md) exposed by `oams_manager`.
